@@ -22,7 +22,6 @@
 <rect x="44" y="318" width="528" height="60" rx="8" fill="#ffebe9" stroke="#ff8182" stroke-width="1"/>
 <text x="60" y="342" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#82071e">Says “verified” — rate-limit never repro’d</text>
 <text x="60" y="362" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#82071e">No link to test output — cannot re-check.</text>
-</text>
 <rect x="44" y="390" width="528" height="46" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1" stroke-dasharray="5 4"/>
 <text x="60" y="418" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6e7781">shape: done + attempted read the same</text>
 </g>
