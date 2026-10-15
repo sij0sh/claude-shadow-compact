@@ -18,8 +18,13 @@
  * functions, never into closures capturing it.
  */
 import type { EngineInterface, Register, SessionMessage } from "claude-code";
-import { currentPromptVersions } from "./checkpoint.js";
-import { isAtOrAbove, resolveConfig, type ShadowConfig } from "./config.js";
+import { currentPromptVersions, extractJsonObject } from "./checkpoint.js";
+import {
+  describeBackend,
+  isAtOrAbove,
+  resolveConfig,
+  type ShadowConfig,
+} from "./config.js";
 import { EvidenceArchive } from "./evidence.js";
 import {
   BUILDER_SYSTEM_PROMPT,
@@ -172,6 +177,92 @@ function askViaComplete($: EngineInterface, rt: Runtime): AskFn {
   };
 }
 
+const PI_STDOUT_CAP = 256_000;
+const PI_STDERR_SNIPPET = 200;
+
+/**
+ * Answers one builder/verifier request through the Pi CLI on the host
+ * (`pi -p`, tool-less and session-less). The Pi provider/model pair
+ * comes from config; `request.model` is the Claude alias and is ignored
+ * here. Stdout must contain a JSON object or the call fails so the
+ * Claude path below is tried next.
+ */
+function askViaPiBridge($: EngineInterface, rt: Runtime, kind: "builder" | "verifier"): AskFn {
+  return async (request) => {
+    const pair = kind === "builder" ? rt.config.builderPi : rt.config.verifierPi;
+    const argv: string[] = [
+      rt.config.piBinary,
+      "-p",
+      "--no-session",
+      "--mode",
+      "text",
+      "--no-tools",
+      "--no-extensions",
+      "--no-mcp",
+      "--no-skills",
+      "--no-context-files",
+      "--system-prompt",
+      request.system,
+    ];
+    if (pair.id !== "") {
+      argv.push("--model", pair.id);
+      if (pair.provider !== "") argv.push("--provider", pair.provider);
+    }
+    argv.push("--", request.prompt);
+    let result;
+    try {
+      // A host without a process runner throws here; the caller falls
+      // back to the Claude path.
+      result = await $.process.run(argv, { timeoutMs: rt.config.piTimeoutMs });
+    } catch (error) {
+      throw new Error(
+        `Pi bridge ${kind} failed to start: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (result.exitCode !== 0) {
+      const snippet = result.stderr.slice(0, PI_STDERR_SNIPPET).replace(/\s+/g, " ");
+      throw new Error(`Pi bridge ${kind} exited ${result.exitCode}${snippet ? `: ${snippet}` : ""}`);
+    }
+    const stdout = result.stdout.slice(0, PI_STDOUT_CAP);
+    try {
+      extractJsonObject(stdout);
+    } catch {
+      throw new Error(`Pi bridge ${kind} returned no JSON object`);
+    }
+    return stdout;
+  };
+}
+
+/**
+ * One AskFn routing each request to its configured backend, then falling
+ * back per request: Pi bridge, Claude agent spawn, `$.model.complete`,
+ * then fail closed to the validation retries in `prepare.ts`.
+ */
+function askWithFallback($: EngineInterface, rt: Runtime): AskFn {
+  const builderAgent = askViaAgent($, rt, "builder");
+  const verifierAgent = askViaAgent($, rt, "verifier");
+  const builderPi = askViaPiBridge($, rt, "builder");
+  const verifierPi = askViaPiBridge($, rt, "verifier");
+  const complete = askViaComplete($, rt);
+  return async (request) => {
+    const isBuilder = request.system.includes("create evidence-grounded");
+    const configured = isBuilder ? rt.config.builderBackend : rt.config.verifierBackend;
+    if (configured === "pi") {
+      try {
+        return await (isBuilder ? builderPi : verifierPi)(request);
+      } catch {
+        // Fall through to the Claude path below.
+      }
+    }
+    const claudeAsk = isBuilder ? builderAgent : verifierAgent;
+    try {
+      return await claudeAsk(request);
+    } catch {
+      return complete(request);
+    }
+  };
+}
+
 /**
  * Installs at the next safe boundary by running the built-in /compact,
  * whose session.compact dispatch (engine-originated) this mod answers
@@ -211,13 +302,20 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
   const snapshotLastIndex = rows.size - 1;
   const snapshotLeaf = rows.rows[snapshotLastIndex]!.id;
   try {
-    const access = await evidenceAccess($, rt, rows);
     const models = { builder: rt.config.builderModel, verifier: rt.config.verifierModel };
     let prepared;
-    try {
-      prepared = await prepareCheckpoint(askViaAgents($, rt), rows, access, models);
-    } catch {
-      prepared = await prepareCheckpoint(askViaComplete($, rt), rows, inlineEvidence(rows), models);
+    if (rt.config.builderBackend === "pi" || rt.config.verifierBackend === "pi") {
+      // The Pi subprocess cannot read the host-side evidence file, so the
+      // whole pipeline uses inline evidence; per-request fallback still
+      // tries the Claude agent before `$.model.complete`.
+      prepared = await prepareCheckpoint(askWithFallback($, rt), rows, inlineEvidence(rows), models);
+    } else {
+      const access = await evidenceAccess($, rt, rows);
+      try {
+        prepared = await prepareCheckpoint(askViaAgents($, rt), rows, access, models);
+      } catch {
+        prepared = await prepareCheckpoint(askViaComplete($, rt), rows, inlineEvidence(rows), models);
+      }
     }
     if (rows.indexOf(prepared.coverageEndEntryId) > snapshotLastIndex) {
       throw new Error("Coverage boundary is past the inspected snapshot");
@@ -261,6 +359,8 @@ function statusText(rt: Runtime): string {
       ? `checkpoint=${published.checkpointId} coverage=${published.coverage.coverageEndEntryId} installs=${rt.state.installCount}`
       : "checkpoint=none",
     `thresholds prepare=${rt.config.prepareThresholdTokens} tokens hard=${rt.config.hardThresholdTokens} tokens recentTurns=${rt.config.recentTurns}`,
+    `builder=${describeBackend(rt.config.builderBackend, rt.config.builderModel, rt.config.builderPi)}`,
+    `verifier=${describeBackend(rt.config.verifierBackend, rt.config.verifierModel, rt.config.verifierPi)}`,
   ].join(" · ");
 }
 

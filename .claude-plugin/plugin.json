@@ -48,6 +48,62 @@
         "opus"
       ]
     },
+    "builderBackend": {
+      "type": "string",
+      "title": "Builder backend",
+      "description": "claude uses the private Claude agent; pi shells out to the Pi CLI for non-Claude models and falls back to Claude on failure.",
+      "default": "claude",
+      "options": [
+        "claude",
+        "pi"
+      ]
+    },
+    "verifierBackend": {
+      "type": "string",
+      "title": "Verifier backend",
+      "description": "claude uses the private Claude agent; pi shells out to the Pi CLI for non-Claude models and falls back to Claude on failure.",
+      "default": "claude",
+      "options": [
+        "claude",
+        "pi"
+      ]
+    },
+    "builderProvider": {
+      "type": "string",
+      "title": "Builder Pi provider",
+      "description": "Pi provider for the builder when its backend is pi (for example openai); leave blank with builder id for the Pi default model.",
+      "default": ""
+    },
+    "builderId": {
+      "type": "string",
+      "title": "Builder Pi model id",
+      "description": "Pi model id for the builder when its backend is pi; leave blank with builder provider for the Pi default model.",
+      "default": ""
+    },
+    "verifierProvider": {
+      "type": "string",
+      "title": "Verifier Pi provider",
+      "description": "Pi provider for the verifier when its backend is pi; leave blank with verifier id to reuse the builder Pi model.",
+      "default": ""
+    },
+    "verifierId": {
+      "type": "string",
+      "title": "Verifier Pi model id",
+      "description": "Pi model id for the verifier when its backend is pi; leave blank with verifier provider to reuse the builder Pi model.",
+      "default": ""
+    },
+    "piBinary": {
+      "type": "string",
+      "title": "Pi executable",
+      "description": "Pi CLI used by the pi backend; a bare name resolves on PATH.",
+      "default": "pi"
+    },
+    "piTimeoutMs": {
+      "type": "number",
+      "title": "Pi bridge timeout (ms)",
+      "description": "How long one Pi CLI call may run before the request falls back to Claude; at most 600000.",
+      "default": 540000
+    },
     "manualCompactMode": {
       "type": "string",
       "title": "Manual /compact mode",

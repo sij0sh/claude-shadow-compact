@@ -249,6 +249,50 @@ describe("config", () => {
     }
   });
 
+  test("pi backends default to claude with blank pairs", async () => {
+    const config = resolveConfig({});
+    expect(config.builderBackend).toBe("claude");
+    expect(config.verifierBackend).toBe("claude");
+    expect(config.builderPi).toEqual({ provider: "", id: "" });
+    expect(config.verifierPi).toEqual({ provider: "", id: "" });
+    expect(config.piBinary).toBe("pi");
+    expect(config.piTimeoutMs).toBe(540_000);
+  });
+
+  test("pi pairs require both fields and verifier inherits builder", async () => {
+    const half = resolveConfig({ builderBackend: "pi", builderProvider: "openai" });
+    expect(half.builderPi).toEqual({ provider: "", id: "" });
+    const full = resolveConfig({
+      builderBackend: "pi",
+      builderProvider: "openai",
+      builderId: "gpt-5-mini",
+    });
+    expect(full.builderBackend).toBe("pi");
+    expect(full.builderPi).toEqual({ provider: "openai", id: "gpt-5-mini" });
+    expect(full.verifierBackend).toBe("claude");
+    expect(full.verifierPi).toEqual({ provider: "openai", id: "gpt-5-mini" });
+    const own = resolveConfig({
+      builderBackend: "pi",
+      builderProvider: "openai",
+      builderId: "gpt-5-mini",
+      verifierBackend: "pi",
+      verifierProvider: "google",
+      verifierId: "gemini-3",
+    });
+    expect(own.verifierPi).toEqual({ provider: "google", id: "gemini-3" });
+    expect(resolveConfig({ builderBackend: "PI" }).builderBackend).toBe("pi");
+    expect(resolveConfig({ builderBackend: "bogus" }).builderBackend).toBe("claude");
+  });
+
+  test("pi binary and timeout fall back and clamp", async () => {
+    expect(resolveConfig({ piBinary: "" }).piBinary).toBe("pi");
+    expect(resolveConfig({ piBinary: " /usr/bin/pi " }).piBinary).toBe("/usr/bin/pi");
+    expect(resolveConfig({ piTimeoutMs: 0 }).piTimeoutMs).toBe(540_000);
+    expect(resolveConfig({ piTimeoutMs: "bad" }).piTimeoutMs).toBe(540_000);
+    expect(resolveConfig({ piTimeoutMs: 999_999 }).piTimeoutMs).toBe(600_000);
+    expect(resolveConfig({ piTimeoutMs: 60_000 }).piTimeoutMs).toBe(60_000);
+  });
+
   test("invalid token settings use defaults and always leave room for ordering", async () => {
     for (const invalid of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "bad", "", true, false]) {
       const config = resolveConfig({ prepareThresholdTokens: invalid, hardThresholdTokens: invalid });
@@ -276,11 +320,17 @@ describe("config", () => {
 
 // Drive the registered hooks with a small host so threshold scheduling is
 // deterministic and never invokes real model calls or native compaction.
-function thresholdHost(options: Record<string, number> = {}, messages: SessionMessage[] = []) {
+function thresholdHost(
+  options: Record<string, number | string> = {},
+  messages: SessionMessage[] = [],
+  processImpl?: (argv: readonly string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>,
+) {
   type Handler = ($: EngineInterface, e: any, next: (e: any) => Promise<any>) => any;
   const handlers = new Map<string, Handler>();
   const scheduled: Array<() => void> = [];
   const commands: string[] = [];
+  const processCalls: string[][] = [];
+  const stored: unknown[] = [];
   let busy = false;
   let preparations = 0;
   const on = ((event: string, ...args: unknown[]) => {
@@ -293,7 +343,15 @@ function thresholdHost(options: Record<string, number> = {}, messages: SessionMe
       id: async () => "threshold-test",
       messages: async () => messages,
     },
-    store: { get: async () => undefined },
+    store: {
+      get: async () => undefined,
+      set: async (_key: string, value: unknown) => { stored.push(value); },
+    },
+    process: { run: async (argv: readonly string[]) => {
+      processCalls.push([...argv]);
+      if (!processImpl) throw new Error("pi not installed");
+      return processImpl(argv);
+    } },
     clock: { after: (_delay: number, callback: () => void) => scheduled.push(callback) },
     command: { run: async ({ command }: { command: string }) => {
       commands.push(command);
@@ -311,6 +369,8 @@ function thresholdHost(options: Record<string, number> = {}, messages: SessionMe
   return {
     commands,
     scheduled,
+    processCalls,
+    stored,
     get preparations() { return preparations; },
     setBusy: (value: boolean) => { busy = value; },
     measure: (tokens?: number, percent = 0) => handlers.get("session.measure")!(
@@ -385,6 +445,72 @@ describe("token threshold scheduling", () => {
   });
 });
 
+describe("pi bridge backend", () => {
+  const twoRows = [message("user", "task"), message("assistant", "answer")];
+  const piOptions = {
+    builderBackend: "pi",
+    builderProvider: "openai",
+    builderId: "gpt-5-mini",
+    verifierBackend: "pi",
+  };
+
+  function piReplies(argv: readonly string[]) {
+    const system = argv[argv.indexOf("--system-prompt") + 1] ?? "";
+    if (system.includes("create evidence-grounded")) {
+      return JSON.stringify({ checkpoint: checkpointJson("E0001"), coverageEndEntryId: "bootstrap-1" });
+    }
+    return JSON.stringify({ verdict: "accept", reason: "grounded" });
+  }
+
+  test("pi backend publishes without touching Claude agents", async () => {
+    const host = thresholdHost(piOptions, twoRows, async (argv) => ({
+      exitCode: 0,
+      stdout: piReplies(argv),
+      stderr: "",
+    }));
+    await host.measure(160_000);
+    await host.flush();
+    expect(host.preparations).toBe(0);
+    expect(host.processCalls.length).toBe(2);
+    const builderArgv = host.processCalls[0] ?? [];
+    expect(builderArgv[0]).toBe("pi");
+    expect(builderArgv).toContain("--no-tools");
+    expect(builderArgv).toContain("--no-session");
+    expect(builderArgv).toContain("--model");
+    expect(builderArgv).toContain("gpt-5-mini");
+    expect(builderArgv).toContain("--provider");
+    expect(builderArgv).toContain("openai");
+    expect(host.stored.length).toBe(1);
+  });
+
+  test("bad bridge output falls back to the Claude agent", async () => {
+    const host = thresholdHost(piOptions, twoRows, async () => ({
+      exitCode: 0,
+      stdout: "no json here",
+      stderr: "",
+    }));
+    await host.measure(160_000);
+    await host.flush();
+    expect(host.processCalls.length).toBe(1);
+    // The Claude agent spawn was tried after the bridge answer failed validation.
+    expect(host.preparations).toBe(1);
+    expect(host.stored.length).toBe(0);
+  });
+
+  test("bridge exit failure falls back to the Claude agent", async () => {
+    const host = thresholdHost(piOptions, twoRows, async () => ({
+      exitCode: 1,
+      stdout: "",
+      stderr: "boom",
+    }));
+    await host.measure(160_000);
+    await host.flush();
+    expect(host.processCalls.length).toBe(1);
+    expect(host.preparations).toBe(1);
+    expect(host.stored.length).toBe(0);
+  });
+});
+
 describe("engine integration", () => {
   test("shadow-status command answers through the engine", async ($, on) => {
     on("session.start", (_$, e) => ({ cwd: e.cwd }));
@@ -397,6 +523,8 @@ describe("engine integration", () => {
     });
     expect(result.text).toContain("shadow-compact: phase=");
     expect(result.text).toContain("prepare=160000 tokens hard=250000 tokens");
+    expect(result.text).toContain("builder=claude:inherit");
+    expect(result.text).toContain("verifier=claude:inherit");
   });
 
   test("compact with no checkpoint defers without inventing messages", async ($, on) => {
