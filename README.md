@@ -15,14 +15,12 @@ is marked verified, untested work stays unverified, and the checkpoint names
 exactly how far it covers. A second agent checks the first. If the check
 fails, the session falls back to native compaction.
 
-Both examples are synthetic and show the same session on each side, so
-compare shape, not size. Tasks and paths are generic on purpose.
+The example is synthetic and shows the same session on each side, so
+compare shape, not size. Task and paths are generic on purpose.
 
 <div align="center">
 
-<img src="./docs/images/comparison-csv-export.svg" width="100%" alt="Synthetic Example 1: native prose versus Shadow checkpoint for adding CSV export to a notes app" />
-
-<img src="./docs/images/comparison-login-retry.svg" width="100%" alt="Synthetic Example 2: native prose versus Shadow checkpoint for fixing a login retry timeout" />
+<img src="./docs/images/comparison-full-checkpoint.svg" width="100%" alt="Synthetic example: native prose versus Shadow checkpoint across all 12 checkpoint sections for adding CSV export to a notes app" />
 
 </div>
 
@@ -35,43 +33,46 @@ compare shape, not size. Tasks and paths are generic on purpose.
 | Failure mode | Always installs prose | Falls back to native when unsafe |
 
 <details>
-<summary>Text version of the examples</summary>
+<summary>Text version of the example</summary>
 
-Example 1 — add CSV export (`src/notes/export.ts`):
+Synthetic session — add CSV export (`src/notes/export.ts`). Left column:
+what native prose provides per area. Right column: the Shadow checkpoint.
 
 ```text
 Native: "Add CSV export to notes app. Updated export logic and wired
 the button. Tests were run and things look good. Remaining work
-is handled."
+is handled. See prior files for details."
 
 Shadow:
 ## Objective
 - Add CSV export, UTF-8 + commas [E0004]
+## Constraints
+- Keep JSON export working; bundle size stays flat [E0006]
+## Completed Work
+- Serializer written; Export button wired [E0012]
+## Current State
+- Serializer done; Excel import untried [E0023]
+## Decisions
+- RFC-4180 quoting, not ad-hoc escaping [E0015]
+## Open Issues
+- Excel import of quoted commas not tried [E0031]
+## Next Actions
+- Open output in Excel, then merge [E0031]
+## Critical Context
+- Export path: export.ts via export-button.tsx [E0004]
+## Modified Files
+- src/notes/export.ts, src/notes/export-button.tsx [E0012]
+## Referenced Files
+- tests/notes-export.test.ts, 14 passed [E0023]
 ## Verification State
-- [verified] export unit tests, 14 passed [E0023]
+- [verified] export tests, 14 passed [E0023]
 - [unverified] Excel import not tried [E0031]
 ## Continuation
-- Next: open file in Excel, then close
-Coverage through E0031.
+- Goal: ship an export Excel opens cleanly
+- Approach: verify in Excel, then merge
+- Next: open notes.csv in Excel
+Coverage through E0031. Builder + verifier; fails closed to native.
 ```
-
-Example 2 — fix login retry (`src/auth/retry.ts`):
-
-```text
-Native: "Fixed login retry. Changed timeout handling and added backoff.
-Verified the fix works. Cleanup left."
-
-Shadow:
-## Objective
-- Fix retry: 3 tries, 2s backoff [E0007]
-## Verification State
-- [verified] retry test passes 5/5 [E0019]
-- [unverified] rate-limit path not reproduced [E0026]
-## Continuation
-- Next: repro rate-limit with stub, merge
-Coverage through E0028.
-```
-
 </details>
 
 ## How it works

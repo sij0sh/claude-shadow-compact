@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1500" viewBox="0 0 1200 1500" role="img" aria-labelledby="t d">
+<title id="t">Native prose vs Shadow checkpoint, all 12 sections, synthetic CSV-export session</title>
+<desc id="d">One synthetic session shown on both sides. Left: native prose covers a few areas and leaves most unstated. Right: Shadow checkpoint fills all ten fixed sections plus verification state and continuation, every item citing evidence refs.</desc>
+<rect x="0" y="0" width="1200" height="1500" rx="16" fill="#f6f8fa"/>
+<text x="600" y="34" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="20" font-weight="700" fill="#24292f">Native vs Shadow — full checkpoint, one synthetic session</text>
+<text x="600" y="56" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#57606a">Add CSV export to a notes app (src/notes/export.ts) · same session both sides · compare shape, not size</text>
+<rect x="346" y="66" width="200" height="24" rx="12" fill="#eaeef2"/>
+<text x="446" y="83" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#57606a">Native compact — prose</text>
+<rect x="807" y="66" width="250" height="24" rx="12" fill="#dafbe1"/>
+<text x="932" y="83" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#116329">Shadow checkpoint — structured</text>
+<line x1="24" y1="100" x2="1176" y2="100" stroke="#d0d7de" stroke-width="1"/>
+<text x="36" y="126" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">Objective</text>
+<text x="228" y="126" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">Add CSV export to notes app.</text>
+<text x="700" y="126" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">Add CSV export, UTF-8 + commas</text>
+<text x="1164" y="126" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#57606a">[E0004]</text>
+<line x1="24" y1="208" x2="1176" y2="208" stroke="#d0d7de" stroke-width="1"/>
+<text x="36" y="234" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">Constraints</text>
+<text x="228" y="234" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#6e7781">— not stated</text>
+<text x="700" y="234" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">Keep JSON export working,</text>
+<text x="700" y="254" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">bundle size stays flat</text>
+<text x="1164" y="254" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#57606a">[E0006]</text>
+<line x1="24" y1="316" x2="1176" y2="316" stroke="#d0d7de" stroke-width="1"/>
+<text x="36" y="342" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">Completed Work</text>
+<text x="228" y="342" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">Updated export logic,</text>
+<text x="228" y="362" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">wired the button.</text>
+<text x="700" y="342" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">Serializer written;</text>
+<text x="700" y="362" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">Export button wired</text>
+<text x="1164" y="362" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#57606a">[E0012]</text>
+<line x1="24" y1="424" x2="1176" y2="424" stroke="#d0d7de" stroke-width="1"/>
+<text x="36" y="450" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">Current State</text>
+<text x="228" y="450" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#6e7781">— scattered in prose</text>
+<text x="700" y="450" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">Serializer done;</text>
+<text x="700" y="470" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">Excel import untried</text>
+<text x="1164" y="470" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#57606a">[E0023]</text>
+<line x1="24" y1="532" x2="1176" y2="532" stroke="#d0d7de" stroke-width="1"/>
+<text x="36" y="558" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">Decisions</text>
+<text x="228" y="558" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#6e7781">— not stated</text>
+<text x="700" y="558" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">RFC-4180 quoting,</text>
+<text x="700" y="578" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">not ad-hoc escaping</text>
+<text x="1164" y="578" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#57606a">[E0015]</text>
+<line x1="24" y1="640" x2="1176" y2="640" stroke="#d0d7de" stroke-width="1"/>
+<text x="36" y="666" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">Open Issues</text>
+<text x="228" y="666" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#6e7781">— not stated</text>
+<text x="700" y="666" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">Excel import of quoted</text>
+<text x="700" y="686" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">commas not tried</text>
+<text x="1164" y="686" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#57606a">[E0031]</text>
+<line x1="24" y1="748" x2="1176" y2="748" stroke="#d0d7de" stroke-width="1"/>
+<text x="36" y="774" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">Next Actions</text>
+<text x="228" y="774" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">Remaining work is handled.</text>
+<text x="700" y="774" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">Open output in Excel,</text>
+<text x="700" y="794" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">then merge</text>
+<text x="1164" y="794" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#57606a">[E0031]</text>
+<line x1="24" y1="856" x2="1176" y2="856" stroke="#d0d7de" stroke-width="1"/>
+<text x="36" y="882" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">Critical Context</text>
+<text x="228" y="882" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#6e7781">— (see prior files)</text>
+<text x="700" y="882" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">Export path: export.ts</text>
+<text x="700" y="902" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">via export-button.tsx</text>
+<text x="1164" y="902" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#57606a">[E0004]</text>
+<line x1="24" y1="964" x2="1176" y2="964" stroke="#d0d7de" stroke-width="1"/>
+<text x="36" y="990" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">Modified Files</text>
+<text x="228" y="990" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#6e7781">— (lives in details.readFiles)</text>
+<text x="700" y="990" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">src/notes/export.ts,</text>
+<text x="700" y="1010" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">src/notes/export-button.tsx</text>
+<text x="1164" y="1010" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#57606a">[E0012]</text>
+<line x1="24" y1="1072" x2="1176" y2="1072" stroke="#d0d7de" stroke-width="1"/>
+<text x="36" y="1098" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">Referenced Files</text>
+<text x="228" y="1098" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#6e7781">— (lives in details.readFiles)</text>
+<text x="700" y="1098" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">tests/notes-export.test.ts,</text>
+<text x="700" y="1118" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">14 passed</text>
+<text x="1164" y="1118" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#57606a">[E0023]</text>
+<line x1="24" y1="1180" x2="1176" y2="1180" stroke="#d0d7de" stroke-width="1"/>
+<text x="36" y="1206" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">Verification State</text>
+<text x="228" y="1206" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">Tests were run and</text>
+<text x="228" y="1226" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">things look good. (claimed)</text>
+<text x="700" y="1206" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">[verified] export tests, 14 passed</text>
+<text x="1164" y="1206" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#57606a">[E0023]</text>
+<text x="700" y="1226" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">[unverified] Excel import untried</text>
+<text x="1164" y="1226" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#57606a">[E0031]</text>
+<line x1="24" y1="1288" x2="1176" y2="1288" stroke="#d0d7de" stroke-width="1"/>
+<text x="36" y="1314" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">Continuation</text>
+<text x="228" y="1314" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#6e7781">— buried in prose</text>
+<text x="700" y="1314" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">Goal: ship an export Excel opens cleanly</text>
+<text x="700" y="1334" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">Approach: verify in Excel, then merge</text>
+<text x="700" y="1354" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#24292f">Next: open notes.csv in Excel</text>
+<line x1="24" y1="1396" x2="1176" y2="1396" stroke="#d0d7de" stroke-width="1"/>
+<line x1="213" y1="100" x2="213" y2="1396" stroke="#e5e8eb" stroke-width="1"/>
+<line x1="682" y1="100" x2="682" y2="1396" stroke="#e5e8eb" stroke-width="1"/>
+<rect x="24" y="1412" width="568" height="58" rx="8" fill="#ffebe9" stroke="#ff8182" stroke-width="1"/>
+<text x="40" y="1435" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#82071e">One prose blob — claims unlinked</text>
+<text x="40" y="1455" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#82071e">Files ride in details.readFiles, not in text.</text>
+<rect x="608" y="1412" width="568" height="58" rx="8" fill="#dafbe1" stroke="#1a7f37" stroke-width="1"/>
+<text x="624" y="1435" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#116329">12 blocks — every item cites E-refs</text>
+<text x="624" y="1455" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#116329">Coverage through E0031 · fails closed to native.</text>
+</svg>
