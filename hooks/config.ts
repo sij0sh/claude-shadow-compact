@@ -26,6 +26,9 @@ export interface PiModelPair {
   id: string;
 }
 
+/** Pi thinking levels accepted by `pi --thinking`. Blank means Pi default. */
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
 export interface ShadowConfig {
   prepareThresholdTokens: number;
   hardThresholdTokens: number;
@@ -36,6 +39,8 @@ export interface ShadowConfig {
   verifierBackend: ModelBackend;
   builderPi: PiModelPair;
   verifierPi: PiModelPair;
+  builderThinking: string;
+  verifierThinking: string;
   piBinary: string;
   piTimeoutMs: number;
   manualCompactMode: ManualCompactMode;
@@ -67,6 +72,12 @@ function piPair(provider: unknown, id: unknown): PiModelPair {
   return pair;
 }
 
+function thinking(value: unknown): string {
+  const level = text(value).toLowerCase();
+  if (level === "" || level === "default") return "";
+  return THINKING_LEVELS.has(level) ? level : "";
+}
+
 function piTimeout(value: unknown): number {
   const parsed = positiveInt(value, DEFAULT_PI_TIMEOUT_MS);
   return Math.min(parsed, MAX_PI_TIMEOUT_MS);
@@ -82,6 +93,10 @@ export function resolveConfig(options: PluginOptions): ShadowConfig {
   const verifierRaw = piPair(options.verifierProvider, options.verifierId);
   const verifierPi =
     verifierRaw.provider === "" && verifierRaw.id === "" ? builderPi : verifierRaw;
+  const builderThinking = thinking(options.builderThinking);
+  // A blank verifier level reuses the builder level, as with Pi pairs.
+  const verifierOwn = thinking(options.verifierThinking);
+  const verifierThinking = verifierOwn === "" ? builderThinking : verifierOwn;
   const piBinary = text(options.piBinary) === "" ? DEFAULT_PI_BINARY : text(options.piBinary);
   return {
     prepareThresholdTokens: prepare,
@@ -93,6 +108,8 @@ export function resolveConfig(options: PluginOptions): ShadowConfig {
     verifierBackend: backend(options.verifierBackend),
     builderPi,
     verifierPi,
+    builderThinking,
+    verifierThinking,
     piBinary,
     piTimeoutMs: piTimeout(options.piTimeoutMs),
     manualCompactMode: options.manualCompactMode === "native" ? "native" : "shadow",
@@ -100,9 +117,15 @@ export function resolveConfig(options: PluginOptions): ShadowConfig {
 }
 
 /** Human-readable backend + model for `/shadow-status`. */
-export function describeBackend(backendName: ModelBackend, claudeModel: string, pi: PiModelPair): string {
+export function describeBackend(
+  backendName: ModelBackend,
+  claudeModel: string,
+  pi: PiModelPair,
+  thinkingLevel: string,
+): string {
   if (backendName === "pi") {
-    return pi.id === "" ? "pi:default" : `pi:${pi.provider}/${pi.id}`;
+    const model = pi.id === "" ? "default" : `${pi.provider}/${pi.id}`;
+    return thinkingLevel === "" ? `pi:${model}` : `pi:${model}:${thinkingLevel}`;
   }
   return `claude:${claudeModel}`;
 }

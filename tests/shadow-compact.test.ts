@@ -5,7 +5,7 @@ import {
   validateCheckpointObject,
   type Checkpoint,
 } from "../hooks/checkpoint.js";
-import { isAtOrAbove, resolveConfig } from "../hooks/config.js";
+import { describeBackend, isAtOrAbove, resolveConfig } from "../hooks/config.js";
 import { EvidenceArchive } from "../hooks/evidence.js";
 import { redactSecretValue, sanitizeForContext } from "../hooks/normalize.js";
 import { prepareCheckpoint } from "../hooks/prepare.js";
@@ -284,6 +284,22 @@ describe("config", () => {
     expect(resolveConfig({ builderBackend: "bogus" }).builderBackend).toBe("claude");
   });
 
+  test("pi thinking levels parse and verifier inherits builder", async () => {
+    expect(resolveConfig({}).builderThinking).toBe("");
+    expect(resolveConfig({}).verifierThinking).toBe("");
+    const full = resolveConfig({ builderThinking: "HIGH", verifierThinking: "XHigh" });
+    expect(full.builderThinking).toBe("high");
+    expect(full.verifierThinking).toBe("xhigh");
+    expect(resolveConfig({ builderThinking: "high" }).verifierThinking).toBe("high");
+    expect(resolveConfig({ builderThinking: "turbo" }).builderThinking).toBe("");
+    expect(describeBackend("pi", "inherit", { provider: "meta", id: "muse-spark-1.3-contributor" }, "high"))
+      .toBe("pi:meta/muse-spark-1.3-contributor:high");
+    expect(describeBackend("pi", "inherit", { provider: "", id: "" }, ""))
+      .toBe("pi:default");
+    expect(describeBackend("claude", "sonnet", { provider: "", id: "" }, ""))
+      .toBe("claude:sonnet");
+  });
+
   test("pi binary and timeout fall back and clamp", async () => {
     expect(resolveConfig({ piBinary: "" }).piBinary).toBe("pi");
     expect(resolveConfig({ piBinary: " /usr/bin/pi " }).piBinary).toBe("/usr/bin/pi");
@@ -451,7 +467,9 @@ describe("pi bridge backend", () => {
     builderBackend: "pi",
     builderProvider: "openai",
     builderId: "gpt-5-mini",
+    builderThinking: "high",
     verifierBackend: "pi",
+    verifierThinking: "xhigh",
   };
 
   function piReplies(argv: readonly string[]) {
@@ -480,6 +498,10 @@ describe("pi bridge backend", () => {
     expect(builderArgv).toContain("gpt-5-mini");
     expect(builderArgv).toContain("--provider");
     expect(builderArgv).toContain("openai");
+    expect(builderArgv).toContain("--thinking");
+    expect(builderArgv).toContain("high");
+    const verifierArgv = host.processCalls[1] ?? [];
+    expect(verifierArgv).toContain("xhigh");
     expect(host.stored.length).toBe(1);
   });
 

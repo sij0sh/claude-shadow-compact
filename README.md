@@ -149,6 +149,7 @@ Set via the plugin's `userConfig` (Claude Code `/config` or
 | `builderBackend` / `verifierBackend` | `claude` | `claude` agent or `pi` CLI bridge |
 | `builderProvider` / `builderId` | blank | Pi provider/model for the builder when its backend is `pi` |
 | `verifierProvider` / `verifierId` | blank | Pi provider/model for the verifier; blank reuses the builder Pi model |
+| `builderThinking` / `verifierThinking` | `default` | Pi thinking level (`off` to `max`); `default` uses the Pi default, verifier reuses builder |
 | `piBinary` | `pi` | Pi CLI used by the `pi` backend |
 | `piTimeoutMs` | `540000` | One Pi call may run this long before fallback; at most `600000` |
 | `manualCompactMode` | `shadow` | `shadow` or `native` for manual `/compact` |

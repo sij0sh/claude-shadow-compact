@@ -208,6 +208,8 @@ function askViaPiBridge($: EngineInterface, rt: Runtime, kind: "builder" | "veri
       argv.push("--model", pair.id);
       if (pair.provider !== "") argv.push("--provider", pair.provider);
     }
+    const thinkingLevel = kind === "builder" ? rt.config.builderThinking : rt.config.verifierThinking;
+    if (thinkingLevel !== "") argv.push("--thinking", thinkingLevel);
     argv.push("--", request.prompt);
     let result;
     try {
@@ -359,8 +361,8 @@ function statusText(rt: Runtime): string {
       ? `checkpoint=${published.checkpointId} coverage=${published.coverage.coverageEndEntryId} installs=${rt.state.installCount}`
       : "checkpoint=none",
     `thresholds prepare=${rt.config.prepareThresholdTokens} tokens hard=${rt.config.hardThresholdTokens} tokens recentTurns=${rt.config.recentTurns}`,
-    `builder=${describeBackend(rt.config.builderBackend, rt.config.builderModel, rt.config.builderPi)}`,
-    `verifier=${describeBackend(rt.config.verifierBackend, rt.config.verifierModel, rt.config.verifierPi)}`,
+    `builder=${describeBackend(rt.config.builderBackend, rt.config.builderModel, rt.config.builderPi, rt.config.builderThinking)}`,
+    `verifier=${describeBackend(rt.config.verifierBackend, rt.config.verifierModel, rt.config.verifierPi, rt.config.verifierThinking)}`,
   ].join(" · ");
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "shadow-compact",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Verified-checkpoint compaction for Claude Code: a private builder and independent verifier prepare an evidence-grounded checkpoint in the background, and session.compact installs it with the exact recent tail preserved by handle.",
   "author": {
     "name": "pi-shadow-compact port"
@@ -91,6 +91,38 @@
       "title": "Verifier Pi model id",
       "description": "Pi model id for the verifier when its backend is pi; leave blank with verifier provider to reuse the builder Pi model.",
       "default": ""
+    },
+    "builderThinking": {
+      "type": "string",
+      "title": "Builder Pi thinking level",
+      "description": "Pi thinking level for the builder when its backend is pi; default uses the Pi default.",
+      "default": "default",
+      "options": [
+        "default",
+        "off",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    "verifierThinking": {
+      "type": "string",
+      "title": "Verifier Pi thinking level",
+      "description": "Pi thinking level for the verifier when its backend is pi; default reuses the builder level.",
+      "default": "default",
+      "options": [
+        "default",
+        "off",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
     },
     "piBinary": {
       "type": "string",
