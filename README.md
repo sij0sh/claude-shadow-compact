@@ -7,6 +7,73 @@ when compaction fires, Shadow answers with a **verified structured
 checkpoint plus the exact recent tail** (original messages carried by
 their engine handles, untouched), instead of Claude's native summary.
 
+## Native vs Shadow
+
+Native compaction writes a prose summary of what it saw. Shadow writes a
+checked checkpoint: every claim points at saved session entries, tested work
+is marked verified, untested work stays unverified, and the checkpoint names
+exactly how far it covers. A second agent checks the first. If the check
+fails, the session falls back to native compaction.
+
+Both examples are synthetic and show the same session on each side, so
+compare shape, not size. Tasks and paths are generic on purpose.
+
+<div align="center">
+
+<img src="./docs/images/comparison-csv-export.svg" width="100%" alt="Synthetic Example 1: native prose versus Shadow checkpoint for adding CSV export to a notes app" />
+
+<img src="./docs/images/comparison-login-retry.svg" width="100%" alt="Synthetic Example 2: native prose versus Shadow checkpoint for fixing a login retry timeout" />
+
+</div>
+
+| Area | Native | Shadow |
+|---|---|---|
+| Grounding | Prose, no links | Each claim cites entries (`E0004` ...) |
+| Tested vs untested | Same voice | `[verified]` vs `[unverified]` ledger |
+| Resume pointer | Buried in prose | Goal, approach, next step |
+| Coverage proof | None | `coverageEndEntryId` in live transcript |
+| Failure mode | Always installs prose | Falls back to native when unsafe |
+
+<details>
+<summary>Text version of the examples</summary>
+
+Example 1 — add CSV export (`src/notes/export.ts`):
+
+```text
+Native: "Add CSV export to notes app. Updated export logic and wired
+the button. Tests were run and things look good. Remaining work
+is handled."
+
+Shadow:
+## Objective
+- Add CSV export, UTF-8 + commas [E0004]
+## Verification State
+- [verified] export unit tests, 14 passed [E0023]
+- [unverified] Excel import not tried [E0031]
+## Continuation
+- Next: open file in Excel, then close
+Coverage through E0031.
+```
+
+Example 2 — fix login retry (`src/auth/retry.ts`):
+
+```text
+Native: "Fixed login retry. Changed timeout handling and added backoff.
+Verified the fix works. Cleanup left."
+
+Shadow:
+## Objective
+- Fix retry: 3 tries, 2s backoff [E0007]
+## Verification State
+- [verified] retry test passes 5/5 [E0019]
+- [unverified] rate-limit path not reproduced [E0026]
+## Continuation
+- Next: repro rate-limit with stub, merge
+Coverage through E0028.
+```
+
+</details>
+
 ## How it works
 
 ```text
@@ -79,6 +146,11 @@ Set via the plugin's `userConfig` (Claude Code `/config` or
 | `hardThresholdTokens` | `250000` | Request compaction at the next safe boundary |
 | `recentTurns` | `10` | Minimum recent turns kept verbatim |
 | `builderModel` / `verifierModel` | `inherit` | Checkpoint agent models |
+| `builderBackend` / `verifierBackend` | `claude` | `claude` agent or `pi` CLI bridge |
+| `builderProvider` / `builderId` | blank | Pi provider/model for the builder when its backend is `pi` |
+| `verifierProvider` / `verifierId` | blank | Pi provider/model for the verifier; blank reuses the builder Pi model |
+| `piBinary` | `pi` | Pi CLI used by the `pi` backend |
+| `piTimeoutMs` | `540000` | One Pi call may run this long before fallback; at most `600000` |
 | `manualCompactMode` | `shadow` | `shadow` or `native` for manual `/compact` |
 
 Token thresholds must be positive safe integers. Invalid values use the
@@ -90,6 +162,16 @@ no longer used; replace any saved overrides with token values.
 
 The hard threshold is a trigger, not a strict cap on a running turn: Claude
 pins the transcript during a turn, so compaction retries when the turn ends.
+
+Set a backend to `pi` to answer builder or verifier requests with a
+non-Claude model through the Pi CLI (for example `builderProvider`
+`openai` with `builderId` `gpt-5-mini`). The Pi CLI must be on PATH and
+authenticated through Pi's own settings; the bridge calls it tool-less
+and session-less with sanitized evidence only. A blank provider and id
+uses the Pi default model, and a half-set pair falls back to blank. Any
+bridge failure (missing binary, timeout, bad JSON) falls back to the
+Claude agent and then `$.model.complete`, so Claude remains the default
+and the safety net. `/shadow-status` shows the resolved backend per role.
 
 ## Deferred from the Pi version
 
