@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="500" viewBox="0 0 1200 500" role="img" aria-labelledby="t1 d1">
+<title id="t1">Example 1 — Add CSV export to notes app: native prose vs Shadow checkpoint</title>
+<desc id="d1">Synthetic example. Left shows native prose with no evidence links. Right shows Shadow checkpoint with verified split, evidence refs, and explicit next step.</desc>
+<rect x="0" y="0" width="1200" height="500" rx="16" fill="#f6f8fa"/>
+<text x="600" y="34" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="20" font-weight="700" fill="#24292f">Example 1 — Add CSV export to a notes app (synthetic, same session)</text>
+
+<!-- Left card : native -->
+<g>
+<rect x="24" y="56" width="568" height="420" rx="12" fill="#ffffff" stroke="#d0d7de" stroke-width="1.5"/>
+<rect x="44" y="76" width="200" height="26" rx="13" fill="#eaeef2"/>
+<text x="144" y="94" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#57606a">Native compact — prose</text>
+<text x="44" y="130" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" fill="#24292f">
+<tspan x="44" dy="0">Add CSV export to notes app. Updated</tspan>
+<tspan x="44" dy="22">export logic and wired the button.</tspan>
+<tspan x="44" dy="22">Tests were run and things look good.</tspan>
+<tspan x="44" dy="22">Remaining work is handled. See prior</tspan>
+<tspan x="44" dy="22">files for details.</tspan>
+</text>
+<text x="44" y="270" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#57606a">
+<tspan x="44" dy="0">touched: src/notes/export.ts,</tspan>
+<tspan x="44" dy="19">src/notes/export-button.tsx</tspan>
+</text>
+<rect x="44" y="318" width="528" height="60" rx="8" fill="#ffebe9" stroke="#ff8182" stroke-width="1"/>
+<text x="60" y="342" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#82071e">No evidence links · verified? unknown</text>
+<text x="60" y="362" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#82071e">Next step buried in prose — resume guesses.</text>
+<rect x="44" y="390" width="528" height="46" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1" stroke-dasharray="5 4"/>
+<text x="60" y="418" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6e7781">shape: one markdown blob, no E-refs, no coverage</text>
+</g>
+
+<!-- Right card : shadow -->
+<g>
+<rect x="608" y="56" width="568" height="420" rx="12" fill="#ffffff" stroke="#1a7f37" stroke-width="2"/>
+<rect x="628" y="76" width="236" height="26" rx="13" fill="#dafbe1"/>
+<text x="746" y="94" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#116329">Shadow checkpoint — verified</text>
+<text x="628" y="130" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">OBJECTIVE</text>
+<text x="628" y="150" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#24292f">• Add CSV export, UTF-8 + commas <tspan fill="#57606a">[E0004]</tspan></text>
+<text x="628" y="184" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">VERIFICATION STATE</text>
+<rect x="628" y="194" width="72" height="20" rx="10" fill="#1a7f37"/>
+<text x="664" y="208" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#ffffff">verified</text>
+<text x="706" y="208" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#24292f">export tests, 14 passed <tspan fill="#57606a">[E0023]</tspan></text>
+<rect x="628" y="220" width="82" height="20" rx="10" fill="#9a6700"/>
+<text x="669" y="234" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#ffffff">unverified</text>
+<text x="716" y="234" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#24292f">Excel import not tried <tspan fill="#57606a">[E0031]</tspan></text>
+<text x="628" y="268" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">CONTINUATION</text>
+<text x="628" y="288" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#24292f">• Next: open file in Excel, then close</text>
+<text x="628" y="312" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#57606a">touched: src/notes/export.ts · coverage through E0031</text>
+<rect x="628" y="330" width="528" height="60" rx="8" fill="#dafbe1" stroke="#1a7f37" stroke-width="1"/>
+<text x="644" y="354" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#116329">Each claim → E-ref · tested vs untested split</text>
+<text x="644" y="374" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#116329">Next step explicit — resume continues exactly.</text>
+<rect x="628" y="402" width="528" height="46" rx="8" fill="#ffffff" stroke="#1a7f37" stroke-width="1" stroke-dasharray="5 4"/>
+<text x="644" y="430" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#116329">builder + verifier · fails closed to native if unsafe</text>
+</g>
+</svg>
