@@ -9,17 +9,13 @@
 <rect x="24" y="56" width="568" height="420" rx="12" fill="#ffffff" stroke="#d0d7de" stroke-width="1.5"/>
 <rect x="44" y="76" width="200" height="26" rx="13" fill="#eaeef2"/>
 <text x="144" y="94" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#57606a">Native compact — prose</text>
-<text x="44" y="130" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" fill="#24292f">
-<tspan x="44" dy="0">Add CSV export to notes app. Updated</tspan>
-<tspan x="44" dy="22">export logic and wired the button.</tspan>
-<tspan x="44" dy="22">Tests were run and things look good.</tspan>
-<tspan x="44" dy="22">Remaining work is handled. See prior</tspan>
-<tspan x="44" dy="22">files for details.</tspan>
-</text>
-<text x="44" y="270" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#57606a">
-<tspan x="44" dy="0">touched: src/notes/export.ts,</tspan>
-<tspan x="44" dy="19">src/notes/export-button.tsx</tspan>
-</text>
+<text x="44" y="130" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" fill="#24292f">Add CSV export to notes app. Updated</text>
+<text x="44" y="152" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" fill="#24292f">export logic and wired the button.</text>
+<text x="44" y="174" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" fill="#24292f">Tests were run and things look good.</text>
+<text x="44" y="196" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" fill="#24292f">Remaining work is handled. See prior</text>
+<text x="44" y="218" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" fill="#24292f">files for details.</text>
+<text x="44" y="270" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#57606a">touched: src/notes/export.ts,</text>
+<text x="44" y="289" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#57606a">src/notes/export-button.tsx</text>
 <rect x="44" y="318" width="528" height="60" rx="8" fill="#ffebe9" stroke="#ff8182" stroke-width="1"/>
 <text x="60" y="342" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#82071e">No evidence links · verified? unknown</text>
 <text x="60" y="362" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#82071e">Next step buried in prose — resume guesses.</text>
@@ -33,14 +29,17 @@
 <rect x="628" y="76" width="236" height="26" rx="13" fill="#dafbe1"/>
 <text x="746" y="94" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#116329">Shadow checkpoint — verified</text>
 <text x="628" y="130" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">OBJECTIVE</text>
-<text x="628" y="150" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#24292f">• Add CSV export, UTF-8 + commas <tspan fill="#57606a">[E0004]</tspan></text>
+<text x="628" y="150" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#24292f">• Add CSV export, UTF-8 + commas</text>
+<text x="1156" y="150" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#57606a">[E0004]</text>
 <text x="628" y="184" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">VERIFICATION STATE</text>
 <rect x="628" y="194" width="72" height="20" rx="10" fill="#1a7f37"/>
 <text x="664" y="208" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#ffffff">verified</text>
-<text x="706" y="208" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#24292f">export tests, 14 passed <tspan fill="#57606a">[E0023]</tspan></text>
+<text x="706" y="208" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#24292f">export tests, 14 passed</text>
+<text x="1156" y="208" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#57606a">[E0023]</text>
 <rect x="628" y="220" width="82" height="20" rx="10" fill="#9a6700"/>
 <text x="669" y="234" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#ffffff">unverified</text>
-<text x="716" y="234" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#24292f">Excel import not tried <tspan fill="#57606a">[E0031]</tspan></text>
+<text x="716" y="234" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#24292f">Excel import not tried</text>
+<text x="1156" y="234" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#57606a">[E0031]</text>
 <text x="628" y="268" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">CONTINUATION</text>
 <text x="628" y="288" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#24292f">• Next: open file in Excel, then close</text>
 <text x="628" y="312" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#57606a">touched: src/notes/export.ts · coverage through E0031</text>

@@ -9,16 +9,12 @@
 <rect x="24" y="56" width="568" height="420" rx="12" fill="#ffffff" stroke="#d0d7de" stroke-width="1.5"/>
 <rect x="44" y="76" width="200" height="26" rx="13" fill="#eaeef2"/>
 <text x="144" y="94" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#57606a">Native compact — prose</text>
-<text x="44" y="130" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" fill="#24292f">
-<tspan x="44" dy="0">Fixed login retry. Changed timeout</tspan>
-<tspan x="44" dy="22">handling and added backoff. Verified</tspan>
-<tspan x="44" dy="22">the fix works. Cleanup left. Auth</tspan>
-<tspan x="44" dy="22">should be fine now.</tspan>
-</text>
-<text x="44" y="270" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#57606a">
-<tspan x="44" dy="0">touched: src/auth/retry.ts,</tspan>
-<tspan x="44" dy="19">tests/auth-retry.test.ts</tspan>
-</text>
+<text x="44" y="130" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" fill="#24292f">Fixed login retry. Changed timeout</text>
+<text x="44" y="152" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" fill="#24292f">handling and added backoff. Verified</text>
+<text x="44" y="174" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" fill="#24292f">the fix works. Cleanup left. Auth</text>
+<text x="44" y="196" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" fill="#24292f">should be fine now.</text>
+<text x="44" y="270" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#57606a">touched: src/auth/retry.ts,</text>
+<text x="44" y="289" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#57606a">tests/auth-retry.test.ts</text>
 <rect x="44" y="318" width="528" height="60" rx="8" fill="#ffebe9" stroke="#ff8182" stroke-width="1"/>
 <text x="60" y="342" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#82071e">Says “verified” — rate-limit never repro’d</text>
 <text x="60" y="362" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#82071e">No link to test output — cannot re-check.</text>
@@ -32,14 +28,17 @@
 <rect x="628" y="76" width="236" height="26" rx="13" fill="#dafbe1"/>
 <text x="746" y="94" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" font-weight="700" fill="#116329">Shadow checkpoint — verified</text>
 <text x="628" y="130" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">OBJECTIVE</text>
-<text x="628" y="150" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#24292f">• Fix retry: 3 tries, 2s backoff <tspan fill="#57606a">[E0007]</tspan></text>
+<text x="628" y="150" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#24292f">• Fix retry: 3 tries, 2s backoff</text>
+<text x="1156" y="150" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#57606a">[E0007]</text>
 <text x="628" y="184" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">VERIFICATION STATE</text>
 <rect x="628" y="194" width="72" height="20" rx="10" fill="#1a7f37"/>
 <text x="664" y="208" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#ffffff">verified</text>
-<text x="706" y="208" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#24292f">retry test passes 5/5 <tspan fill="#57606a">[E0019]</tspan></text>
+<text x="706" y="208" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#24292f">retry test passes 5/5</text>
+<text x="1156" y="208" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#57606a">[E0019]</text>
 <rect x="628" y="220" width="82" height="20" rx="10" fill="#9a6700"/>
 <text x="669" y="234" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#ffffff">unverified</text>
-<text x="716" y="234" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#24292f">rate-limit path not repro’d <tspan fill="#57606a">[E0026]</tspan></text>
+<text x="716" y="234" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#24292f">rate-limit path not repro’d</text>
+<text x="1156" y="234" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#57606a">[E0026]</text>
 <text x="628" y="268" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" font-weight="700" fill="#57606a">CONTINUATION</text>
 <text x="628" y="288" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#24292f">• Next: repro rate-limit with stub, merge</text>
 <text x="628" y="312" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#57606a">touched: src/auth/retry.ts · coverage through E0028</text>
