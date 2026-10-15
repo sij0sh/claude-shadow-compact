@@ -1,0 +1,5 @@
+node_modules/
+.shadow-data/
+.agents/artifactss/
+.agents/artifacts/
+.trace/

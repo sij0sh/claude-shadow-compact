@@ -1,0 +1,62 @@
+{
+  "name": "shadow-compact",
+  "version": "0.1.0",
+  "description": "Verified-checkpoint compaction for Claude Code: a private builder and independent verifier prepare an evidence-grounded checkpoint in the background, and session.compact installs it with the exact recent tail preserved by handle.",
+  "author": {
+    "name": "pi-shadow-compact port"
+  },
+  "userConfig": {
+    "prepareThresholdTokens": {
+      "type": "number",
+      "title": "Checkpoint threshold (tokens)",
+      "description": "Absolute context token count at which background checkpoint preparation starts. Must be a positive integer below the hard threshold.",
+      "default": 160000
+    },
+    "hardThresholdTokens": {
+      "type": "number",
+      "title": "Hard compaction threshold (tokens)",
+      "description": "Absolute context token count at which compaction is requested at the next safe boundary, using a verified checkpoint when available or native compaction otherwise. Must be a positive integer above the checkpoint threshold.",
+      "default": 250000
+    },
+    "recentTurns": {
+      "type": "number",
+      "title": "Recent turns kept verbatim",
+      "description": "Minimum number of recent user-anchored turns preserved exactly (by engine handle) after the checkpoint.",
+      "default": 10
+    },
+    "builderModel": {
+      "type": "string",
+      "title": "Builder model",
+      "description": "Model alias or id for the private checkpoint-builder agent; inherit uses the session model.",
+      "default": "inherit",
+      "options": [
+        "inherit",
+        "haiku",
+        "sonnet",
+        "opus"
+      ]
+    },
+    "verifierModel": {
+      "type": "string",
+      "title": "Verifier model",
+      "description": "Model alias or id for the private checkpoint-verifier agent; inherit uses the session model.",
+      "default": "inherit",
+      "options": [
+        "inherit",
+        "haiku",
+        "sonnet",
+        "opus"
+      ]
+    },
+    "manualCompactMode": {
+      "type": "string",
+      "title": "Manual /compact mode",
+      "description": "shadow answers /compact with the verified checkpoint when one covers the transcript; native always defers to Claude Code compaction.",
+      "default": "shadow",
+      "options": [
+        "shadow",
+        "native"
+      ]
+    }
+  }
+}
