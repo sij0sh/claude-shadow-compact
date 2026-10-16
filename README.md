@@ -132,9 +132,10 @@ Or, from a local checkout, load it for one session with
 
 | Command | Behavior |
 |---|---|
-| `/shadow-compact` | Start background preparation, or install the ready checkpoint |
+| `/shadow-compact` | Start background preparation, or install the ready checkpoint (honest when history is too short) |
 | `/compact-native` | Bypass Shadow for the next compaction (native summary) |
-| `/shadow-status` | Phase, archive size, checkpoint coverage, thresholds |
+| `/shadow-status` | Version, phase, archive size, checkpoint coverage, thresholds, last fallback, compact-hook |
+| `/shadow-export` | Print the verified checkpoint for manual copy-paste |
 
 ## Configuration
 
@@ -173,7 +174,26 @@ and session-less with sanitized evidence only. A blank provider and id
 uses the Pi default model, and a half-set pair falls back to blank. Any
 bridge failure (missing binary, timeout, bad JSON) falls back to the
 Claude agent and then `$.model.complete`, so Claude remains the default
-and the safety net. `/shadow-status` shows the resolved backend per role.
+and the safety net. Each fallback is logged at debug level without prompt
+contents, and `/shadow-status` shows the resolved backend per role plus
+the last fallback reason. The prompt travels on `stdin`, never `argv`,
+so large sessions cannot overflow the command line.
+
+## Managed installs and updates
+
+On organization-managed Claude Code, `session.compact` hooks run only for
+org-listed plugins. If yours is not listed, Shadow prepares but never
+installs: `/shadow-status` shows `compact-hook=unseen`. Ask the org to
+allowlist `shadow-compact`, or copy `/shadow-export` output by hand.
+
+If the marketplace reports a stale version after a release, refresh it:
+
+```bash
+claude plugin marketplace update claude-shadow-compact
+claude plugin update shadow-compact@claude-shadow-compact
+```
+
+`/shadow-status` shows the running version (`v0.2.1`).
 
 ## Deferred from the Pi version
 

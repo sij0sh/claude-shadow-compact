@@ -39,6 +39,15 @@ const BUILDER_TYPE = "shadow-compact:checkpoint-builder";
 const VERIFIER_TYPE = "shadow-compact:checkpoint-verifier";
 const AGENT_TIMEOUT_MS = 600_000;
 
+/** Running plugin version shown in status; bump with the manifest. */
+const PLUGIN_VERSION = "0.2.1";
+
+/** Max persisted transcript index entries; ids only, never text. */
+const MAX_PERSISTED_INDEX = 2000;
+
+/** Inline evidence cap for Pi bridge and model.complete fallback. */
+const INLINE_EVIDENCE_CHARS = 120_000;
+
 interface Runtime {
   config: ShadowConfig;
   state: ShadowState;
@@ -52,6 +61,10 @@ interface Runtime {
   pendingAnswers: Map<string, (answer: string) => void>;
   installScheduled: boolean;
   hardLimitReached: boolean;
+  /** Last fallback reason class for status; memory only, never prompt text. */
+  lastFallback: string | null;
+  /** True once a main-loop session.compact dispatch has been observed. */
+  compactHookSeen: boolean;
 }
 
 function createRuntime(config: ShadowConfig): Runtime {
@@ -66,6 +79,8 @@ function createRuntime(config: ShadowConfig): Runtime {
     pendingAnswers: new Map(),
     installScheduled: false,
     hardLimitReached: false,
+    lastFallback: null,
+    compactHookSeen: false,
   };
 }
 
@@ -83,6 +98,19 @@ async function ensureSession($: EngineInterface, rt: Runtime): Promise<EvidenceA
       rt.messageRowIds = rt.archive.rows.map((row) => row.id);
     }
     await restore($, rt);
+    try {
+      const raw = await $.store.get(indexKey(rt.sessionId));
+      if (Array.isArray(raw) && raw.every((entry) => typeof entry === "string")) {
+        const ids = raw as string[];
+        // Only adopt a stored index when we have no live one yet; live
+        // appends after reload win over the snapshot.
+        if (rt.messageRowIds.length === 0 && ids.length > 0) {
+          rt.messageRowIds = ids.slice(-MAX_PERSISTED_INDEX);
+        }
+      }
+    } catch {
+      // A broken index entry must never block the session.
+    }
   }
   return rt.archive;
 }
@@ -93,16 +121,35 @@ async function restore($: EngineInterface, rt: Runtime): Promise<void> {
     if (!raw || typeof raw !== "object") return;
     const saved = raw as PublishedCheckpoint;
     if (saved.sessionId !== rt.sessionId || !saved.coverage || !saved.rendered) return;
-    if (!rt.archive || rt.archive.indexOf(saved.coverage.coverageEndEntryId) < 0) {
-      // Coverage row is not in this transcript (resumed after the
-      // boundary was compacted away): fail closed, prepare fresh.
-      rt.state.rearm();
-      return;
+    if (!rt.archive) return;
+    if (rt.archive.indexOf(saved.coverage.coverageEndEntryId) < 0) {
+      // After reload/resume the archive is rebuilt with synthetic
+      // bootstrap ids, so the uuid can miss while the position still
+      // matches. Keep the checkpoint when the saved index is in range;
+      // session.compact re-anchors by position and otherwise fails closed.
+      const at = saved.coverageMessageIndex;
+      if (typeof at !== "number" || at < 0 || at >= rt.archive.size) {
+        rt.state.rearm();
+        return;
+      }
     }
     rt.state.restorePublished(saved);
     rt.archive.setPreviousCheckpoint(saved.rendered, saved.coverage.coverageEndEntryId);
   } catch {
     // A broken store entry must never block the session.
+  }
+}
+
+function indexKey(sessionId: string): string {
+  return `shadow-index:${sessionId}`;
+}
+
+async function persistIndex($: EngineInterface, rt: Runtime): Promise<void> {
+  try {
+    const tail = rt.messageRowIds.slice(-MAX_PERSISTED_INDEX);
+    await $.store.set(indexKey(rt.sessionId), tail);
+  } catch {
+    // Index persistence is best-effort; compaction still fails closed.
   }
 }
 
@@ -127,7 +174,7 @@ function inlineEvidence(rows: EvidenceArchive): string {
   const previousText = previous
     ? `\n\nPrevious checkpoint (evidence ${previous.evidenceId}):\n${previous.summary}`
     : "";
-  return `Session evidence (sanitized JSONL rows; cite evidenceId, name coverage by entryId):\n${rows.fullText().slice(0, 120_000)}${previousText}`;
+  return `Session evidence (sanitized JSONL rows; cite evidenceId, name coverage by entryId):\n${rows.fullText().slice(0, INLINE_EVIDENCE_CHARS)}${previousText}`;
 }
 
 function askViaAgent($: EngineInterface, rt: Runtime, kind: "builder" | "verifier"): AskFn {
@@ -210,12 +257,22 @@ function askViaPiBridge($: EngineInterface, rt: Runtime, kind: "builder" | "veri
     }
     const thinkingLevel = kind === "builder" ? rt.config.builderThinking : rt.config.verifierThinking;
     if (thinkingLevel !== "") argv.push("--thinking", thinkingLevel);
-    argv.push("--", request.prompt);
+    // The prompt (with inline evidence) travels on stdin, never argv, so
+    // large sessions cannot overflow ARG_MAX. A bare "--" ends option
+    // parsing; pi -p reads the piped prompt as its message.
+    argv.push("--");
+    try {
+      $.ui.log(`shadow-compact: pi ${kind} bridge prompt=${request.prompt.length} chars`, {
+        to: "debug",
+      });
+    } catch {
+      // Logging must never break the bridge call.
+    }
     let result;
     try {
       // A host without a process runner throws here; the caller falls
       // back to the Claude path.
-      result = await $.process.run(argv, { timeoutMs: rt.config.piTimeoutMs });
+      result = await $.process.run(argv, { timeoutMs: rt.config.piTimeoutMs, stdin: request.prompt });
     } catch (error) {
       throw new Error(
         `Pi bridge ${kind} failed to start: ${error instanceof Error ? error.message : String(error)}`,
@@ -248,18 +305,35 @@ function askWithFallback($: EngineInterface, rt: Runtime): AskFn {
   const complete = askViaComplete($, rt);
   return async (request) => {
     const isBuilder = request.system.includes("create evidence-grounded");
+    const kind = isBuilder ? "builder" : "verifier";
     const configured = isBuilder ? rt.config.builderBackend : rt.config.verifierBackend;
+    const note = (text: string): void => {
+      try {
+        $.ui.log(text, { to: "debug" });
+      } catch {
+        // Logging must never break preparation.
+      }
+    };
     if (configured === "pi") {
       try {
-        return await (isBuilder ? builderPi : verifierPi)(request);
-      } catch {
-        // Fall through to the Claude path below.
+        const answer = await (isBuilder ? builderPi : verifierPi)(request);
+        return answer;
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        const short = reason.slice(0, 160).replace(/\s+/g, " ");
+        rt.lastFallback = `pi-${kind}:${short}`;
+        // Never log prompt or evidence contents: reason class only.
+        note(`shadow-compact: pi ${kind} fallback (${short})`);
       }
     }
     const claudeAsk = isBuilder ? builderAgent : verifierAgent;
     try {
       return await claudeAsk(request);
-    } catch {
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      const short = reason.slice(0, 160).replace(/\s+/g, " ");
+      rt.lastFallback = `claude-${kind}:${short}`;
+      note(`shadow-compact: claude ${kind} fallback (${short})`);
       return complete(request);
     }
   };
@@ -339,6 +413,7 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
     };
     if (rt.state.publish(generation, checkpoint)) {
       await $.store.set(`checkpoint:${rt.sessionId}`, checkpoint).catch(() => undefined);
+      void persistIndex($, rt);
       rows.setPreviousCheckpoint(checkpoint.rendered, checkpoint.coverage.coverageEndEntryId);
       $.ui.log(`shadow-compact: verified checkpoint ready (covers ${prepared.coverageEndEntryId})`);
       scheduleInstall($, rt);
@@ -355,7 +430,7 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
 function statusText(rt: Runtime): string {
   const published = rt.state.published;
   return [
-    `shadow-compact: phase=${rt.state.phase}`,
+    `shadow-compact: v${PLUGIN_VERSION} phase=${rt.state.phase}`,
     `archive rows=${rt.archive?.size ?? 0}`,
     published
       ? `checkpoint=${published.checkpointId} coverage=${published.coverage.coverageEndEntryId} installs=${rt.state.installCount}`
@@ -363,7 +438,17 @@ function statusText(rt: Runtime): string {
     `thresholds prepare=${rt.config.prepareThresholdTokens} tokens hard=${rt.config.hardThresholdTokens} tokens recentTurns=${rt.config.recentTurns}`,
     `builder=${describeBackend(rt.config.builderBackend, rt.config.builderModel, rt.config.builderPi, rt.config.builderThinking)}`,
     `verifier=${describeBackend(rt.config.verifierBackend, rt.config.verifierModel, rt.config.verifierPi, rt.config.verifierThinking)}`,
+    `lastFallback=${rt.lastFallback ?? "none"}`,
+    `compact-hook=${rt.compactHookSeen ? "seen" : "unseen"}`,
   ].join(" · ");
+}
+
+/** Honest gate for manual preparation: null means preparation may start. */
+function preparationBlocker(rt: Runtime): string | null {
+  if (rt.state.preparing) return "already in progress";
+  const rows = rt.archive?.size ?? 0;
+  if (rows < 2) return `need at least 2 archived rows, have ${rows}`;
+  return null;
 }
 
 export const register: Register = (on, options) => {
@@ -403,6 +488,9 @@ export const register: Register = (on, options) => {
     await $.command
       .register({ name: "shadow-status", description: "Show Shadow Compact state" })
       .catch(() => undefined);
+    await $.command
+      .register({ name: "shadow-export", description: "Print the verified checkpoint for manual copy-paste" })
+      .catch(() => undefined);
     return next(e);
   });
 
@@ -418,6 +506,7 @@ export const register: Register = (on, options) => {
       if (result.message.role) {
         if (e.door === "compaction") rt.messageRowIds = [result.uuid];
         else rt.messageRowIds.push(result.uuid);
+        void persistIndex($, rt);
       }
     }
     return result;
@@ -459,6 +548,7 @@ export const register: Register = (on, options) => {
 
   on("session.compact", async ($, e, next) => {
     await ensureSession($, rt);
+    if (!e.agentId) rt.compactHookSeen = true;
     // Native path helper: after any core compaction, realign the
     // transcript index with placeholders so later coverage math fails
     // closed or counts indexes honestly.
@@ -470,6 +560,7 @@ export const register: Register = (on, options) => {
         rt.messageRowIds = result.messages.map((_, index) =>
           index === 0 ? "native-summary" : `unknown-${index}`,
         );
+        void persistIndex($, rt);
       }
       return result;
     };
@@ -479,10 +570,17 @@ export const register: Register = (on, options) => {
     const published = rt.state.published;
     if (!published) return native();
     if (rt.messageRowIds.length !== e.messages.length) return native();
-    const coveredIndex = rt.messageRowIds.indexOf(published.coverage.coverageEndEntryId);
+    let coveredIndex = rt.messageRowIds.indexOf(published.coverage.coverageEndEntryId);
     if (coveredIndex < 0) {
-      rt.state.discardPublished();
-      return native();
+      // Reload/resume rebuilds the archive with synthetic ids, so the
+      // uuid can miss while the saved position still matches. Re-anchor
+      // by position only when lengths agree and the index is in range.
+      const at = published.coverageMessageIndex;
+      if (typeof at !== "number" || at < 0 || at >= e.messages.length) {
+        rt.state.discardPublished();
+        return native();
+      }
+      coveredIndex = at;
     }
     const built = buildCandidate(e.messages, coveredIndex, rt.config.recentTurns, published.rendered);
     if (isSkipped(built) || !built.messages) return native();
@@ -495,6 +593,7 @@ export const register: Register = (on, options) => {
         ...rt.messageRowIds.slice(built.tailStart),
       ];
       rt.archive?.setPreviousCheckpoint(published.rendered, published.coverage.coverageEndEntryId);
+      void persistIndex($, rt);
       $.ui.log("shadow-compact: installed verified checkpoint + exact recent tail");
     }
     return { messages: built.messages };
@@ -511,13 +610,27 @@ export const register: Register = (on, options) => {
       scheduleInstall($, rt);
       return { text: "shadow-compact: installing verified checkpoint at this boundary." };
     }
-    if (rt.state.preparing) {
-      return { text: "shadow-compact: checkpoint preparation already in progress." };
+    const blocker = preparationBlocker(rt);
+    if (blocker) {
+      const rows = rt.archive?.size ?? 0;
+      if (rt.state.preparing) {
+        return { text: "shadow-compact: checkpoint preparation already in progress." };
+      }
+      return { text: `shadow-compact: idle (${blocker}; archive rows=${rows}).` };
     }
     void runPreparation($, rt, true);
     return {
-      text: "shadow-compact: background builder/verifier preparation started; it installs at the next safe compaction boundary.",
+      text: `shadow-compact: background builder/verifier preparation started (archive rows=${rt.archive?.size ?? 0}); it installs at the next safe compaction boundary.`,
     };
+  });
+
+  on("command.run", { command: "shadow-export" }, async ($, _e, _next) => {
+    await ensureSession($, rt);
+    const published = rt.state.published;
+    if (!published) {
+      return { text: "shadow-compact: no verified checkpoint to export yet." };
+    }
+    return { text: published.rendered };
   });
 
   on("command.run", { command: "compact-native" }, async ($, _e, _next) => {
@@ -536,6 +649,7 @@ export const register: Register = (on, options) => {
     rt.messageRowIds = [];
     rt.bootstrapped = false;
     rt.hardLimitReached = false;
+    rt.lastFallback = null;
     return result;
   });
 };

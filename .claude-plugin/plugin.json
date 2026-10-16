@@ -1,6 +1,6 @@
 {
   "name": "shadow-compact",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Verified-checkpoint compaction for Claude Code: a private builder and independent verifier prepare an evidence-grounded checkpoint in the background, and session.compact installs it with the exact recent tail preserved by handle.",
   "author": {
     "name": "pi-shadow-compact port"

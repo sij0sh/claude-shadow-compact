@@ -339,18 +339,22 @@ describe("config", () => {
 function thresholdHost(
   options: Record<string, number | string> = {},
   messages: SessionMessage[] = [],
-  processImpl?: (argv: readonly string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>,
+  processImpl?: (argv: readonly string[], init?: { stdin?: string }) => Promise<{ exitCode: number; stdout: string; stderr: string }>,
 ) {
   type Handler = ($: EngineInterface, e: any, next: (e: any) => Promise<any>) => any;
   const handlers = new Map<string, Handler>();
   const scheduled: Array<() => void> = [];
   const commands: string[] = [];
   const processCalls: string[][] = [];
-  const stored: unknown[] = [];
+  const processStdins: Array<string | undefined> = [];
+  const stored: Array<{ key: string; value: unknown }> = [];
+  const logs: string[] = [];
   let busy = false;
   let preparations = 0;
   const on = ((event: string, ...args: unknown[]) => {
-    handlers.set(event, args[args.length - 1] as Handler);
+    const head = args.length >= 2 ? (args[0] as { command?: string }) : undefined;
+    const key = head && typeof head.command === "string" ? `${event}:${head.command}` : event;
+    handlers.set(key, args[args.length - 1] as Handler);
   }) as On;
   const $ = {
     plugin: { root: "/plugin" },
@@ -361,12 +365,13 @@ function thresholdHost(
     },
     store: {
       get: async () => undefined,
-      set: async (_key: string, value: unknown) => { stored.push(value); },
+      set: async (key: string, value: unknown) => { stored.push({ key, value }); },
     },
-    process: { run: async (argv: readonly string[]) => {
+    process: { run: async (argv: readonly string[], init?: { stdin?: string }) => {
       processCalls.push([...argv]);
+      processStdins.push(init?.stdin);
       if (!processImpl) throw new Error("pi not installed");
-      return processImpl(argv);
+      return processImpl(argv, init);
     } },
     clock: { after: (_delay: number, callback: () => void) => scheduled.push(callback) },
     command: { run: async ({ command }: { command: string }) => {
@@ -379,14 +384,20 @@ function thresholdHost(
       throw new Error("Agents unavailable in test");
     } },
     model: { complete: async () => { throw new Error("Models unavailable in test"); } },
-    ui: { log: () => undefined },
+    ui: { log: (text: string) => { logs.push(text); } },
   } as unknown as EngineInterface;
   register(on, options);
   return {
     commands,
     scheduled,
     processCalls,
+    processStdins,
     stored,
+    logs,
+    runCommand: (name: string) => handlers.get(`command.run:${name}`)!(
+      $, {}, async () => ({}),
+    ) as Promise<{ text: string }>,
+    checkpoints: () => stored.filter((entry) => entry.key.startsWith("checkpoint:")).map((entry) => entry.value),
     get preparations() { return preparations; },
     setBusy: (value: boolean) => { busy = value; },
     measure: (tokens?: number, percent = 0) => handlers.get("session.measure")!(
@@ -502,7 +513,36 @@ describe("pi bridge backend", () => {
     expect(builderArgv).toContain("high");
     const verifierArgv = host.processCalls[1] ?? [];
     expect(verifierArgv).toContain("xhigh");
-    expect(host.stored.length).toBe(1);
+    expect(host.checkpoints().length).toBe(1);
+    // Large prompt travels on stdin, never argv: argv stays small.
+    const builderStdin = host.processStdins[0] ?? "";
+    expect(builderStdin.length).toBeGreaterThan(100);
+    const argvBytes = JSON.stringify(builderArgv).length;
+    expect(argvBytes).toBeLessThan(8000);
+    expect(builderArgv.some((entry) => entry.length > 8000)).toBe(false);
+  });
+
+  test("manual shadow-compact is honest with fewer than 2 rows", async () => {
+    const host = thresholdHost(piOptions, []);
+    const idle = await host.runCommand("shadow-compact") as { text: string };
+    expect(idle.text).toContain("need at least 2 archived rows");
+    expect(idle.text).toContain("archive rows=0");
+    expect(host.processCalls.length).toBe(0);
+  });
+
+  test("fallback reason is logged and visible in status", async () => {
+    const host = thresholdHost(piOptions, twoRows, async () => ({
+      exitCode: 1,
+      stdout: "",
+      stderr: "boom",
+    }));
+    await host.measure(160_000);
+    await host.flush();
+    expect(host.logs.some((line) => line.includes("pi builder fallback"))).toBe(true);
+    const status = await host.runCommand("shadow-status") as { text: string };
+    expect(status.text).not.toContain("lastFallback=none");
+    expect(status.text).toContain("builder:");
+    expect(status.text).toContain("compact-hook=");
   });
 
   test("bad bridge output falls back to the Claude agent", async () => {
@@ -543,10 +583,14 @@ describe("engine integration", () => {
       origin: { kind: "composer" },
       presentation: { isFullscreen: false, columns: 80 },
     });
-    expect(result.text).toContain("shadow-compact: phase=");
+    expect(result.text).toContain("shadow-compact: v");
+    expect(result.text).toContain("phase=");
     expect(result.text).toContain("prepare=160000 tokens hard=250000 tokens");
     expect(result.text).toContain("builder=claude:inherit");
     expect(result.text).toContain("verifier=claude:inherit");
+    expect(result.text).toContain("lastFallback=none");
+    expect(result.text).toContain("compact-hook=");
+    expect(result.text).toContain("v0.2.1");
   });
 
   test("compact with no checkpoint defers without inventing messages", async ($, on) => {
