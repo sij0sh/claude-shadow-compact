@@ -5,7 +5,7 @@ import {
   validateCheckpointObject,
   type Checkpoint,
 } from "../hooks/checkpoint.js";
-import { describeBackend, isAtOrAbove, resolveConfig } from "../hooks/config.js";
+import { describeModel, isAtOrAbove, resolveConfig } from "../hooks/config.js";
 import { EvidenceArchive } from "../hooks/evidence.js";
 import { redactSecretValue, sanitizeForContext } from "../hooks/normalize.js";
 import { prepareCheckpoint } from "../hooks/prepare.js";
@@ -249,64 +249,16 @@ describe("config", () => {
     }
   });
 
-  test("pi backends default to claude with blank pairs", async () => {
+  test("builder and verifier default to haiku", async () => {
     const config = resolveConfig({});
-    expect(config.builderBackend).toBe("claude");
-    expect(config.verifierBackend).toBe("claude");
-    expect(config.builderPi).toEqual({ provider: "", id: "" });
-    expect(config.verifierPi).toEqual({ provider: "", id: "" });
-    expect(config.piBinary).toBe("pi");
-    expect(config.piTimeoutMs).toBe(540_000);
-  });
-
-  test("pi pairs require both fields and verifier inherits builder", async () => {
-    const half = resolveConfig({ builderBackend: "pi", builderProvider: "openai" });
-    expect(half.builderPi).toEqual({ provider: "", id: "" });
-    const full = resolveConfig({
-      builderBackend: "pi",
-      builderProvider: "openai",
-      builderId: "gpt-5-mini",
-    });
-    expect(full.builderBackend).toBe("pi");
-    expect(full.builderPi).toEqual({ provider: "openai", id: "gpt-5-mini" });
-    expect(full.verifierBackend).toBe("claude");
-    expect(full.verifierPi).toEqual({ provider: "openai", id: "gpt-5-mini" });
-    const own = resolveConfig({
-      builderBackend: "pi",
-      builderProvider: "openai",
-      builderId: "gpt-5-mini",
-      verifierBackend: "pi",
-      verifierProvider: "google",
-      verifierId: "gemini-3",
-    });
-    expect(own.verifierPi).toEqual({ provider: "google", id: "gemini-3" });
-    expect(resolveConfig({ builderBackend: "PI" }).builderBackend).toBe("pi");
-    expect(resolveConfig({ builderBackend: "bogus" }).builderBackend).toBe("claude");
-  });
-
-  test("pi thinking levels parse and verifier inherits builder", async () => {
-    expect(resolveConfig({}).builderThinking).toBe("");
-    expect(resolveConfig({}).verifierThinking).toBe("");
-    const full = resolveConfig({ builderThinking: "HIGH", verifierThinking: "XHigh" });
-    expect(full.builderThinking).toBe("high");
-    expect(full.verifierThinking).toBe("xhigh");
-    expect(resolveConfig({ builderThinking: "high" }).verifierThinking).toBe("high");
-    expect(resolveConfig({ builderThinking: "turbo" }).builderThinking).toBe("");
-    expect(describeBackend("pi", "inherit", { provider: "meta", id: "muse-spark-1.3-contributor" }, "high"))
-      .toBe("pi:meta/muse-spark-1.3-contributor:high");
-    expect(describeBackend("pi", "inherit", { provider: "", id: "" }, ""))
-      .toBe("pi:default");
-    expect(describeBackend("claude", "sonnet", { provider: "", id: "" }, ""))
-      .toBe("claude:sonnet");
-  });
-
-  test("pi binary and timeout fall back and clamp", async () => {
-    expect(resolveConfig({ piBinary: "" }).piBinary).toBe("pi");
-    expect(resolveConfig({ piBinary: " /usr/bin/pi " }).piBinary).toBe("/usr/bin/pi");
-    expect(resolveConfig({ piTimeoutMs: 0 }).piTimeoutMs).toBe(540_000);
-    expect(resolveConfig({ piTimeoutMs: "bad" }).piTimeoutMs).toBe(540_000);
-    expect(resolveConfig({ piTimeoutMs: 999_999 }).piTimeoutMs).toBe(600_000);
-    expect(resolveConfig({ piTimeoutMs: 60_000 }).piTimeoutMs).toBe(60_000);
+    expect(config.builderModel).toBe("haiku");
+    expect(config.verifierModel).toBe("haiku");
+    const custom = resolveConfig({ builderModel: "sonnet", verifierModel: " inherit " });
+    expect(custom.builderModel).toBe("sonnet");
+    expect(custom.verifierModel).toBe("inherit");
+    expect(resolveConfig({ builderModel: "" }).builderModel).toBe("haiku");
+    expect(describeModel("haiku")).toBe("claude:haiku");
+    expect(describeModel("sonnet")).toBe("claude:sonnet");
   });
 
   test("invalid token settings use defaults and always leave room for ordering", async () => {
@@ -339,14 +291,11 @@ describe("config", () => {
 function thresholdHost(
   options: Record<string, number | string> = {},
   messages: SessionMessage[] = [],
-  processImpl?: (argv: readonly string[], init?: { stdin?: string }) => Promise<{ exitCode: number; stdout: string; stderr: string }>,
 ) {
   type Handler = ($: EngineInterface, e: any, next: (e: any) => Promise<any>) => any;
   const handlers = new Map<string, Handler>();
   const scheduled: Array<() => void> = [];
   const commands: string[] = [];
-  const processCalls: string[][] = [];
-  const processStdins: Array<string | undefined> = [];
   const stored: Array<{ key: string; value: unknown }> = [];
   const logs: string[] = [];
   let busy = false;
@@ -367,12 +316,6 @@ function thresholdHost(
       get: async () => undefined,
       set: async (key: string, value: unknown) => { stored.push({ key, value }); },
     },
-    process: { run: async (argv: readonly string[], init?: { stdin?: string }) => {
-      processCalls.push([...argv]);
-      processStdins.push(init?.stdin);
-      if (!processImpl) throw new Error("pi not installed");
-      return processImpl(argv, init);
-    } },
     clock: { after: (_delay: number, callback: () => void) => scheduled.push(callback) },
     command: { run: async ({ command }: { command: string }) => {
       commands.push(command);
@@ -390,8 +333,6 @@ function thresholdHost(
   return {
     commands,
     scheduled,
-    processCalls,
-    processStdins,
     stored,
     logs,
     runCommand: (name: string) => handlers.get(`command.run:${name}`)!(
@@ -472,104 +413,27 @@ describe("token threshold scheduling", () => {
   });
 });
 
-describe("pi bridge backend", () => {
+describe("agent fallback chain", () => {
   const twoRows = [message("user", "task"), message("assistant", "answer")];
-  const piOptions = {
-    builderBackend: "pi",
-    builderProvider: "openai",
-    builderId: "gpt-5-mini",
-    builderThinking: "high",
-    verifierBackend: "pi",
-    verifierThinking: "xhigh",
-  };
-
-  function piReplies(argv: readonly string[]) {
-    const system = argv[argv.indexOf("--system-prompt") + 1] ?? "";
-    if (system.includes("create evidence-grounded")) {
-      return JSON.stringify({ checkpoint: checkpointJson("E0001"), coverageEndEntryId: "bootstrap-1" });
-    }
-    return JSON.stringify({ verdict: "accept", reason: "grounded" });
-  }
-
-  test("pi backend publishes without touching Claude agents", async () => {
-    const host = thresholdHost(piOptions, twoRows, async (argv) => ({
-      exitCode: 0,
-      stdout: piReplies(argv),
-      stderr: "",
-    }));
-    await host.measure(160_000);
-    await host.flush();
-    expect(host.preparations).toBe(0);
-    expect(host.processCalls.length).toBe(2);
-    const builderArgv = host.processCalls[0] ?? [];
-    expect(builderArgv[0]).toBe("pi");
-    expect(builderArgv).toContain("--no-tools");
-    expect(builderArgv).toContain("--no-session");
-    expect(builderArgv).toContain("--model");
-    expect(builderArgv).toContain("gpt-5-mini");
-    expect(builderArgv).toContain("--provider");
-    expect(builderArgv).toContain("openai");
-    expect(builderArgv).toContain("--thinking");
-    expect(builderArgv).toContain("high");
-    const verifierArgv = host.processCalls[1] ?? [];
-    expect(verifierArgv).toContain("xhigh");
-    expect(host.checkpoints().length).toBe(1);
-    // Large prompt travels on stdin, never argv: argv stays small.
-    const builderStdin = host.processStdins[0] ?? "";
-    expect(builderStdin.length).toBeGreaterThan(100);
-    const argvBytes = JSON.stringify(builderArgv).length;
-    expect(argvBytes).toBeLessThan(8000);
-    expect(builderArgv.some((entry) => entry.length > 8000)).toBe(false);
-  });
 
   test("manual shadow-compact is honest with fewer than 2 rows", async () => {
-    const host = thresholdHost(piOptions, []);
+    const host = thresholdHost({}, []);
     const idle = await host.runCommand("shadow-compact") as { text: string };
     expect(idle.text).toContain("need at least 2 archived rows");
     expect(idle.text).toContain("archive rows=0");
-    expect(host.processCalls.length).toBe(0);
   });
 
-  test("fallback reason is logged and visible in status", async () => {
-    const host = thresholdHost(piOptions, twoRows, async () => ({
-      exitCode: 1,
-      stdout: "",
-      stderr: "boom",
-    }));
+  test("agent spawn failure is recorded and fails closed without a checkpoint", async () => {
+    const host = thresholdHost({}, twoRows);
     await host.measure(160_000);
     await host.flush();
-    expect(host.logs.some((line) => line.includes("pi builder fallback"))).toBe(true);
+    // Spawn and model.complete both refuse in the test host: nothing stored.
+    expect(host.preparations).toBe(1);
+    expect(host.checkpoints().length).toBe(0);
     const status = await host.runCommand("shadow-status") as { text: string };
-    expect(status.text).not.toContain("lastFallback=none");
-    expect(status.text).toContain("builder:");
-    expect(status.text).toContain("compact-hook=");
-  });
-
-  test("bad bridge output falls back to the Claude agent", async () => {
-    const host = thresholdHost(piOptions, twoRows, async () => ({
-      exitCode: 0,
-      stdout: "no json here",
-      stderr: "",
-    }));
-    await host.measure(160_000);
-    await host.flush();
-    expect(host.processCalls.length).toBe(1);
-    // The Claude agent spawn was tried after the bridge answer failed validation.
-    expect(host.preparations).toBe(1);
-    expect(host.stored.length).toBe(0);
-  });
-
-  test("bridge exit failure falls back to the Claude agent", async () => {
-    const host = thresholdHost(piOptions, twoRows, async () => ({
-      exitCode: 1,
-      stdout: "",
-      stderr: "boom",
-    }));
-    await host.measure(160_000);
-    await host.flush();
-    expect(host.processCalls.length).toBe(1);
-    expect(host.preparations).toBe(1);
-    expect(host.stored.length).toBe(0);
+    expect(status.text).toContain("lastFallback=agents:Agents unavailable in test");
+    expect(status.text).toContain("builder=claude:haiku");
+    expect(status.text).toContain("verifier=claude:haiku");
   });
 });
 
@@ -586,11 +450,11 @@ describe("engine integration", () => {
     expect(result.text).toContain("shadow-compact: v");
     expect(result.text).toContain("phase=");
     expect(result.text).toContain("prepare=160000 tokens hard=250000 tokens");
-    expect(result.text).toContain("builder=claude:inherit");
-    expect(result.text).toContain("verifier=claude:inherit");
+    expect(result.text).toContain("builder=claude:haiku");
+    expect(result.text).toContain("verifier=claude:haiku");
     expect(result.text).toContain("lastFallback=none");
     expect(result.text).toContain("compact-hook=");
-    expect(result.text).toContain("v0.2.1");
+    expect(result.text).toContain("v0.3.0");
   });
 
   test("compact with no checkpoint defers without inventing messages", async ($, on) => {

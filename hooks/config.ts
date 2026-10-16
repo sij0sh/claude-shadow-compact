@@ -1,33 +1,18 @@
 /**
- * Plugin-option configuration. The Pi version layered global/project
- * JSON files plus env overrides; the Claude version's single source is
- * the manifest's `userConfig`, delivered to `register(on, options)`
- * with defaults already filled. Values are re-validated here because
- * stored settings can predate the manifest's options.
+ * Plugin-option configuration. The single source is the manifest's
+ * `userConfig`, delivered to `register(on, options)` with defaults
+ * already filled. Values are re-validated here because stored settings
+ * can predate the manifest's options.
  */
 import type { PluginOptions } from "claude-code";
 
 export const DEFAULT_PREPARE_THRESHOLD_TOKENS = 160_000;
 export const DEFAULT_HARD_THRESHOLD_TOKENS = 250_000;
 export const DEFAULT_RECENT_TURNS = 10;
-export const DEFAULT_PI_BINARY = "pi";
-export const DEFAULT_PI_TIMEOUT_MS = 540_000;
-export const MAX_PI_TIMEOUT_MS = 600_000;
+/** Default checkpoint-agent model: cheap and fast, never the session model. */
+export const DEFAULT_MODEL = "haiku";
 
 export type ManualCompactMode = "shadow" | "native";
-
-/** Which engine answers a builder/verifier request. `claude` is the
- * default; `pi` shells out to the Pi CLI through `$.process.run`. */
-export type ModelBackend = "claude" | "pi";
-
-/** A Pi provider/model pair. Both blank means the Pi default model. */
-export interface PiModelPair {
-  provider: string;
-  id: string;
-}
-
-/** Pi thinking levels accepted by `pi --thinking`. Blank means Pi default. */
-const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 export interface ShadowConfig {
   prepareThresholdTokens: number;
@@ -35,14 +20,6 @@ export interface ShadowConfig {
   recentTurns: number;
   builderModel: string;
   verifierModel: string;
-  builderBackend: ModelBackend;
-  verifierBackend: ModelBackend;
-  builderPi: PiModelPair;
-  verifierPi: PiModelPair;
-  builderThinking: string;
-  verifierThinking: string;
-  piBinary: string;
-  piTimeoutMs: number;
   manualCompactMode: ManualCompactMode;
 }
 
@@ -54,33 +31,7 @@ function positiveInt(value: unknown, fallback: number): number {
 }
 
 function model(value: unknown): string {
-  return typeof value === "string" && value.trim() !== "" ? value.trim() : "inherit";
-}
-
-function backend(value: unknown): ModelBackend {
-  return typeof value === "string" && value.trim().toLowerCase() === "pi" ? "pi" : "claude";
-}
-
-function text(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-/** Both blank or both set; a half-set pair falls back to blank. */
-function piPair(provider: unknown, id: unknown): PiModelPair {
-  const pair = { provider: text(provider), id: text(id) };
-  if ((pair.provider === "") !== (pair.id === "")) return { provider: "", id: "" };
-  return pair;
-}
-
-function thinking(value: unknown): string {
-  const level = text(value).toLowerCase();
-  if (level === "" || level === "default") return "";
-  return THINKING_LEVELS.has(level) ? level : "";
-}
-
-function piTimeout(value: unknown): number {
-  const parsed = positiveInt(value, DEFAULT_PI_TIMEOUT_MS);
-  return Math.min(parsed, MAX_PI_TIMEOUT_MS);
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : DEFAULT_MODEL;
 }
 
 export function resolveConfig(options: PluginOptions): ShadowConfig {
@@ -88,45 +39,18 @@ export function resolveConfig(options: PluginOptions): ShadowConfig {
   // Leave room for a strictly higher hard limit, even for stored settings.
   if (prepare === Number.MAX_SAFE_INTEGER) prepare = DEFAULT_PREPARE_THRESHOLD_TOKENS;
   const hard = positiveInt(options.hardThresholdTokens, DEFAULT_HARD_THRESHOLD_TOKENS);
-  const builderPi = piPair(options.builderProvider, options.builderId);
-  // A blank verifier pair reuses the builder pair, as in the Pi version.
-  const verifierRaw = piPair(options.verifierProvider, options.verifierId);
-  const verifierPi =
-    verifierRaw.provider === "" && verifierRaw.id === "" ? builderPi : verifierRaw;
-  const builderThinking = thinking(options.builderThinking);
-  // A blank verifier level reuses the builder level, as with Pi pairs.
-  const verifierOwn = thinking(options.verifierThinking);
-  const verifierThinking = verifierOwn === "" ? builderThinking : verifierOwn;
-  const piBinary = text(options.piBinary) === "" ? DEFAULT_PI_BINARY : text(options.piBinary);
   return {
     prepareThresholdTokens: prepare,
     hardThresholdTokens: Math.max(hard, prepare + 1),
     recentTurns: positiveInt(options.recentTurns, DEFAULT_RECENT_TURNS),
     builderModel: model(options.builderModel),
     verifierModel: model(options.verifierModel),
-    builderBackend: backend(options.builderBackend),
-    verifierBackend: backend(options.verifierBackend),
-    builderPi,
-    verifierPi,
-    builderThinking,
-    verifierThinking,
-    piBinary,
-    piTimeoutMs: piTimeout(options.piTimeoutMs),
     manualCompactMode: options.manualCompactMode === "native" ? "native" : "shadow",
   };
 }
 
-/** Human-readable backend + model for `/shadow-status`. */
-export function describeBackend(
-  backendName: ModelBackend,
-  claudeModel: string,
-  pi: PiModelPair,
-  thinkingLevel: string,
-): string {
-  if (backendName === "pi") {
-    const model = pi.id === "" ? "default" : `${pi.provider}/${pi.id}`;
-    return thinkingLevel === "" ? `pi:${model}` : `pi:${model}:${thinkingLevel}`;
-  }
+/** Human-readable model for `/shadow-status`. */
+export function describeModel(claudeModel: string): string {
   return `claude:${claudeModel}`;
 }
 

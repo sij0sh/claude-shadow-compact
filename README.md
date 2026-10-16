@@ -123,7 +123,7 @@ no/invalid checkpoint ──► next(e): Claude native compaction (fail closed)
 
 ## Install
 
-/plugin install shadow-compact --marketplace <owner>/<repo>
+/plugin install shadow-compact --marketplace sij0sh/claude-shadow-compact
 
 Or, from a local checkout, load it for one session with
 `claude --plugin-dir /path/to/claude-shadow-compact`.
@@ -147,13 +147,7 @@ Set via the plugin's `userConfig` (Claude Code `/config` or
 | `prepareThresholdTokens` | `160000` | Start background checkpoint preparation |
 | `hardThresholdTokens` | `250000` | Request compaction at the next safe boundary |
 | `recentTurns` | `10` | Minimum recent turns kept verbatim |
-| `builderModel` / `verifierModel` | `inherit` | Checkpoint agent models |
-| `builderBackend` / `verifierBackend` | `claude` | `claude` agent or `pi` CLI bridge |
-| `builderProvider` / `builderId` | blank | Pi provider/model for the builder when its backend is `pi` |
-| `verifierProvider` / `verifierId` | blank | Pi provider/model for the verifier; blank reuses the builder Pi model |
-| `builderThinking` / `verifierThinking` | `default` | Pi thinking level (`off` to `max`); `default` uses the Pi default, verifier reuses builder |
-| `piBinary` | `pi` | Pi CLI used by the `pi` backend |
-| `piTimeoutMs` | `540000` | One Pi call may run this long before fallback; at most `600000` |
+| `builderModel` / `verifierModel` | `haiku` | Checkpoint agent models; `inherit` uses the session model |
 | `manualCompactMode` | `shadow` | `shadow` or `native` for manual `/compact` |
 
 Token thresholds must be positive safe integers. Invalid values use the
@@ -166,18 +160,7 @@ no longer used; replace any saved overrides with token values.
 The hard threshold is a trigger, not a strict cap on a running turn: Claude
 pins the transcript during a turn, so compaction retries when the turn ends.
 
-Set a backend to `pi` to answer builder or verifier requests with a
-non-Claude model through the Pi CLI (for example `builderProvider`
-`openai` with `builderId` `gpt-5-mini`). The Pi CLI must be on PATH and
-authenticated through Pi's own settings; the bridge calls it tool-less
-and session-less with sanitized evidence only. A blank provider and id
-uses the Pi default model, and a half-set pair falls back to blank. Any
-bridge failure (missing binary, timeout, bad JSON) falls back to the
-Claude agent and then `$.model.complete`, so Claude remains the default
-and the safety net. Each fallback is logged at debug level without prompt
-contents, and `/shadow-status` shows the resolved backend per role plus
-the last fallback reason. The prompt travels on `stdin`, never `argv`,
-so large sessions cannot overflow the command line.
+Builder and verifier run as private Claude agents with file access to the paged evidence archive. When agents are unavailable the pipeline retries with `model.complete` on inline evidence, then fails closed to native compaction. Agent spawn failures are logged at debug level without prompt contents, and `/shadow-status` shows the resolved model per role plus the last fallback reason.
 
 ## Managed installs and updates
 

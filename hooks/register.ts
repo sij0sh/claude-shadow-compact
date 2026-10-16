@@ -18,9 +18,9 @@
  * functions, never into closures capturing it.
  */
 import type { EngineInterface, Register, SessionMessage } from "claude-code";
-import { currentPromptVersions, extractJsonObject } from "./checkpoint.js";
+import { currentPromptVersions } from "./checkpoint.js";
 import {
-  describeBackend,
+  describeModel,
   isAtOrAbove,
   resolveConfig,
   type ShadowConfig,
@@ -40,12 +40,12 @@ const VERIFIER_TYPE = "shadow-compact:checkpoint-verifier";
 const AGENT_TIMEOUT_MS = 600_000;
 
 /** Running plugin version shown in status; bump with the manifest. */
-const PLUGIN_VERSION = "0.2.1";
+const PLUGIN_VERSION = "0.3.0";
 
 /** Max persisted transcript index entries; ids only, never text. */
 const MAX_PERSISTED_INDEX = 2000;
 
-/** Inline evidence cap for Pi bridge and model.complete fallback. */
+/** Inline evidence cap for the model.complete fallback. */
 const INLINE_EVIDENCE_CHARS = 120_000;
 
 interface Runtime {
@@ -224,121 +224,6 @@ function askViaComplete($: EngineInterface, rt: Runtime): AskFn {
   };
 }
 
-const PI_STDOUT_CAP = 256_000;
-const PI_STDERR_SNIPPET = 200;
-
-/**
- * Answers one builder/verifier request through the Pi CLI on the host
- * (`pi -p`, tool-less and session-less). The Pi provider/model pair
- * comes from config; `request.model` is the Claude alias and is ignored
- * here. Stdout must contain a JSON object or the call fails so the
- * Claude path below is tried next.
- */
-function askViaPiBridge($: EngineInterface, rt: Runtime, kind: "builder" | "verifier"): AskFn {
-  return async (request) => {
-    const pair = kind === "builder" ? rt.config.builderPi : rt.config.verifierPi;
-    const argv: string[] = [
-      rt.config.piBinary,
-      "-p",
-      "--no-session",
-      "--mode",
-      "text",
-      "--no-tools",
-      "--no-extensions",
-      "--no-mcp",
-      "--no-skills",
-      "--no-context-files",
-      "--system-prompt",
-      request.system,
-    ];
-    if (pair.id !== "") {
-      argv.push("--model", pair.id);
-      if (pair.provider !== "") argv.push("--provider", pair.provider);
-    }
-    const thinkingLevel = kind === "builder" ? rt.config.builderThinking : rt.config.verifierThinking;
-    if (thinkingLevel !== "") argv.push("--thinking", thinkingLevel);
-    // The prompt (with inline evidence) travels on stdin, never argv, so
-    // large sessions cannot overflow ARG_MAX. A bare "--" ends option
-    // parsing; pi -p reads the piped prompt as its message.
-    argv.push("--");
-    try {
-      $.ui.log(`shadow-compact: pi ${kind} bridge prompt=${request.prompt.length} chars`, {
-        to: "debug",
-      });
-    } catch {
-      // Logging must never break the bridge call.
-    }
-    let result;
-    try {
-      // A host without a process runner throws here; the caller falls
-      // back to the Claude path.
-      result = await $.process.run(argv, { timeoutMs: rt.config.piTimeoutMs, stdin: request.prompt });
-    } catch (error) {
-      throw new Error(
-        `Pi bridge ${kind} failed to start: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-    if (result.exitCode !== 0) {
-      const snippet = result.stderr.slice(0, PI_STDERR_SNIPPET).replace(/\s+/g, " ");
-      throw new Error(`Pi bridge ${kind} exited ${result.exitCode}${snippet ? `: ${snippet}` : ""}`);
-    }
-    const stdout = result.stdout.slice(0, PI_STDOUT_CAP);
-    try {
-      extractJsonObject(stdout);
-    } catch {
-      throw new Error(`Pi bridge ${kind} returned no JSON object`);
-    }
-    return stdout;
-  };
-}
-
-/**
- * One AskFn routing each request to its configured backend, then falling
- * back per request: Pi bridge, Claude agent spawn, `$.model.complete`,
- * then fail closed to the validation retries in `prepare.ts`.
- */
-function askWithFallback($: EngineInterface, rt: Runtime): AskFn {
-  const builderAgent = askViaAgent($, rt, "builder");
-  const verifierAgent = askViaAgent($, rt, "verifier");
-  const builderPi = askViaPiBridge($, rt, "builder");
-  const verifierPi = askViaPiBridge($, rt, "verifier");
-  const complete = askViaComplete($, rt);
-  return async (request) => {
-    const isBuilder = request.system.includes("create evidence-grounded");
-    const kind = isBuilder ? "builder" : "verifier";
-    const configured = isBuilder ? rt.config.builderBackend : rt.config.verifierBackend;
-    const note = (text: string): void => {
-      try {
-        $.ui.log(text, { to: "debug" });
-      } catch {
-        // Logging must never break preparation.
-      }
-    };
-    if (configured === "pi") {
-      try {
-        const answer = await (isBuilder ? builderPi : verifierPi)(request);
-        return answer;
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        const short = reason.slice(0, 160).replace(/\s+/g, " ");
-        rt.lastFallback = `pi-${kind}:${short}`;
-        // Never log prompt or evidence contents: reason class only.
-        note(`shadow-compact: pi ${kind} fallback (${short})`);
-      }
-    }
-    const claudeAsk = isBuilder ? builderAgent : verifierAgent;
-    try {
-      return await claudeAsk(request);
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      const short = reason.slice(0, 160).replace(/\s+/g, " ");
-      rt.lastFallback = `claude-${kind}:${short}`;
-      note(`shadow-compact: claude ${kind} fallback (${short})`);
-      return complete(request);
-    }
-  };
-}
-
 /**
  * Installs at the next safe boundary by running the built-in /compact,
  * whose session.compact dispatch (engine-originated) this mod answers
@@ -379,19 +264,16 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
   const snapshotLeaf = rows.rows[snapshotLastIndex]!.id;
   try {
     const models = { builder: rt.config.builderModel, verifier: rt.config.verifierModel };
+    // Side agents read the paged evidence file; when agents are
+    // unavailable the whole pipeline retries on inline evidence.
+    const access = await evidenceAccess($, rt, rows);
     let prepared;
-    if (rt.config.builderBackend === "pi" || rt.config.verifierBackend === "pi") {
-      // The Pi subprocess cannot read the host-side evidence file, so the
-      // whole pipeline uses inline evidence; per-request fallback still
-      // tries the Claude agent before `$.model.complete`.
-      prepared = await prepareCheckpoint(askWithFallback($, rt), rows, inlineEvidence(rows), models);
-    } else {
-      const access = await evidenceAccess($, rt, rows);
-      try {
-        prepared = await prepareCheckpoint(askViaAgents($, rt), rows, access, models);
-      } catch {
-        prepared = await prepareCheckpoint(askViaComplete($, rt), rows, inlineEvidence(rows), models);
-      }
+    try {
+      prepared = await prepareCheckpoint(askViaAgents($, rt), rows, access, models);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      rt.lastFallback = `agents:${reason.slice(0, 160).replace(/\s+/g, " ")}`;
+      prepared = await prepareCheckpoint(askViaComplete($, rt), rows, inlineEvidence(rows), models);
     }
     if (rows.indexOf(prepared.coverageEndEntryId) > snapshotLastIndex) {
       throw new Error("Coverage boundary is past the inspected snapshot");
@@ -436,8 +318,8 @@ function statusText(rt: Runtime): string {
       ? `checkpoint=${published.checkpointId} coverage=${published.coverage.coverageEndEntryId} installs=${rt.state.installCount}`
       : "checkpoint=none",
     `thresholds prepare=${rt.config.prepareThresholdTokens} tokens hard=${rt.config.hardThresholdTokens} tokens recentTurns=${rt.config.recentTurns}`,
-    `builder=${describeBackend(rt.config.builderBackend, rt.config.builderModel, rt.config.builderPi, rt.config.builderThinking)}`,
-    `verifier=${describeBackend(rt.config.verifierBackend, rt.config.verifierModel, rt.config.verifierPi, rt.config.verifierThinking)}`,
+    `builder=${describeModel(rt.config.builderModel)}`,
+    `verifier=${describeModel(rt.config.verifierModel)}`,
     `lastFallback=${rt.lastFallback ?? "none"}`,
     `compact-hook=${rt.compactHookSeen ? "seen" : "unseen"}`,
   ].join(" · ");

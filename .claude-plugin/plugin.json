@@ -1,6 +1,6 @@
 {
   "name": "shadow-compact",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Verified-checkpoint compaction for Claude Code: a private builder and independent verifier prepare an evidence-grounded checkpoint in the background, and session.compact installs it with the exact recent tail preserved by handle.",
   "author": {
     "name": "pi-shadow-compact port"
@@ -27,8 +27,8 @@
     "builderModel": {
       "type": "string",
       "title": "Builder model",
-      "description": "Model alias or id for the private checkpoint-builder agent; inherit uses the session model.",
-      "default": "inherit",
+      "description": "Model alias or id for the private checkpoint-builder agent; haiku keeps cost low, inherit uses the session model.",
+      "default": "haiku",
       "options": [
         "inherit",
         "haiku",
@@ -39,102 +39,14 @@
     "verifierModel": {
       "type": "string",
       "title": "Verifier model",
-      "description": "Model alias or id for the private checkpoint-verifier agent; inherit uses the session model.",
-      "default": "inherit",
+      "description": "Model alias or id for the private checkpoint-verifier agent; haiku keeps cost low, inherit uses the session model.",
+      "default": "haiku",
       "options": [
         "inherit",
         "haiku",
         "sonnet",
         "opus"
       ]
-    },
-    "builderBackend": {
-      "type": "string",
-      "title": "Builder backend",
-      "description": "claude uses the private Claude agent; pi shells out to the Pi CLI for non-Claude models and falls back to Claude on failure.",
-      "default": "claude",
-      "options": [
-        "claude",
-        "pi"
-      ]
-    },
-    "verifierBackend": {
-      "type": "string",
-      "title": "Verifier backend",
-      "description": "claude uses the private Claude agent; pi shells out to the Pi CLI for non-Claude models and falls back to Claude on failure.",
-      "default": "claude",
-      "options": [
-        "claude",
-        "pi"
-      ]
-    },
-    "builderProvider": {
-      "type": "string",
-      "title": "Builder Pi provider",
-      "description": "Pi provider for the builder when its backend is pi (for example openai); leave blank with builder id for the Pi default model.",
-      "default": ""
-    },
-    "builderId": {
-      "type": "string",
-      "title": "Builder Pi model id",
-      "description": "Pi model id for the builder when its backend is pi; leave blank with builder provider for the Pi default model.",
-      "default": ""
-    },
-    "verifierProvider": {
-      "type": "string",
-      "title": "Verifier Pi provider",
-      "description": "Pi provider for the verifier when its backend is pi; leave blank with verifier id to reuse the builder Pi model.",
-      "default": ""
-    },
-    "verifierId": {
-      "type": "string",
-      "title": "Verifier Pi model id",
-      "description": "Pi model id for the verifier when its backend is pi; leave blank with verifier provider to reuse the builder Pi model.",
-      "default": ""
-    },
-    "builderThinking": {
-      "type": "string",
-      "title": "Builder Pi thinking level",
-      "description": "Pi thinking level for the builder when its backend is pi; default uses the Pi default.",
-      "default": "default",
-      "options": [
-        "default",
-        "off",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max"
-      ]
-    },
-    "verifierThinking": {
-      "type": "string",
-      "title": "Verifier Pi thinking level",
-      "description": "Pi thinking level for the verifier when its backend is pi; default reuses the builder level.",
-      "default": "default",
-      "options": [
-        "default",
-        "off",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max"
-      ]
-    },
-    "piBinary": {
-      "type": "string",
-      "title": "Pi executable",
-      "description": "Pi CLI used by the pi backend; a bare name resolves on PATH.",
-      "default": "pi"
-    },
-    "piTimeoutMs": {
-      "type": "number",
-      "title": "Pi bridge timeout (ms)",
-      "description": "How long one Pi CLI call may run before the request falls back to Claude; at most 600000.",
-      "default": 540000
     },
     "manualCompactMode": {
       "type": "string",
