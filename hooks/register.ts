@@ -212,16 +212,15 @@ function askViaAgents($: EngineInterface, rt: Runtime): AskFn {
     request.system.includes("create evidence-grounded") ? builder(request) : verifier(request);
 }
 
-function askViaComplete($: EngineInterface, rt: Runtime): AskFn {
-  return async (request) => {
-    if (!rt.archive) throw new Error("Evidence archive not ready");
-    return $.model.complete({
+/** The prompt already carries the inline snapshot evidence as its access text. */
+function askViaComplete($: EngineInterface): AskFn {
+  return async (request) =>
+    $.model.complete({
       model: request.model === "inherit" ? "haiku" : request.model,
       system: request.system,
-      prompt: `${request.prompt}\n\n${inlineEvidence(rt.archive)}`,
+      prompt: request.prompt,
       maxTokens: 16_000,
     });
-  };
 }
 
 /**
@@ -262,18 +261,20 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
   const generation = preparing.generation;
   const snapshotLastIndex = rows.size - 1;
   const snapshotLeaf = rows.rows[snapshotLastIndex]!.id;
+  // Rows appended mid-preparation (agent hand-backs, new turns) stay out.
+  const snapshot = rows.snapshot(snapshotLastIndex);
   try {
     const models = { builder: rt.config.builderModel, verifier: rt.config.verifierModel };
     // Side agents read the paged evidence file; when agents are
     // unavailable the whole pipeline retries on inline evidence.
-    const access = await evidenceAccess($, rt, rows);
+    const access = await evidenceAccess($, rt, snapshot);
     let prepared;
     try {
-      prepared = await prepareCheckpoint(askViaAgents($, rt), rows, access, models);
+      prepared = await prepareCheckpoint(askViaAgents($, rt), snapshot, access, models);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       rt.lastFallback = `agents:${reason.slice(0, 160).replace(/\s+/g, " ")}`;
-      prepared = await prepareCheckpoint(askViaComplete($, rt), rows, inlineEvidence(rows), models);
+      prepared = await prepareCheckpoint(askViaComplete($), snapshot, inlineEvidence(snapshot), models);
     }
     if (rows.indexOf(prepared.coverageEndEntryId) > snapshotLastIndex) {
       throw new Error("Coverage boundary is past the inspected snapshot");
@@ -384,7 +385,7 @@ export const register: Register = (on, options) => {
     const result = await next(e);
     if (!e.agentId && result.uuid && result.message) {
       const rows = await ensureSession($, rt);
-      rows.addAppend(result.uuid, e.door, result.message);
+      rows.addAppend(result.uuid, e.door, result.message, e.origin.kind);
       if (result.message.role) {
         if (e.door === "compaction") rt.messageRowIds = [result.uuid];
         else rt.messageRowIds.push(result.uuid);

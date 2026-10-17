@@ -89,6 +89,17 @@ describe("evidence archive", () => {
     expect(archive.search("other API")[0]?.evidenceId).toBe("E0003");
     expect(archive.knownRefs().has("E0004")).toBe(true);
   });
+
+  test("only the person's prompts count as user corrections", async () => {
+    const archive = new EvidenceArchive("/repo");
+    const say = (text: string) => ({ type: "user", role: "user", content: [{ type: "text", text }] });
+    archive.addAppend("r1", "prompt", say("build the thing"), "composer");
+    // A subagent hand-back arrives as a user-role row full of "should"/"no".
+    archive.addAppend("r2", "prompt", say('{"checkpoint": "you should never do that"}'), "task-notification");
+    archive.addAppend("r3", "prompt", say("no, use the other API instead"), "composer");
+    const turns = archive.manifest().turns;
+    expect(turns.map((turn) => turn.hasUserCorrection)).toEqual([false, false, true]);
+  });
 });
 
 function message(role: "user" | "assistant", text: string, extra: Partial<SessionMessage> = {}): SessionMessage {
@@ -231,6 +242,35 @@ describe("prepare pipeline", () => {
       verifier: "inherit",
     });
     expect(builderCalls).toBe(2);
+    expect(prepared.coverageEndEntryId).toBe("r2");
+  });
+
+  test("rows appended mid-preparation stay out of the snapshot", async () => {
+    const live = archiveWith(rows);
+    const snapshot = live.snapshot(live.size - 1);
+    const verifierPrompts: string[] = [];
+    const ask = async (request: { system: string; prompt: string }) => {
+      if (request.system.includes("create evidence-grounded")) {
+        // The builder's hand-back and a new turn land in the live archive.
+        live.addAppend("r3", "prompt", { type: "user", role: "user", content: [] }, "task-notification");
+        live.addAppend("r4", "response", { type: "assistant", role: "assistant", content: [] });
+        return JSON.stringify({ checkpoint: checkpointJson("E0002"), coverageEndEntryId: "r2" });
+      }
+      verifierPrompts.push(request.prompt);
+      if (verifierPrompts.length === 1) {
+        return JSON.stringify({ verdict: "repair", checkpoint: checkpointJson("E0004"), coverageEndEntryId: "r4" });
+      }
+      return JSON.stringify({ verdict: "accept", reason: "ok" });
+    };
+    const prepared = await prepareCheckpoint(ask, snapshot, "evidence inline", {
+      builder: "inherit",
+      verifier: "inherit",
+    });
+    expect(live.size).toBe(4);
+    expect(verifierPrompts[0]).toContain('"rowCount":2');
+    expect(verifierPrompts[0]).toContain('"lastRowId":"r2"');
+    // A repair citing a row the agents never saw is rejected and retried.
+    expect(verifierPrompts[1]).toContain("Unknown evidence reference");
     expect(prepared.coverageEndEntryId).toBe("r2");
   });
 });

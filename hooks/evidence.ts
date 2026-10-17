@@ -28,6 +28,17 @@ export interface EvidenceRow {
   /** True when the row carries a tool result. */
   hasToolResult: boolean;
   isError: boolean;
+  /** `session.append` origin kind; absent for bootstrap rows. */
+  originKind?: string;
+}
+
+/** Origins that are the person speaking, the only source of user corrections. */
+const PERSON_ORIGINS = new Set(["composer", "bridge", "sdk"]);
+
+/** True for a user row the person wrote (bootstrap rows carry no origin). */
+export function isPersonPrompt(row: EvidenceRow): boolean {
+  if (row.role !== "user" || row.hasToolResult) return false;
+  return row.originKind === undefined || PERSON_ORIGINS.has(row.originKind);
 }
 
 export interface EvidenceTurn {
@@ -58,6 +69,7 @@ export function rowFromAppend(
   message: { type: string; role?: string; content: unknown },
   cwd: string,
   index: number,
+  originKind?: string,
 ): EvidenceRow {
   const blocks: BlockLike[] = Array.isArray(message.content)
     ? (message.content as BlockLike[])
@@ -99,6 +111,7 @@ export function rowFromAppend(
     toolNames,
     hasToolResult,
     isError,
+    ...(originKind ? { originKind } : {}),
   };
 }
 
@@ -166,8 +179,21 @@ export class EvidenceArchive {
     uuid: string,
     door: string,
     message: { type: string; role?: string; content: unknown },
+    originKind?: string,
   ): boolean {
-    return this.add(rowFromAppend(uuid, door, message, this.cwd, this.rows.length));
+    return this.add(rowFromAppend(uuid, door, message, this.cwd, this.rows.length, originKind));
+  }
+
+  /**
+   * A frozen copy of rows `0..lastIndex` with the same previous checkpoint.
+   * Preparation reads only this, so the evidence file, manifest, and ref
+   * validation agree even while the live archive keeps growing.
+   */
+  snapshot(lastIndex: number): EvidenceArchive {
+    const copy = new EvidenceArchive(this.cwd);
+    for (const row of this.rows.slice(0, lastIndex + 1)) copy.add(row);
+    copy.setPreviousCheckpoint(this.#previousCheckpointSummary, this.#previousCoverageEndEntryId);
+    return copy;
   }
 
   /** Seeds rows that predate installation (from `$.session.messages()`). */
@@ -259,7 +285,7 @@ export class EvidenceArchive {
           endEvidenceId: turnRows[turnRows.length - 1]?.evidenceId ?? "",
           userPreview: (firstUser?.text ?? "").slice(0, 120),
           hasUserCorrection: turnRows.some(
-            (row) => row.role === "user" && CORRECTION_SIGNALS.test(row.text),
+            (row) => isPersonPrompt(row) && CORRECTION_SIGNALS.test(row.text),
           ),
           hasError: turnRows.some((row) => row.isError),
           tokenEstimate: turnRows.reduce((sum, row) => sum + estimateTokens(row.text), 0),
