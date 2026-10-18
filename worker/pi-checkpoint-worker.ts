@@ -13,7 +13,7 @@
  */
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, type Api, type Model } from "@earendil-works/pi-ai";
 import type {
   PiCheckRequest,
   PiCheckResult,
@@ -67,12 +67,13 @@ async function run(request: PiRunRequest): Promise<PiRunResult> {
     if (!model) throw new Error(`unknown model ${request.target.provider}/${request.target.model}`);
     if (!runtime.hasConfiguredAuth(model.provider)) throw new Error(`no Pi credentials for ${model.provider}`);
     const file = JSON.parse(await readFile(request.evidencePath, "utf8")) as PiEvidenceFile;
+    const reasoning = model.reasoning && request.target.thinking !== "off" ? clampThinkingLevel(model, request.target.thinking) : "off";
     const options = {
       maxTokens: Math.min(model.maxTokens > 0 ? model.maxTokens : MAX_RESPONSE_TOKENS, MAX_RESPONSE_TOKENS),
       toolChoice: "auto" as const,
       cacheRetention: "none" as const,
       sessionId: request.nonce,
-      ...(model.reasoning ? { reasoning: "low" as const } : {}),
+      ...(reasoning !== "off" ? { reasoning } : {}),
     };
     const result = await runCheckpointAgent({
       role: request.role,

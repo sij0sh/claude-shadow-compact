@@ -867,8 +867,13 @@ describe("pi backend", () => {
     expect(config.verifierBackend).toBe("claude");
     expect(config.piBuilder).toBe(null);
     expect(describeRole(config, "builder")).toBe("pi:unconfigured");
-    expect(describeRole(resolveConfig(PI_BOTH), "verifier")).toBe("pi:openrouter/verifier-model");
+    expect(describeRole(resolveConfig(PI_BOTH), "verifier")).toBe("pi:openrouter/verifier-model@low");
     expect(resolveConfig(PI_BOTH).piNodePath).toBe("node");
+    // Thinking defaults to low; an unknown level falls back to it.
+    expect(resolveConfig(PI_BOTH).piBuilder?.thinking).toBe("low");
+    const tuned = resolveConfig({ ...PI_BOTH, piBuilderThinking: "high", piVerifierThinking: "loud" });
+    expect(describeRole(tuned, "builder")).toBe("pi:openrouter/builder-model@high");
+    expect(tuned.piVerifier?.thinking).toBe("low");
   });
 
   test("Pi answers both roles in separate worker runs and the checkpoint publishes", async () => {
@@ -986,7 +991,7 @@ describe("engine integration", () => {
     expect(result.text).toContain("verifier=claude:haiku");
     expect(result.text).toContain("lastFallback=none");
     expect(result.text).toContain("lastCompact=unseen");
-    expect(result.text).toContain("v0.4.3");
+    expect(result.text).toContain("v0.4.4");
   });
 
   test("compact with no checkpoint defers without inventing messages", async ($, on) => {

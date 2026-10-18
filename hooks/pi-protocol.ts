@@ -16,9 +16,14 @@ export const PI_EVIDENCE_ACCESS = `Inspect the session evidence through your rea
 
 export type CheckpointRole = "builder" | "verifier";
 
+/** Pi's thinking levels; the worker clamps to what the model supports. */
+export const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type PiThinkingLevel = (typeof PI_THINKING_LEVELS)[number];
+
 export interface PiTarget {
   provider: string;
   model: string;
+  thinking: PiThinkingLevel;
 }
 
 /** The frozen snapshot both Pi agents read, written once per preparation. */

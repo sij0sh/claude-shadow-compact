@@ -5,7 +5,7 @@
  * can predate the manifest's options.
  */
 import type { ContextWindowSource, PluginOptions, Settings } from "claude-code";
-import type { CheckpointRole, PiTarget } from "./pi-protocol.js";
+import { PI_THINKING_LEVELS, type CheckpointRole, type PiTarget, type PiThinkingLevel } from "./pi-protocol.js";
 
 export const DEFAULT_PREPARE_THRESHOLD_TOKENS = 150_000;
 /**
@@ -31,6 +31,7 @@ export type ManualCompactMode = "shadow" | "native";
 export type CheckpointBackend = "claude" | "pi";
 
 export const DEFAULT_NODE_PATH = "node";
+export const DEFAULT_PI_THINKING: PiThinkingLevel = "low";
 
 export interface ShadowConfig {
   prepareThresholdTokens: number;
@@ -70,8 +71,13 @@ function backend(value: unknown): CheckpointBackend {
   return value === "pi" ? "pi" : "claude";
 }
 
-function piTarget(provider: unknown, modelId: unknown): PiTarget | null {
-  const target = { provider: text(provider), model: text(modelId) };
+function thinking(value: unknown): PiThinkingLevel {
+  const level = text(value);
+  return (PI_THINKING_LEVELS as readonly string[]).includes(level) ? (level as PiThinkingLevel) : DEFAULT_PI_THINKING;
+}
+
+function piTarget(provider: unknown, modelId: unknown, level: unknown): PiTarget | null {
+  const target = { provider: text(provider), model: text(modelId), thinking: thinking(level) };
   return target.provider && target.model ? target : null;
 }
 
@@ -91,8 +97,8 @@ export function resolveConfig(options: PluginOptions): ShadowConfig {
     manualCompactMode: options.manualCompactMode === "native" ? "native" : "shadow",
     builderBackend: backend(options.builderBackend),
     verifierBackend: backend(options.verifierBackend),
-    piBuilder: piTarget(options.piBuilderProvider, options.piBuilderModel),
-    piVerifier: piTarget(options.piVerifierProvider, options.piVerifierModel),
+    piBuilder: piTarget(options.piBuilderProvider, options.piBuilderModel, options.piBuilderThinking),
+    piVerifier: piTarget(options.piVerifierProvider, options.piVerifierModel, options.piVerifierThinking),
     piNodePath: text(options.piNodePath) || DEFAULT_NODE_PATH,
   };
 }
@@ -121,7 +127,7 @@ export function describeRole(config: ShadowConfig, role: CheckpointRole): string
     return describeModel(role === "builder" ? config.builderModel : config.verifierModel);
   }
   const target = piTargetFor(config, role);
-  return target ? `pi:${target.provider}/${target.model}` : "pi:unconfigured";
+  return target ? `pi:${target.provider}/${target.model}@${target.thinking}` : "pi:unconfigured";
 }
 
 export interface ThresholdUsage {

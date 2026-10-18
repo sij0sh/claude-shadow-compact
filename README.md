@@ -184,6 +184,7 @@ Set via the plugin's `userConfig` (Claude Code `/config` or
 | `builderBackend` / `verifierBackend` | `claude` | `claude` or `pi` per role (see [Optional Pi backend](#optional-pi-backend)) |
 | `piBuilderProvider` / `piBuilderModel` | `""` | Pi provider and model id for a `pi` builder |
 | `piVerifierProvider` / `piVerifierModel` | `""` | Pi provider and model id for a `pi` verifier |
+| `piBuilderThinking` / `piVerifierThinking` | `low` | Pi thinking level per role (`off` … `max`), clamped to what the model supports |
 | `piNodePath` | `node` | Node.js executable that runs the Pi worker |
 
 Token settings must be positive safe integers; invalid values use the
@@ -206,7 +207,7 @@ Setup:
 1. Install Pi and run `pi`, then `/login` for the provider you want. The
    worker uses Pi's stored credentials and model catalog.
 2. Set `builderBackend` and/or `verifierBackend` to `pi`, plus that role's
-   `pi*Provider` / `pi*Model`. Node.js 20+ must be on `PATH`, or set `piNodePath`.
+   `pi*Provider` / `pi*Model` (and optionally `pi*Thinking`). Node.js 20+ must be on `PATH`, or set `piNodePath`.
 
 How it runs:
 
@@ -247,7 +248,7 @@ claude plugin marketplace update claude-shadow-compact
 claude plugin update shadow-compact@claude-shadow-compact
 ```
 
-`/shadow-status` shows the running version (`v0.4.3`).
+`/shadow-status` shows the running version (`v0.4.4`).
 
 ## Deferred from the Pi version
 
