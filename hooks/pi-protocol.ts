@@ -50,6 +50,8 @@ export interface PiRunRequest {
   outputPath: string;
   /** The worker stops itself before this, so it writes an error instead of being killed. */
   deadlineMs: number;
+  /** Per-preparation cancellation marker; the worker only reads it. */
+  cancelPath?: string;
 }
 
 export type PiWorkerRequest = PiCheckRequest | PiRunRequest;

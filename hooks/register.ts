@@ -69,10 +69,11 @@ import {
 import { PI_EVIDENCE_ACCESS } from "./pi-protocol.js";
 import { ShadowState, type PublishedCheckpoint } from "./state.js";
 import { buildCandidate, isSkipped } from "./working-context.js";
+import { LiveTranscript, isTranscriptRow } from "./transcript.js";
+import { PreparationCancelled, PreparationControl } from "./preparation-control.js";
 
 const BUILDER_TYPE = "shadow-compact:checkpoint-builder";
 const VERIFIER_TYPE = "shadow-compact:checkpoint-verifier";
-const AGENT_TIMEOUT_MS = 600_000;
 
 /** How often a held compaction checks on its preparation. */
 const COMPACT_POLL_SECONDS = 1;
@@ -80,16 +81,13 @@ const COMPACT_POLL_SECONDS = 1;
 const COMPACT_BUDGET_RESERVE_MS = 2_000;
 
 /** Running plugin version shown in status; bump with the manifest. */
-const PLUGIN_VERSION = "0.4.5";
+const PLUGIN_VERSION = "0.4.6";
 
 /** Inline evidence cap for the model.complete fallback. */
 const INLINE_EVIDENCE_CHARS = 120_000;
 
 /** Store key: model id -> what Shadow decided for its auto-compact window. */
 const WINDOW_DECISIONS_KEY = "autoCompactWindowDecisions";
-
-/** Index slot for a compaction's summary row until its append names it. */
-const SUMMARY_PLACEHOLDER = "compaction-summary";
 
 interface Runtime {
   config: ShadowConfig;
@@ -100,11 +98,14 @@ interface Runtime {
   /** Transcript message order as archive row ids; `unknown-N` marks a
    * message no append named, so coverage on it can never be proven. */
   messageRowIds: string[];
+  transcript: LiveTranscript;
+  preparation: PreparationControl | undefined;
+  runtimeId: string;
+  traceSequence: number;
   bootstrapped: boolean;
   pendingAnswers: Map<string, (answer: string) => void>;
   /** A compaction this mod saw is waiting for its summary row's append. */
   awaitingCompactionRow: boolean;
-  lastCompactionRowId: string | null;
   /** Last preparation fallback/failure for status; never prompt text. */
   lastFallback: string | null;
   /** Last main-loop compaction decision for status; null until one is seen. */
@@ -135,10 +136,13 @@ function createRuntime(config: ShadowConfig): Runtime {
     cwd: "",
     archive: undefined,
     messageRowIds: [],
+    transcript: new LiveTranscript(),
+    preparation: undefined,
+    runtimeId: crypto.randomUUID(),
+    traceSequence: 0,
     bootstrapped: false,
     pendingAnswers: new Map(),
     awaitingCompactionRow: false,
-    lastCompactionRowId: null,
     lastFallback: null,
     lastCompact: null,
     autoCompactWindow: null,
@@ -164,42 +168,75 @@ async function ensureSession($: EngineInterface, rt: Runtime): Promise<EvidenceA
     if (rt.archive.size === 0 && messages.length > 0) {
       rt.archive.bootstrap(messages);
       rt.messageRowIds = rt.archive.rows.map((row) => row.id);
+      rt.transcript.remember(messages, rt.messageRowIds);
     }
   }
   return rt.archive;
 }
 
-/** A compaction row arrived: name the summary slot, or drop an index a
- * compaction this mod never saw has invalidated. */
-function noteCompactionRow(rt: Runtime, uuid: string): void {
-  rt.lastCompactionRowId = uuid;
+/** A compaction row arrived: acknowledge an owned install or invalidate an
+ * unexpected replacement. Handle reconciliation happens at the compact input. */
+function noteCompactionRow(rt: Runtime, uuid: string): boolean {
   if (rt.awaitingCompactionRow) {
     rt.awaitingCompactionRow = false;
-    rt.messageRowIds[0] = uuid;
-    return;
+    return false;
   }
   rt.messageRowIds = [uuid];
   rt.state.discardPublished();
+  return true;
+}
+
+/** Each event is its own file: concurrent dispatches cannot overwrite it. */
+async function trace($: EngineInterface, rt: Runtime, event: string, details: Record<string, unknown> = {}): Promise<void> {
+  const sequence = ++rt.traceSequence;
+  const row = { version: PLUGIN_VERSION, sessionId: rt.sessionId, at: await $.clock.now(), event, ...details };
+  await $.fs.write(`${dataDir($, rt)}/events/${rt.runtimeId}-${String(sequence).padStart(6, "0")}.json`, JSON.stringify(row))
+    .catch(() => { $.ui.log("shadow-compact: could not persist a diagnostic event", { to: "debug" }); });
+}
+
+async function stopPreparation($: EngineInterface, rt: Runtime, reason: string): Promise<void> {
+  const control = rt.preparation;
+  if (!control || control.finished || control.stopping) return;
+  control.stopping = true;
+  control.cancel(reason);
+  // The worker polls this file and aborts its current provider request.
+  await $.fs.write(`${control.directory}/cancel`, reason).catch(() => undefined);
+  for (const agentId of control.agents) {
+    await $.tool.call({ tool: "TaskStop", task_id: agentId }).catch(() => undefined);
+  }
+  await trace($, rt, "prepare-cancel", { generation: control.generation, reason });
+}
+
+function controlledAsk($: EngineInterface, control: PreparationControl, ask: AskFn): AskFn {
+  return async request => {
+    control.remaining(await $.clock.now());
+    const answer = await control.race(ask(request));
+    control.remaining(await $.clock.now());
+    return answer;
+  };
+}
+
+function noteDraft($: EngineInterface, rt: Runtime, control: PreparationControl, coverage: string): void {
+  control.coverageEndEntryId = coverage;
+  if (rt.preparation !== control) control.cancel("superseded preparation");
+  else if (!rt.messageRowIds.includes(coverage)) {
+    void stopPreparation($, rt, `stale:coverage ${coverage} compacted away`);
+  }
 }
 
 /**
- * Runs a native compaction and rebuilds the index for its result:
- * messages kept by handle keep their row ids, the summary (first,
- * handle-less) takes the compaction row once its append names it.
+ * Remember native's entire result by content and identity, including its new
+ * summary. This also handles hosts which install without a compaction append.
  */
 async function compactNatively(
+  $: EngineInterface,
   rt: Runtime,
   before: readonly SessionMessage[],
   run: () => Promise<SessionCompactResult>,
 ): Promise<SessionCompactResult> {
-  const byHandle = new Map<string, string>();
-  if (before.length === rt.messageRowIds.length) {
-    before.forEach((message, index) => {
-      if (message.handle) byHandle.set(message.handle, rt.messageRowIds[index]!);
-    });
-  }
+  const beforeIds = rt.transcript.resolve(before);
+  const byHandle = new Map(before.flatMap((message, index) => message.handle ? [[message.handle, beforeIds[index]!] as const] : []));
   rt.awaitingCompactionRow = true;
-  const summaryRowBefore = rt.lastCompactionRowId;
   const result = await run().catch((error: unknown) => {
     rt.awaitingCompactionRow = false;
     throw error;
@@ -208,33 +245,39 @@ async function compactNatively(
     rt.awaitingCompactionRow = false;
     return result;
   }
-  // The summary row may already have appended while core compacted.
-  let summary = SUMMARY_PLACEHOLDER;
-  if (rt.lastCompactionRowId !== summaryRowBefore) {
-    summary = rt.lastCompactionRowId!;
-    rt.awaitingCompactionRow = false;
+  rt.messageRowIds = result.messages.map(message => {
+    const kept = message.handle && byHandle.get(message.handle);
+    if (kept && !kept.startsWith("unknown-")) return kept;
+    const id = `native-${crypto.randomUUID()}`;
+    rt.archive?.addSessionMessage(id, message);
+    return id;
+  });
+  rt.transcript.remember(result.messages, rt.messageRowIds);
+  if (rt.preparation && !rt.messageRowIds.includes(rt.preparation.coverageEndEntryId)) {
+    await stopPreparation($, rt, `stale:coverage ${rt.preparation.coverageEndEntryId} compacted away`);
   }
-  rt.messageRowIds = result.messages.map(
-    (message, index) =>
-      (message.handle && byHandle.get(message.handle)) ||
-      (index === 0 ? summary : `unknown-${index}`),
-  );
   // Native summarized what the checkpoint covered: prepare afresh.
   rt.state.discardPublished();
   rt.state.rearm();
+  await trace($, rt, "native-complete", { messages: result.messages.length });
   return result;
 }
 
 /** Confirms an attempted install against canonical history. */
 async function confirmInstall($: EngineInterface, rt: Runtime): Promise<void> {
   const published = rt.state.published;
+  if (!rt.state.attemptedCheckpointId && !rt.awaitingCompactionRow) return;
+  const messages = await $.session.messages().catch(() => [] as SessionMessage[]);
+  if (rt.awaitingCompactionRow && rt.transcript.matchesPrefix(messages)) rt.awaitingCompactionRow = false;
   if (!rt.state.attemptedCheckpointId || !published) return;
-  const first = (await $.session.messages().catch(() => [] as SessionMessage[]))[0];
+  const first = messages[0];
   if (
     first?.text.startsWith(CHECKPOINT_HEADING) &&
     first.text.includes(coverageLine(published.coverageEndEntryId))
   ) {
     rt.state.confirmInstall();
+    rt.awaitingCompactionRow = false;
+    await trace($, rt, "install-confirmed", { checkpoint: published.checkpointId, coverage: published.coverageEndEntryId });
     $.ui.log("shadow-compact: installed verified checkpoint + exact recent tail");
   }
 }
@@ -248,8 +291,9 @@ async function evidenceAccess(
   $: EngineInterface,
   rt: Runtime,
   rows: EvidenceArchive,
+  control: PreparationControl,
 ): Promise<string> {
-  const path = `${dataDir($, rt)}/evidence.jsonl`;
+  const path = `${control.directory}/evidence.jsonl`;
   // An unwritten file would send agents to stale or missing evidence.
   await $.fs.write(path, rows.fullText());
   const previous = rows.previousCheckpoint();
@@ -265,10 +309,12 @@ function inlineEvidence(rows: EvidenceArchive): string {
   const previousText = previous
     ? `\n\nPrevious checkpoint (evidence ${previous.evidenceId}):\n${previous.summary}`
     : "";
-  return `Session evidence (sanitized JSONL rows; cite evidenceId, name coverage by entryId):\n${rows.fullText().slice(0, INLINE_EVIDENCE_CHARS)}${previousText}`;
+  const text = rows.fullText();
+  if (text.length > INLINE_EVIDENCE_CHARS) throw new Error("inline evidence exceeds safe limit; refusing truncated fallback");
+  return `Session evidence (sanitized JSONL rows; cite evidenceId, name coverage by entryId):\n${text}${previousText}`;
 }
 
-function askViaAgent($: EngineInterface, rt: Runtime, kind: "builder" | "verifier"): AskFn {
+function askViaAgent($: EngineInterface, rt: Runtime, kind: "builder" | "verifier", control: PreparationControl): AskFn {
   return async (request) => {
     const spawned = await $.agent.spawn({
       subagentType: kind === "builder" ? BUILDER_TYPE : VERIFIER_TYPE,
@@ -280,25 +326,28 @@ function askViaAgent($: EngineInterface, rt: Runtime, kind: "builder" | "verifie
       throw new Error(`Agent spawn refused: ${spawned.deny ?? "no agent id"}`);
     }
     const agentId = spawned.agentId;
+    control.agents.add(agentId);
+    if (control.reason) {
+      await $.tool.call({ tool: "TaskStop", task_id: agentId }).catch(() => undefined);
+      throw new PreparationCancelled(control.reason);
+    }
     const answer = new Promise<string>((resolve) => {
       rt.pendingAnswers.set(agentId, resolve);
     });
-    const timeout = $.clock.sleep(AGENT_TIMEOUT_MS).then(() => {
-      if (rt.pendingAnswers.delete(agentId)) throw new Error(`${kind} agent timed out`);
-      return "";
-    });
     try {
-      return await Promise.race([answer, timeout]);
+      return await control.race(answer);
     } finally {
       rt.pendingAnswers.delete(agentId);
+      // Cancellation owns stopping the agent; normal completion releases it.
+      if (!control.reason) control.agents.delete(agentId);
     }
   };
 }
 
 /** One AskFn routing each role to its private agent type. */
-function askViaAgents($: EngineInterface, rt: Runtime): AskFn {
-  const builder = askViaAgent($, rt, "builder");
-  const verifier = askViaAgent($, rt, "verifier");
+function askViaAgents($: EngineInterface, rt: Runtime, control: PreparationControl): AskFn {
+  const builder = askViaAgent($, rt, "builder", control);
+  const verifier = askViaAgent($, rt, "verifier", control);
   return (request) => (request.role === "builder" ? builder(request) : verifier(request));
 }
 
@@ -307,24 +356,24 @@ function askViaAgents($: EngineInterface, rt: Runtime): AskFn {
  * the rest. Each Pi role reads the snapshot through the worker's tools;
  * a Claude role reads the evidence file.
  */
-async function prepareWithPi($: EngineInterface, rt: Runtime, snapshot: EvidenceArchive) {
-  const dir = dataDir($, rt);
+async function prepareWithPi($: EngineInterface, rt: Runtime, snapshot: EvidenceArchive, control: PreparationControl) {
+  const dir = control.directory;
   const evidencePath = `${dir}/pi-evidence.json`;
   await writePiEvidence($, evidencePath, snapshot);
-  const pi = askViaPi($, rt.config, { evidencePath, dataDir: dir }, rt.piStats);
+  const pi = askViaPi($, rt.config, { evidencePath, dataDir: dir, control }, rt.piStats);
   const claudeRoles = roleBackend(rt.config, "builder") === "claude" || roleBackend(rt.config, "verifier") === "claude";
-  const claudeAccess = claudeRoles ? await evidenceAccess($, rt, snapshot) : "";
-  const agents = askViaAgents($, rt);
+  const claudeAccess = claudeRoles ? await evidenceAccess($, rt, snapshot, control) : "";
+  const agents = askViaAgents($, rt, control);
   const ask: AskFn = (request) =>
     roleBackend(rt.config, request.role) === "pi" ? pi(request) : agents(request);
   const access = {
     builder: roleBackend(rt.config, "builder") === "pi" ? PI_EVIDENCE_ACCESS : claudeAccess,
     verifier: roleBackend(rt.config, "verifier") === "pi" ? PI_EVIDENCE_ACCESS : claudeAccess,
   };
-  return prepareCheckpoint(ask, snapshot, access, {
+  return prepareCheckpoint(controlledAsk($, control, ask), snapshot, access, {
     builder: rt.config.builderModel,
     verifier: rt.config.verifierModel,
-  });
+  }, coverage => { noteDraft($, rt, control, coverage); });
 }
 
 /** Claude-only preparation: private agents, then inline `model.complete`. */
@@ -333,19 +382,22 @@ async function prepareWithClaude(
   rt: Runtime,
   snapshot: EvidenceArchive,
   notes: string[],
+  control: PreparationControl,
 ): Promise<{ prepared: Awaited<ReturnType<typeof prepareCheckpoint>>; backend: string }> {
   const models = { builder: rt.config.builderModel, verifier: rt.config.verifierModel };
   // Side agents read the paged evidence file; when agents are
   // unavailable the whole pipeline retries on inline evidence.
-  const access = await evidenceAccess($, rt, snapshot);
+  control.remaining(await $.clock.now());
+  const access = await evidenceAccess($, rt, snapshot, control);
   try {
-    return { prepared: await prepareCheckpoint(askViaAgents($, rt), snapshot, access, models), backend: "claude-agents" };
+    return { prepared: await prepareCheckpoint(controlledAsk($, control, askViaAgents($, rt, control)), snapshot, access, models, coverage => { noteDraft($, rt, control, coverage); }), backend: "claude-agents" };
   } catch (error) {
+    if (error instanceof PreparationCancelled) throw error;
     notes.push(`agents:${oneLine(error)}`);
     rt.lastFallback = notes.join(" then ");
   }
   return {
-    prepared: await prepareCheckpoint(askViaComplete($), snapshot, inlineEvidence(snapshot), models),
+    prepared: await prepareCheckpoint(controlledAsk($, control, askViaComplete($)), snapshot, inlineEvidence(snapshot), models, coverage => { noteDraft($, rt, control, coverage); }),
     backend: "claude-complete",
   };
 }
@@ -377,7 +429,17 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
   const snapshot = rows.snapshot(rows.size - 1);
   const started = performance.now();
   const notes: string[] = [];
+  const coverage = snapshot.rows.findLast(row => rt.transcript.knownIds.has(row.id))?.id;
+  if (!coverage) { rt.state.fail(generation); return; }
+  const directory = `${dataDir($, rt)}/prepare-${rt.runtimeId}-${generation}`;
+  const control = new PreparationControl(generation, directory,
+    (await $.clock.now()) + rt.config.prepareTimeoutSeconds * 1000, coverage);
+  rt.preparation = control;
   try {
+    $.clock.after(rt.config.prepareTimeoutSeconds * 1000, () => {
+      if (rt.preparation === control && !control.finished) void stopPreparation($, rt, "preparation deadline reached");
+    });
+    await trace($, rt, "prepare-start", { generation, directory, rows: snapshot.size, coverage, deadline: control.deadline });
     let prepared: Awaited<ReturnType<typeof prepareCheckpoint>> | undefined;
     let backend = "";
     if (usesPi(rt.config)) {
@@ -385,9 +447,10 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
         notes.push(`pi-unavailable:${rt.piStatus.slice("failed:".length)}`);
       } else {
         try {
-          prepared = await prepareWithPi($, rt, snapshot);
+          prepared = await control.race(prepareWithPi($, rt, snapshot, control));
           backend = rt.config.builderBackend === rt.config.verifierBackend ? "pi" : "mixed";
         } catch (error) {
+          if (error instanceof PreparationCancelled) throw error;
           // Any Pi-involving failure redoes the whole preparation on Claude.
           if (error instanceof PiWorkerUnavailable) rt.piStatus = `failed:${oneLine(error)}`;
           notes.push(`pi:${oneLine(error)}`);
@@ -395,7 +458,8 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
       }
       if (notes.length > 0) rt.lastFallback = notes.join(" then ");
     }
-    if (!prepared) ({ prepared, backend } = await prepareWithClaude($, rt, snapshot, notes));
+    if (!prepared) ({ prepared, backend } = await control.race(prepareWithClaude($, rt, snapshot, notes, control)));
+    control.remaining(await $.clock.now());
     rt.lastPrepare = `${backend} ${Math.round(performance.now() - started)}ms`;
     const checkpoint: PublishedCheckpoint = {
       checkpointId: `shadow-${generation}-${prepared.coverageEndEntryId}`,
@@ -411,17 +475,28 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
         $.ui.log(`shadow-compact: discarded a checkpoint born stale (covers ${checkpoint.coverageEndEntryId})`, { to: "debug" });
       }
     } else if (rt.state.publish(generation, checkpoint)) {
+      control.finished = true;
       rows.setPreviousCheckpoint(checkpoint.rendered, checkpoint.coverageEndEntryId);
       $.ui.log(
         `shadow-compact: verified checkpoint ready (covers ${prepared.coverageEndEntryId}); it installs at the next /compact or auto-compaction`,
       );
+      await $.fs.write(`${directory}/checkpoint.json`, JSON.stringify(checkpoint)).catch(() => undefined);
+      await trace($, rt, "prepare-ready", { generation, coverage: checkpoint.coverageEndEntryId, backend, durationMs: Math.round(performance.now() - started) });
     }
   } catch (error) {
-    rt.state.fail(generation);
+    if (error instanceof PreparationCancelled) await stopPreparation($, rt, control.reason ?? oneLine(error));
+    if (error instanceof PreparationCancelled && control.reason?.startsWith("stale:")) rt.state.discardStale(generation);
+    else rt.state.fail(generation);
     notes.push(`failed:${oneLine(error)}`);
     rt.lastFallback = notes.join(" then ");
     rt.lastPrepare = `failed ${Math.round(performance.now() - started)}ms`;
     $.ui.log(`shadow-compact: preparation failed (${oneLine(error)})`, { to: "debug" });
+    await trace($, rt, "prepare-failed", { generation, reason: oneLine(error) });
+  } finally {
+    control.finished = true;
+    if (rt.preparation === control) rt.preparation = undefined;
+    await $.fs.write(`${directory}/outcome.json`, JSON.stringify({ generation, durationMs: Math.round(performance.now() - started), fallback: notes, cancelled: control.reason }))
+      .catch(() => undefined);
   }
 }
 
@@ -437,15 +512,20 @@ type InstallPlan =
 function planInstall(rt: Runtime, messages: readonly SessionMessage[]): InstallPlan {
   const published = rt.state.published;
   if (!published) return { reason: "no-checkpoint" };
-  if (rt.messageRowIds.length !== messages.length) return { reason: "index-misaligned" };
+  // Rebuild from this compact input, never from the append stream's shape.
+  rt.messageRowIds = rt.transcript.resolve(messages);
   const coveredIndex = rt.messageRowIds.indexOf(published.coverageEndEntryId);
   if (coveredIndex < 0) {
     rt.state.discardPublished();
     return { reason: "coverage-unproven" };
   }
+  if (rt.messageRowIds.lastIndexOf(published.coverageEndEntryId) !== coveredIndex) return { reason: "coverage-ambiguous" };
   const built = buildCandidate(messages, coveredIndex, rt.config.recentTurns, published.rendered);
   if (isSkipped(built) || !built.messages) {
     return { reason: isSkipped(built) ? built.skipped : "no-candidate" };
+  }
+  if (rt.messageRowIds.slice(0, built.tailStart).some(id => id.startsWith("unknown-"))) {
+    return { reason: "history-unproven" };
   }
   return { messages: built.messages, tailStart: built.tailStart, checkpointId: published.checkpointId };
 }
@@ -600,6 +680,8 @@ function statusText(rt: Runtime): string {
     `installs=${rt.state.installCount}`,
     `prepare=${rt.config.prepareThresholdTokens} tokens recentRounds=${rt.config.recentTurns}`,
     `compactWait=${rt.config.compactWaitSeconds}s`,
+    `prepareTimeout=${rt.config.prepareTimeoutSeconds}s`,
+    `diagnostics=${dataDirText(rt)}/events`,
     `autoCompactWindow=${rt.autoCompactWindow ?? "unseen"}`,
     `idleCompact=${rt.idleCompact ?? "unseen"}`,
     `builder=${describeRole(rt.config, "builder")}`,
@@ -610,6 +692,10 @@ function statusText(rt: Runtime): string {
     `lastFallback=${rt.lastFallback ?? "none"}`,
     `lastCompact=${rt.lastCompact ?? "unseen"}`,
   ].join(" · ");
+}
+
+function dataDirText(rt: Runtime): string {
+  return `.shadow-data/${rt.sessionId}`;
 }
 
 /** Honest gate for manual preparation: null means preparation may start. */
@@ -681,10 +767,13 @@ export const register: Register = (on, options) => {
       const rows = await ensureSession($, rt);
       // A replayed uuid is already archived and indexed.
       const added = rows.addAppend(result.uuid, e.door, result.message, e.origin.kind);
-      if (added && result.message.role) {
+      if (added && isTranscriptRow(result.message)) {
+        rt.transcript.knownIds.add(result.uuid);
         const isCheckpointRow =
           rt.awaitingCompactionRow && rows.rows[rows.size - 1]!.text.startsWith(CHECKPOINT_HEADING);
-        if (e.door === "compaction" || isCheckpointRow) noteCompactionRow(rt, result.uuid);
+        if (e.door === "compaction" || isCheckpointRow) {
+          if (noteCompactionRow(rt, result.uuid)) await stopPreparation($, rt, "stale:unobserved compaction replaced history");
+        }
         else rt.messageRowIds.push(result.uuid);
       }
     }
@@ -742,30 +831,42 @@ export const register: Register = (on, options) => {
     if (e.trigger === "precompute") return { skip: "Shadow Compact decides at live compaction" };
     await ensureSession($, rt);
     await confirmInstall($, rt);
+    rt.messageRowIds = rt.transcript.resolve(e.messages);
+    await trace($, rt, "compact-enter", {
+      trigger: e.trigger, messages: e.messages.length, archiveRows: rt.archive?.size,
+      unknownHandles: rt.messageRowIds.filter(id => id.startsWith("unknown-")).length,
+      checkpoint: rt.state.published?.checkpointId ?? null, preparing: rt.state.preparing,
+    });
+    if (rt.preparation && !rt.messageRowIds.includes(rt.preparation.coverageEndEntryId)) {
+      await stopPreparation($, rt, `stale:coverage ${rt.preparation.coverageEndEntryId} no longer live`);
+    }
     if (rt.state.attemptedCheckpointId) {
       rt.state.rejectInstall();
       rt.lastFallback = "install-unconfirmed";
     }
     let waited = "";
     let firstReason: string | undefined;
-    const native = (reason: string) => {
+    const native = async (reason: string) => {
       const why = firstReason && firstReason !== reason ? `${firstReason}${waited} then:${reason}` : `${reason}${waited}`;
       rt.lastCompact = `trigger=${e.trigger} native:${why}`;
-      $.ui.log(`shadow-compact: ${rt.lastCompact}`, { to: "debug" });
-      return compactNatively(rt, e.messages, () => next(e));
+      $.ui.log(`shadow-compact: ${rt.lastCompact}`);
+      await trace($, rt, "compact-native", { decision: rt.lastCompact });
+      return compactNatively($, rt, e.messages, () => next(e));
     };
     if (rt.config.manualCompactMode === "native" && e.trigger === "manual") return native("manual-mode");
     let plan = planInstall(rt, e.messages);
     // Checkpoint-first: a checkpoint still preparing is not a failed one.
     // Hold this compaction for it (or for one just-in-time attempt when
     // none is running) instead of letting native win the race.
-    if ("reason" in plan && plan.reason !== "index-misaligned" && rt.config.compactWaitSeconds > 0) {
+    if ("reason" in plan && plan.reason !== "history-unproven" && plan.reason !== "coverage-ambiguous" && rt.config.compactWaitSeconds > 0) {
       firstReason = plan.reason;
       if (!rt.state.preparing) void runPreparation($, rt, false);
       if (rt.state.preparing) {
         const started = await $.clock.now();
+        await trace($, rt, "compact-wait-start", { trigger: e.trigger, reason: firstReason, seconds: rt.config.compactWaitSeconds });
         const outcome = await waitForPreparation($, rt, next);
         waited = ` waited=${Math.round(((await $.clock.now()) - started) / 1000)}s:${outcome}`;
+        await trace($, rt, "compact-wait-end", { outcome, waited });
         if (outcome === "interrupted") {
           rt.lastCompact = `trigger=${e.trigger} interrupted${waited}`;
           return { skip: "Shadow Compact: compaction interrupted while its checkpoint prepared" };
@@ -776,9 +877,13 @@ export const register: Register = (on, options) => {
     if ("reason" in plan) return native(plan.reason);
     rt.state.attemptInstall();
     rt.awaitingCompactionRow = true;
-    rt.messageRowIds = [SUMMARY_PLACEHOLDER, ...rt.messageRowIds.slice(plan.tailStart)];
+    const checkpointRow = `checkpoint-${crypto.randomUUID()}`;
+    rt.archive?.addSessionMessage(checkpointRow, plan.messages[0]!);
+    rt.messageRowIds = [checkpointRow, ...rt.messageRowIds.slice(plan.tailStart)];
+    rt.transcript.remember(plan.messages, rt.messageRowIds);
     rt.lastCompact = `trigger=${e.trigger} shadow:${plan.checkpointId} tailStart=${plan.tailStart}${waited}`;
     $.ui.log(`shadow-compact: ${rt.lastCompact}`, { to: "debug" });
+    await trace($, rt, "compact-shadow", { decision: rt.lastCompact, messages: plan.messages.length });
     return { messages: plan.messages };
   });
 
@@ -817,7 +922,7 @@ export const register: Register = (on, options) => {
   on("command.run", { command: "compact-native" }, async ($, _e, _next) => {
     await ensureSession($, rt);
     $.clock.after(50, () => {
-      void compactNatively(rt, [], () => $.session.compact()).catch((error: unknown) => {
+      void compactNatively($, rt, [], () => $.session.compact()).catch((error: unknown) => {
         $.ui.log(`shadow-compact: native compaction failed (${oneLine(error)})`);
       });
     });
@@ -825,13 +930,14 @@ export const register: Register = (on, options) => {
   });
 
   on("session.end", async ($, e, next) => {
+    await stopPreparation($, rt, "session ended");
     const result = await next(e);
     rt.state.reset();
     rt.archive = undefined;
     rt.messageRowIds = [];
+    rt.transcript = new LiveTranscript();
     rt.bootstrapped = false;
     rt.awaitingCompactionRow = false;
-    rt.lastCompactionRowId = null;
     rt.lastFallback = null;
     rt.lastCompact = null;
     rt.autoCompactWindow = null;

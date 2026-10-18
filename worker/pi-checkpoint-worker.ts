@@ -23,6 +23,7 @@ import type {
   PiWorkerRequest,
 } from "../hooks/pi-protocol.js";
 import { AgentError, archiveFromFile, runCheckpointAgent } from "./agent-loop.js";
+import { workerCancellation } from "./cancellation.js";
 
 /** Generation cap per response; a checkpoint fits well within it. */
 const MAX_RESPONSE_TOKENS = 32_000;
@@ -60,8 +61,11 @@ async function writeAtomically(path: string, result: PiRunResult): Promise<void>
 async function run(request: PiRunRequest): Promise<PiRunResult> {
   const started = performance.now();
   const elapsed = () => Math.round(performance.now() - started);
-  const signal = AbortSignal.timeout(request.deadlineMs);
+  const cancellation = workerCancellation(request.deadlineMs, request.cancelPath);
+  const { signal } = cancellation;
   try {
+    await cancellation.check();
+    signal.throwIfAborted();
     const runtime = await ModelRuntime.create();
     const model: Model<Api> | undefined = runtime.getModel(request.target.provider, request.target.model);
     if (!model) throw new Error(`unknown model ${request.target.provider}/${request.target.model}`);
@@ -89,6 +93,8 @@ async function run(request: PiRunRequest): Promise<PiRunResult> {
     const usage = error instanceof AgentError ? error.usage : { totalTokens: 0, cost: 0 };
     const reason = signal.aborted && !(error instanceof AgentError) ? `deadline reached: ${message(error)}` : message(error);
     return { nonce: request.nonce, ok: false, error: reason.slice(0, 1_000), usage, durationMs: elapsed() };
+  } finally {
+    cancellation.close();
   }
 }
 

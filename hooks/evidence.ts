@@ -8,6 +8,13 @@
  */
 import { estimateTokens, redactSecretValue, sanitizeForContext } from "./normalize.js";
 
+interface EvidenceMessage {
+  role: "user" | "assistant";
+  text: string;
+  toolUses?: readonly { tool: string; input?: unknown }[];
+  toolResults?: readonly { text: string; isError?: boolean }[];
+}
+
 export const PREVIOUS_CHECKPOINT_EVIDENCE_ID = "E0000";
 
 export function evidenceIdForIndex(index: number): string {
@@ -29,6 +36,8 @@ export interface EvidenceRow {
   isError: boolean;
   /** `session.append` origin kind; absent for bootstrap rows. */
   originKind?: string;
+  /** False for rendered attachments, notices and meta user rows. */
+  isTranscript?: boolean;
 }
 
 /** Origins that are the person speaking, the only source of user corrections. */
@@ -65,7 +74,7 @@ interface BlockLike {
 export function rowFromAppend(
   uuid: string,
   door: string,
-  message: { type: string; role?: string; content: unknown },
+  message: { type: string; role?: string; content: unknown; isMeta?: boolean },
   cwd: string,
   index: number,
   originKind?: string,
@@ -99,8 +108,8 @@ export function rowFromAppend(
       parts.push(`[tool_result${block.is_error === true ? " error" : ""} ${inner}]`);
     }
   }
-  const role =
-    message.role === "user" || message.role === "assistant" ? message.role : undefined;
+  const role = message.type === "assistant" ? "assistant"
+    : message.role === "user" || message.role === "assistant" ? message.role : undefined;
   return {
     id: uuid,
     evidenceId: evidenceIdForIndex(index),
@@ -111,6 +120,7 @@ export function rowFromAppend(
     hasToolResult,
     isError,
     ...(originKind ? { originKind } : {}),
+    isTranscript: message.type === "assistant" || (message.type === "user" && message.role === "user" && !message.isMeta),
   };
 }
 
@@ -119,7 +129,7 @@ export function segmentTurns(rows: readonly EvidenceRow[]): EvidenceTurn[] {
   if (rows.length === 0) return [];
   const starts: number[] = [];
   rows.forEach((row, index) => {
-    if (row.role === "user" && !row.hasToolResult) starts.push(index);
+    if (row.role === "user" && !row.hasToolResult && row.isTranscript !== false) starts.push(index);
   });
   const effective = starts.length > 0 ? starts : [0];
   return effective.map((start, t) => {
@@ -139,6 +149,7 @@ export interface SessionManifest {
   turnCount: number;
   firstRowId: string | null;
   lastRowId: string | null;
+  lastTranscriptRowId: string | null;
   previousCoverageEndEntryId: string | null;
   hasPreviousCheckpoint: boolean;
   requiredTurnIds: string[];
@@ -177,7 +188,7 @@ export class EvidenceArchive {
   addAppend(
     uuid: string,
     door: string,
-    message: { type: string; role?: string; content: unknown },
+    message: { type: string; role?: string; content: unknown; isMeta?: boolean },
     originKind?: string,
   ): boolean {
     return this.add(rowFromAppend(uuid, door, message, this.cwd, this.rows.length, originKind));
@@ -196,18 +207,20 @@ export class EvidenceArchive {
   }
 
   /** Seeds rows that predate installation (from `$.session.messages()`). */
-  bootstrap(messages: readonly { role: "user" | "assistant"; text: string }[]): void {
+  bootstrap(messages: readonly EvidenceMessage[]): void {
     messages.forEach((message, index) => {
-      this.add({
-        id: `bootstrap-${index}`,
-        evidenceId: evidenceIdForIndex(this.rows.length),
-        role: message.role,
-        door: "bootstrap",
-        text: sanitizeForContext(message.text, this.cwd).slice(0, MAX_ROW_TEXT_CHARS),
-        toolNames: [],
-        hasToolResult: false,
-        isError: false,
-      });
+      this.addSessionMessage(`bootstrap-${index}`, message, "bootstrap");
+    });
+  }
+
+  addSessionMessage(id: string, message: EvidenceMessage, door = "compaction"): void {
+    this.addAppend(id, door, {
+      type: message.role, role: message.role,
+      content: [
+        { type: "text", text: message.text },
+        ...(message.toolUses ?? []).map(call => ({ type: "tool_use", name: call.tool, input: call.input })),
+        ...(message.toolResults ?? []).map(result => ({ type: "tool_result", content: result.text, is_error: result.isError })),
+      ],
     });
   }
 
@@ -267,6 +280,7 @@ export class EvidenceArchive {
       turnCount: turns.length,
       firstRowId: this.rows[0]?.id ?? null,
       lastRowId: this.rows[this.rows.length - 1]?.id ?? null,
+      lastTranscriptRowId: this.rows.findLast(row => row.role && row.isTranscript !== false)?.id ?? null,
       previousCoverageEndEntryId: this.#previousCoverageEndEntryId,
       hasPreviousCheckpoint: this.#previousCheckpointSummary !== undefined,
       requiredTurnIds: [...required],
@@ -298,6 +312,7 @@ export class EvidenceArchive {
           evidenceId: row.evidenceId,
           entryId: row.id,
           role: row.role ?? row.door,
+          eligibleForCoverage: row.isTranscript !== false && !!row.role,
           text: row.text,
         }),
       )

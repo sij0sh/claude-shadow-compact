@@ -13,6 +13,7 @@
 import type { EngineInterface } from "claude-code";
 import { piTargetFor, roleBackend, type ShadowConfig } from "./config.js";
 import type { EvidenceArchive } from "./evidence.js";
+import type { PreparationControl } from "./preparation-control.js";
 import type { AskFn } from "./prepare.js";
 import {
   PI_WORKER_PATH,
@@ -99,6 +100,7 @@ export interface PiPaths {
   evidencePath: string;
   /** Directory for per-role result files. */
   dataDir: string;
+  control?: PreparationControl;
 }
 
 /** Writes the snapshot both Pi agents read; one per preparation. */
@@ -151,7 +153,9 @@ export function askViaPi(
     const target = piTargetFor(config, request.role);
     if (!target) throw new Error(`pi ${request.role} has no provider/model configured`);
     const nonce = crypto.randomUUID();
-    const outputPath = `${paths.dataDir}/pi-${request.role}-result.json`;
+    const outputPath = `${paths.dataDir}/pi-${request.role}-${nonce}-result.json`;
+    const remaining = paths.control ? paths.control.remaining(await $.clock.now()) : PI_RUN_TIMEOUT_MS;
+    const timeoutMs = Math.min(PI_RUN_TIMEOUT_MS, remaining);
     const run: PiRunRequest = {
       op: "run",
       nonce,
@@ -161,12 +165,13 @@ export function askViaPi(
       prompt: request.prompt,
       evidencePath: paths.evidencePath,
       outputPath,
-      deadlineMs: PI_RUN_TIMEOUT_MS - PI_DEADLINE_MARGIN_MS,
+      deadlineMs: Math.max(1, timeoutMs - Math.min(PI_DEADLINE_MARGIN_MS, Math.floor(timeoutMs / 10))),
+      ...(paths.control ? { cancelPath: `${paths.control.directory}/cancel` } : {}),
     };
     stats.calls += 1;
     try {
       const exited = await $.process
-        .run(workerArgv($, config), { stdin: JSON.stringify(run), timeoutMs: PI_RUN_TIMEOUT_MS })
+        .run(workerArgv($, config), { stdin: JSON.stringify(run), timeoutMs })
         .catch((error: unknown) => {
           throw new PiWorkerUnavailable(
             `pi ${request.role} worker did not run: ${error instanceof Error ? error.message : String(error)}`,

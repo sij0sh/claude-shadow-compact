@@ -10,8 +10,8 @@ import { PI_THINKING_LEVELS, type CheckpointRole, type PiTarget, type PiThinking
 export const DEFAULT_PREPARE_THRESHOLD_TOKENS = 150_000;
 /**
  * Claude Code auto-compact window Shadow sets once per model. The engine
- * reserves headroom below the window, so compaction lands near ~175k:
- * the gap above the prepare threshold is checkpoint-preparation time.
+ * reserves headroom below the window; the observed Opus trigger is around
+ * 157–162k for a 190k window. The bounded wait supplies additional time.
  */
 export const DEFAULT_AUTO_COMPACT_WINDOW_TOKENS = 190_000;
 /**
@@ -29,6 +29,7 @@ export const DEFAULT_RECENT_TURNS = 10;
 export const DEFAULT_COMPACT_WAIT_SECONDS = 120;
 /** `$.process.run` refuses longer children; the wait is a chain of them. */
 export const MAX_COMPACT_WAIT_SECONDS = 600;
+export const DEFAULT_PREPARE_TIMEOUT_SECONDS = 360;
 /** Default checkpoint-agent model: cheap and fast, never the session model. */
 export const DEFAULT_MODEL = "haiku";
 
@@ -49,6 +50,7 @@ export interface ShadowConfig {
   /** Recent assistant/tool rounds kept verbatim (option key kept from turns). */
   recentTurns: number;
   compactWaitSeconds: number;
+  prepareTimeoutSeconds: number;
   builderModel: string;
   verifierModel: string;
   manualCompactMode: ManualCompactMode;
@@ -112,6 +114,7 @@ export function resolveConfig(options: PluginOptions): ShadowConfig {
       MAX_COMPACT_WAIT_SECONDS,
       nonNegativeInt(options.compactWaitSeconds, DEFAULT_COMPACT_WAIT_SECONDS),
     ),
+    prepareTimeoutSeconds: Math.min(600, positiveInt(options.prepareTimeoutSeconds, DEFAULT_PREPARE_TIMEOUT_SECONDS)),
     builderModel: model(options.builderModel),
     verifierModel: model(options.verifierModel),
     manualCompactMode: options.manualCompactMode === "native" ? "native" : "shadow",

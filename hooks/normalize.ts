@@ -59,8 +59,12 @@ export function sanitizeForContext(value: string, cwd: string): string {
   );
   const normalizedCwd = cwd.replace(/\\/g, "/").replace(/\/$/, "");
   if (normalizedCwd) {
-    result = result.replace(/\\/g, "/");
     result = result.replace(new RegExp(`${escapeRegExp(normalizedCwd)}(?=\/|\b)`, "g"), ".");
+    // Match Windows path spelling locally; never rewrite JSON/code escapes.
+    if (cwd.includes("\\")) {
+      const windowsCwd = cwd.replace(/[\\/]$/, "");
+      result = result.replace(new RegExp(`${escapeRegExp(windowsCwd)}(?=\\\\|\\b)`, "g"), ".");
+    }
   }
   return result;
 }

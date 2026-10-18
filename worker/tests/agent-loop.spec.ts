@@ -5,6 +5,10 @@ import { EvidenceArchive } from "../../hooks/evidence.js";
 import { prepareCheckpoint, type AskFn } from "../../hooks/prepare.js";
 import { PI_EVIDENCE_ACCESS } from "../../hooks/pi-protocol.js";
 import { AgentError, archiveFromFile, executeReadTool, Inspection, runCheckpointAgent, type CompleteFn } from "../agent-loop.js";
+import { workerCancellation } from "../cancellation.js";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const MODEL = { provider: "test", id: "scripted", contextWindow: 200_000 };
 
@@ -86,6 +90,54 @@ function lastToolText(context: Context): string {
 }
 
 describe("pi worker agent loop", () => {
+  test("the host cancellation marker aborts an in-flight provider signal", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "shadow-cancel-"));
+    const path = join(directory, "cancel");
+    const cancellation = workerCancellation(5_000, path);
+    const started = Date.now();
+    try {
+      const aborted = new Promise<void>(resolve => cancellation.signal.addEventListener("abort", () => resolve(), { once: true }));
+      await writeFile(path, "coverage removed");
+      await aborted;
+      assert.equal(cancellation.signal.aborted, true);
+      assert.ok(Date.now() - started < 2_000, "marker must abort before the preparation deadline");
+    } finally {
+      cancellation.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+  test("a JSON-encoded checkpoint object is decoded and still strictly validated", async () => {
+    const { complete } = script(readAll, respond([["submit_checkpoint", { checkpoint: JSON.stringify(checkpoint("E0004")), coverageEndEntryId: "a3" }]]));
+    const result = await runCheckpointAgent({ role: "builder", model: MODEL, system: "sys", prompt: "go", archive: archive(), complete, signal });
+    assert.equal(typeof JSON.parse(result.answer).checkpoint, "object");
+    assert.equal(JSON.parse(result.answer).coverageEndEntryId, "a3");
+    const bad = respond([["submit_checkpoint", { checkpoint: JSON.stringify({ ...checkpoint("E0004"), constraints: ["bare string"] }), coverageEndEntryId: "a3" }]]);
+    const rejected = script(readAll, bad, bad, bad);
+    await assert.rejects(runCheckpointAgent({ role: "builder", model: MODEL, system: "sys", prompt: "go", archive: archive(), complete: rejected.complete, signal }), /constraints must be an object/);
+  });
+
+  test("an aborted provider call cannot submit an answer or start another request", async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const complete: CompleteFn = async (_context, options) => {
+      calls++;
+      controller.abort();
+      options.signal.throwIfAborted();
+      return respond([]);
+    };
+    await assert.rejects(runCheckpointAgent({ role: "builder", model: MODEL, system: "sys", prompt: "go", archive: archive(), complete, signal: controller.signal }), /request failed/);
+    assert.equal(calls, 1);
+  });
+
+  test("a provider that returns after abort cannot submit and still reports its usage", async () => {
+    const controller = new AbortController();
+    const complete: CompleteFn = async () => {
+      controller.abort();
+      return respond([["submit_checkpoint", { checkpoint: checkpoint("E0001"), coverageEndEntryId: "a3" }]]);
+    };
+    await assert.rejects(runCheckpointAgent({ role: "builder", model: MODEL, system: "sys", prompt: "go", archive: archive(), complete, signal: controller.signal }),
+      error => error instanceof AgentError && /deadline reached/.test(error.message) && error.usage.totalTokens === 100);
+  });
   test("a builder that reads the session submits a checked answer", async () => {
     const { complete, contexts } = script(
       readAll,

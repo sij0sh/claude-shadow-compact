@@ -8,12 +8,13 @@ import {
 import { decideAutoCompactWindow, decideIdleCompaction, describeModel, describeRole, isAtOrAbove, resolveConfig, usesPi, type WindowFacts } from "../hooks/config.js";
 import { EvidenceArchive } from "../hooks/evidence.js";
 import { redactSecretValue, sanitizeForContext } from "../hooks/normalize.js";
-import { BUILDER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT, prepareCheckpoint } from "../hooks/prepare.js";
+import { BUILDER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT, prepareCheckpoint, parseSubmission } from "../hooks/prepare.js";
 import { checkPi } from "../hooks/pi-backend.js";
 import { PI_EVIDENCE_ACCESS, type PiEvidenceFile, type PiRunRequest, type PiRunResult } from "../hooks/pi-protocol.js";
 import { register } from "../hooks/register.js";
 import { ShadowState, type PublishedCheckpoint } from "../hooks/state.js";
 import { buildCandidate, hasOrphanedToolResult, isSkipped } from "../hooks/working-context.js";
+import { LiveTranscript } from "../hooks/transcript.js";
 
 function archiveWith(rows: Array<[string, "user" | "assistant", string]>): EvidenceArchive {
   const archive = new EvidenceArchive("/repo");
@@ -67,6 +68,12 @@ describe("checkpoint schema", () => {
 });
 
 describe("sanitization", () => {
+  test("preserves code and JSON escapes while normalizing only the working directory", () => {
+    const code = String.raw`{"content":"import x from \"./file\";\nconst re = /\d+\s/;","path":"/repo/src/file.ts"}`;
+    expect(sanitizeForContext(code, "/repo")).toBe(code.replace("/repo/", "./"));
+    expect(sanitizeForContext(String.raw`C:\work\repo\src\file.ts and \n\d`, String.raw`C:\work\repo`))
+      .toBe(String.raw`.\src\file.ts and \n\d`);
+  });
   test("redacts enumerated and unenumerated secret variants", async () => {
     expect(sanitizeForContext("API_KEY=abc123", "")).toContain("[REDACTED]");
     // A long-form variant the explicit patterns do not enumerate by name:
@@ -80,6 +87,16 @@ describe("sanitization", () => {
 });
 
 describe("evidence archive", () => {
+  test("role-bearing attachments and meta rows cannot become coverage anchors or inflate turns", () => {
+    const archive = archiveWith([["u", "user", "task"], ["a", "assistant", "answer"]]);
+    archive.addAppend("reminder", "attachment", { type: "attachment", role: "user", content: [{ type: "text", text: "environment" }] });
+    archive.addAppend("meta", "delivery", { type: "user", role: "user", isMeta: true, content: [{ type: "text", text: "reminder" }] });
+    expect(archive.manifest().turnCount).toBe(1);
+    expect(archive.manifest().lastTranscriptRowId).toBe("a");
+    for (const coverage of ["reminder", "meta"]) {
+      expect(() => parseSubmission(JSON.stringify({ checkpoint: checkpointJson("E0001"), coverageEndEntryId: coverage }), archive)).toThrow(/must name a user or assistant row/);
+    }
+  });
   test("manifest flags required turns", async () => {
     const archive = archiveWith([
       ["r1", "user", "build the thing"],
@@ -322,6 +339,11 @@ describe("prepare pipeline", () => {
 });
 
 describe("config", () => {
+  test("preparation has one bounded positive deadline", () => {
+    expect(resolveConfig({}).prepareTimeoutSeconds).toBe(360);
+    expect(resolveConfig({ prepareTimeoutSeconds: 999 }).prepareTimeoutSeconds).toBe(600);
+    expect(resolveConfig({ prepareTimeoutSeconds: 0 }).prepareTimeoutSeconds).toBe(360);
+  });
   test("token default and custom threshold hold", async () => {
     expect(resolveConfig({}).prepareThresholdTokens).toBe(150_000);
     expect(resolveConfig({ prepareThresholdTokens: 180_000 }).prepareThresholdTokens).toBe(180_000);
@@ -525,12 +547,14 @@ interface HostFakes {
   piWorker?: PiWorker;
   /** Host `sleep` fails, as on a host without it or Node. */
   noSleep?: boolean;
+  piRunTimeMs?: number;
 }
 
 function host(options: Record<string, number | string> = {}, reply?: Reply, fakes: HostFakes = {}) {
   type Handler = ($: EngineInterface, e: any, next: (e: any) => Promise<any>) => any;
   const handlers = new Map<string, Handler>();
-  const scheduled: Array<() => void> = [];
+  const scheduled: Array<{ at: number; callback: () => void }> = [];
+  const stoppedAgents: string[] = [];
   const logs: string[] = [];
   let canonical: SessionMessage[] = [];
   let spawns = 0;
@@ -540,6 +564,12 @@ function host(options: Record<string, number | string> = {}, reply?: Reply, fake
   let now = 0;
   let sleeps = 0;
   const delayed: Array<{ at: number; deliver: () => Promise<void> }> = [];
+  const fireTimers = () => {
+    for (const due of scheduled.filter(timer => timer.at <= now)) {
+      scheduled.splice(scheduled.indexOf(due), 1);
+      due.callback();
+    }
+  };
   const on = ((event: string, ...args: unknown[]) => {
     const head = args.length >= 2 ? (args[0] as { command?: string }) : undefined;
     const key = head && typeof head.command === "string" ? `${event}:${head.command}` : event;
@@ -557,7 +587,7 @@ function host(options: Record<string, number | string> = {}, reply?: Reply, fake
       },
     },
     clock: {
-      after: (_delay: number, callback: () => void) => scheduled.push(callback),
+      after: (delay: number, callback: () => void) => scheduled.push({ at: now + delay, callback }),
       sleep: () => new Promise(() => undefined),
       now: async () => now,
     },
@@ -576,6 +606,7 @@ function host(options: Record<string, number | string> = {}, reply?: Reply, fake
           if (fakes.noSleep) throw new Error("ENOENT");
           sleeps += 1;
           now += Number(argv[1] ?? 1) * 1000 || 1000;
+          fireTimers();
           for (const due of delayed.filter((entry) => entry.at <= sleeps)) {
             delayed.splice(delayed.indexOf(due), 1);
             await due.deliver();
@@ -586,6 +617,8 @@ function host(options: Record<string, number | string> = {}, reply?: Reply, fake
         expect(argv[1]).toBe("/plugin/dist/pi-checkpoint-worker.mjs");
         const request = JSON.parse(init.stdin!) as PiRunRequest;
         piRuns.push(request);
+        now += fakes.piRunTimeMs ?? 0;
+        fireTimers();
         const result = fakes.piWorker(request);
         if (result === "crash") return { exitCode: 1, stdout: "", stderr: "node: bad bundle" };
         files.set(request.outputPath, JSON.stringify(result));
@@ -617,6 +650,11 @@ function host(options: Record<string, number | string> = {}, reply?: Reply, fake
       return reply(request);
     } },
     ui: { log: (text: string) => { logs.push(text); } },
+    tool: { call: async (input: { tool: string; task_id: string }) => {
+      expect(input.tool).toBe("TaskStop");
+      stoppedAgents.push(input.task_id);
+      return { text: "stopped" };
+    } },
   } as unknown as EngineInterface;
   register(on, options);
   const settle = async () => {
@@ -627,6 +665,7 @@ function host(options: Record<string, number | string> = {}, reply?: Reply, fake
     get spawns() { return spawns; },
     files,
     piRuns,
+    stoppedAgents,
     get selfCompactions() { return selfCompactions; },
     get sleeps() { return sleeps; },
     /** Delivers every held agent answer, as a slow pipeline finishing late. */
@@ -635,6 +674,8 @@ function host(options: Record<string, number | string> = {}, reply?: Reply, fake
       await settle();
     },
     setCanonical: (messages: SessionMessage[]) => { canonical = messages; },
+    appendRow: (uuid: string, row: { type: string; role?: string; content: unknown; isMeta?: boolean }, door = "attachment") =>
+      handlers.get("session.append")!($, { uuid, door, origin: { kind: "model" }, message: row }, async () => ({ uuid, message: row })),
     append: (uuid: string, role: "user" | "assistant", text: string, door = role === "user" ? "prompt" : "response") =>
       handlers.get("session.append")!(
         $,
@@ -652,7 +693,8 @@ function host(options: Record<string, number | string> = {}, reply?: Reply, fake
       );
       await settle();
     },
-    complete: () => handlers.get("turn.complete")!($, {}, async () => ({})),
+    complete: async () => { await handlers.get("turn.complete")!($, {}, async () => ({})); await settle(); },
+    advance: async (ms: number) => { now += ms; fireTimers(); await settle(); },
     /** A compaction the engine starts; core answers with a one-message summary. */
     compact: async (
       messages: SessionMessage[],
@@ -672,7 +714,8 @@ function host(options: Record<string, number | string> = {}, reply?: Reply, fake
       return { result: result as { messages?: SessionMessage[]; skip?: string }, coreCalls };
     },
     flush: async () => {
-      for (const callback of scheduled.splice(0)) callback();
+      now += 50;
+      fireTimers();
       await settle();
     },
   };
@@ -688,7 +731,7 @@ const turns: Array<[string, "user" | "assistant", string]> = [
   ["a3", "assistant", "latest answer"],
 ];
 const transcript = (rows = turns): SessionMessage[] =>
-  rows.map(([id, role, text]) => ({ ...message(role, text), handle: `h-${id}` }));
+  rows.map(([id, role, text]) => ({ ...message(role, text), handle: id }));
 
 /** Builder covers through `coverage`; the verifier accepts. */
 const covering = (coverage: string): Reply => (request) =>
@@ -766,12 +809,74 @@ describe("token threshold", () => {
 });
 
 describe("compaction install", () => {
+  test("inline fallback refuses a large archive instead of silently omitting later evidence", async () => {
+    const h = host({}, covering("a2"));
+    for (const [id, role, text] of turns) await h.append(id, role, text);
+    for (let i = 0; i < 40; i++) await h.append(`large-${i}`, "assistant", `row ${i} ${"x".repeat(3900)}`);
+    await h.measure(160_000);
+    expect(await h.status()).toContain("refusing truncated fallback");
+    expect(await h.status()).toContain("checkpoint=none");
+  });
+  test("real attachment, cancelled-row and role-less assistant shapes do not block a ready checkpoint", async () => {
+    const h = host({ recentTurns: 1 }, covering("a2"));
+    for (const [id, role, text] of turns) await h.append(id, role, text);
+    for (let i = 0; i < 35; i++) {
+      await h.appendRow(`attachment-${i}`, { type: "attachment", role: "user", content: [{ type: "text", text: "environment reminder" }] });
+    }
+    await h.append("cancelled-result", "user", "not in active history", "tool-result");
+    await h.appendRow("virtual", { type: "user", content: [{ type: "text", text: "not on the wire" }] }, "delivery");
+    await h.appendRow("limit", { type: "assistant", content: [{ type: "text", text: "Session limit reached" }] }, "response");
+    await h.measure(160_000);
+    const live = [transcript()[0]!, message("assistant", "Session limit reached", { handle: "limit" }), ...transcript().slice(1)];
+    const result = await h.compact(live);
+    expect(result.coreCalls).toBe(0);
+    expect(result.result.messages?.slice(1).map(row => row.handle)).toEqual(["u3", "a3"]);
+    const events = [...h.files.entries()].filter(([path]) => path.includes("/events/")).map(([, text]) => JSON.parse(text));
+    expect(events.some(event => event.event === "compact-shadow")).toBe(true);
+    expect(events.find(event => event.event === "compact-enter").unknownHandles).toBe(0);
+  });
+
+  test("equal text under an unknown handle cannot re-anchor coverage", async () => {
+    const h = await readyHost();
+    const live = transcript().map(row => row.handle === "a2" ? { ...row, handle: "another-row" } : row);
+    expect((await h.compact(live)).coreCalls).toBe(1);
+    expect(await h.status()).toContain("native:coverage-unproven");
+  });
+
+  test("a confirmed full prefix permits host UUID cloning and a second Shadow install", async () => {
+    let boundary = "a2";
+    const h = host({ recentTurns: 1 }, request => covering(boundary)(request));
+    for (const [id, role, text] of turns) await h.append(id, role, text);
+    await h.measure(160_000);
+    const first = await h.compact(transcript());
+    expect(first.coreCalls).toBe(0);
+    h.setCanonical(first.result.messages!);
+    await h.measure(20_000);
+    boundary = "u4";
+    await h.append("u4", "user", longText("next task"));
+    await h.append("a4", "assistant", "latest answer");
+    await h.measure(160_000);
+    const cloned = first.result.messages!.map((row, i) => ({ ...row, handle: `cloned-${i}` }));
+    const second = await h.compact([...cloned, message("user", longText("next task"), { handle: "u4" }), message("assistant", "latest answer", { handle: "a4" })]);
+    expect(second.coreCalls).toBe(0);
+    expect(second.result.messages?.[0]?.text).toContain("entry u4");
+  });
+
+  test("retained prefix rebinding includes tool arguments and refuses changed history", () => {
+    const index = new LiveTranscript();
+    const old = [message("assistant", "", { toolUses: [{ tool_use_id: "t", tool: "Read", input: { file_path: "old" } }] })];
+    index.remember(old, ["original"]);
+    expect(index.resolve([{ ...old[0]!, handle: "clone" }])).toEqual(["original"]);
+    const changed = message("assistant", "", { handle: "clone", toolUses: [{ tool_use_id: "t", tool: "Read", input: { file_path: "new" } }] });
+    expect(index.resolve([changed])).toEqual(["unknown-0"]);
+  });
+
   test("an engine compaction installs checkpoint + exact handle tail without core", async () => {
     const h = await readyHost();
     const { result, coreCalls } = await h.compact(transcript());
     expect(coreCalls).toBe(0);
     expect(result.messages?.[0]?.text).toContain("Covers the session through entry a2");
-    expect(result.messages?.slice(1).map((entry) => entry.handle)).toEqual(["h-u3", "h-a3"]);
+    expect(result.messages?.slice(1).map((entry) => entry.handle)).toEqual(["u3", "a3"]);
     // Handed back is not installed: canonical history must show it.
     expect(await h.status()).toContain("phase=installing");
     h.setCanonical(result.messages!.map(({ handle: _handle, ...rest }) => rest));
@@ -790,10 +895,10 @@ describe("compaction install", () => {
     await h.append("u4", "user", "next ask");
     await h.append("a4", "assistant", "next answer");
     const after = [
-      { ...message("user", result.messages![0]!.text), handle: "h-cp" },
+      { ...message("user", result.messages![0]!.text), handle: "cp" },
       ...transcript(turns.slice(4)),
-      { ...message("user", "next ask"), handle: "h-u4" },
-      { ...message("assistant", "next answer"), handle: "h-a4" },
+      { ...message("user", "next ask"), handle: "u4" },
+      { ...message("assistant", "next answer"), handle: "a4" },
     ];
     // Same length as the index, but a2 is gone: coverage is unproven.
     const second = await h.compact(after);
@@ -804,7 +909,7 @@ describe("compaction install", () => {
   test("coverage ending mid-turn never drops the uncovered reply", async () => {
     const h = await readyHost("u2");
     const { result } = await h.compact(transcript());
-    expect(result.messages?.slice(1).map((entry) => entry.handle)).toEqual(["h-u2", "h-a2", "h-u3", "h-a3"]);
+    expect(result.messages?.slice(1).map((entry) => entry.handle)).toEqual(["u2", "a2", "u3", "a3"]);
   });
 
   test("duplicate appends do not misalign the index", async () => {
@@ -842,14 +947,14 @@ describe("compaction install", () => {
     await h.append("a5", "assistant", "follow-up answer");
     await h.measure(160_000);
     const later = [
-      { ...message("user", summary), handle: "h-ns" },
+      { ...message("user", summary), handle: "ns" },
       ...kept,
-      { ...message("user", "follow-up ask"), handle: "h-u5" },
-      { ...message("assistant", "follow-up answer"), handle: "h-a5" },
+      { ...message("user", "follow-up ask"), handle: "u5" },
+      { ...message("assistant", "follow-up answer"), handle: "a5" },
     ];
     const second = await h.compact(later);
     expect(second.coreCalls).toBe(0);
-    expect(second.result.messages?.slice(1).map((entry) => entry.handle)).toEqual(["h-u5", "h-a5"]);
+    expect(second.result.messages?.slice(1).map((entry) => entry.handle)).toEqual(["u5", "a5"]);
   });
 
   test("compact-native runs core compaction through the session API", async () => {
@@ -883,6 +988,36 @@ describe("compaction install", () => {
 });
 
 describe("checkpoint-first compaction gate", () => {
+  test("a preparation remains useful when native keeps its coverage, without a summary append", async () => {
+    const h = await preparingHost(1000, { compactWaitSeconds: 0 });
+    const kept = transcript(turns.slice(2));
+    await h.compact(transcript(), "auto", [message("user", longText("native summary")), ...kept]);
+    expect(h.stoppedAgents.length).toBe(0);
+    await h.deliverLate();
+    await h.deliverLate();
+    expect(await h.status()).toContain("phase=ready");
+    const again = await h.compact([message("user", longText("native summary"), { handle: "cloned-summary" }), ...kept]);
+    expect(again.coreCalls).toBe(0);
+  });
+  test("one preparation deadline stops agents and prevents later verifier or fallback calls", async () => {
+    const h = await preparingHost(1_000, { prepareTimeoutSeconds: 2, compactWaitSeconds: 10 });
+    await h.advance(2_000);
+    expect(h.stoppedAgents).toEqual(["agent-1"]);
+    expect(h.spawns).toBe(1);
+    expect(await h.status()).toContain("preparation deadline reached");
+    await h.deliverLate();
+    expect(h.spawns).toBe(1);
+    expect(await h.status()).toContain("checkpoint=none");
+  });
+
+  test("a native fallback cancels obsolete preparation without waiting for its late answer", async () => {
+    const h = await preparingHost(1_000, { compactWaitSeconds: 1 });
+    expect((await h.compact(transcript())).coreCalls).toBe(1);
+    expect(h.stoppedAgents).toEqual(["agent-1"]);
+    expect([...h.files.keys()].some(path => path.endsWith("/cancel"))).toBe(true);
+    await h.deliverLate();
+    expect(h.spawns).toBe(1);
+  });
   /** Rows archived and preparation started, with agent answers held back. */
   async function preparingHost(delaySleeps: number, options: Record<string, number | string> = {}) {
     const h = host({ recentTurns: 1, ...options }, undefined, { agentReply: covering("a2"), agentDelaySleeps: delaySleeps });
@@ -898,7 +1033,7 @@ describe("checkpoint-first compaction gate", () => {
     const { result, coreCalls } = await h.compact(transcript());
     expect(coreCalls).toBe(0);
     expect(result.messages?.[0]?.text).toContain("Covers the session through entry a2");
-    expect(result.messages?.slice(1).map((entry) => entry.handle)).toEqual(["h-u3", "h-a3"]);
+    expect(result.messages?.slice(1).map((entry) => entry.handle)).toEqual(["u3", "a3"]);
     const status = await h.status();
     expect(status).toContain("lastCompact=trigger=auto shadow:");
     expect(status).toContain(":done");
@@ -917,7 +1052,7 @@ describe("checkpoint-first compaction gate", () => {
     await h.deliverLate();
     const status = await h.status();
     expect(status).toContain("checkpoint=none");
-    expect(status).toContain("stale:coverage a2 compacted away");
+    expect(status).toContain("stale:coverage a3 compacted away");
   });
 
   test("with nothing preparing, the compaction starts one just-in-time attempt", async () => {
@@ -996,6 +1131,21 @@ async function fill(h: ReturnType<typeof host>) {
 }
 
 describe("pi backend", () => {
+  test("Pi and Claude fallbacks share one deadline and retain per-call artifacts", async () => {
+    const failure: PiWorker = request => ({ nonce: request.nonce, ok: false, error: "invalid submission", usage: { totalTokens: 123, cost: 0 }, durationMs: 1500 });
+    const h = host({ ...PI_BOTH, recentTurns: 1, prepareTimeoutSeconds: 2 }, undefined, { piWorker: failure, piRunTimeMs: 1500, agentReply: covering("a2"), agentDelaySleeps: 1000 });
+    for (const [id, role, text] of turns) await h.append(id, role, text);
+    await h.measure(160_000);
+    expect(h.piRuns.length).toBe(1);
+    expect(h.spawns).toBe(1);
+    expect(h.piRuns[0]!.outputPath).toContain(h.piRuns[0]!.nonce);
+    expect(h.piRuns[0]!.cancelPath).toContain("/prepare-");
+    await h.advance(500);
+    expect(h.stoppedAgents).toEqual(["agent-1"]);
+    await h.deliverLate();
+    expect(h.spawns).toBe(1);
+    expect(await h.status()).toContain("preparation deadline reached");
+  });
   test("Pi stays off by default and Claude never starts a process", async () => {
     const config = resolveConfig({});
     expect(usesPi(config)).toBe(false);
@@ -1136,7 +1286,7 @@ describe("engine integration", () => {
     expect(result.text).toContain("verifier=claude:haiku");
     expect(result.text).toContain("lastFallback=none");
     expect(result.text).toContain("lastCompact=unseen");
-    expect(result.text).toContain("v0.4.5");
+    expect(result.text).toContain("v0.4.6");
   });
 
   test("compact with no checkpoint defers without inventing messages", async ($, on) => {

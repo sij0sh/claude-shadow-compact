@@ -1,6 +1,6 @@
 {
   "name": "shadow-compact",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "description": "Verified-checkpoint compaction for Claude Code: a private builder and independent verifier prepare an evidence-grounded checkpoint in the background, and Claude Code's own /compact or auto-compaction installs it through session.compact with the exact recent tail preserved by handle.",
   "author": {
     "name": "pi-shadow-compact port"
@@ -21,7 +21,7 @@
     "autoCompactWindowTokens": {
       "type": "number",
       "title": "Auto-compact window (tokens)",
-      "description": "Window Shadow sets for Claude Code auto-compaction. The engine compacts somewhat below it (~175k for 190k); keep it above the checkpoint threshold.",
+      "description": "Window Shadow sets for Claude Code auto-compaction. The engine reserves headroom below it (observed around 157\u2013162k for a 190k window); keep it above the checkpoint threshold.",
       "default": 190000
     },
     "configureIdleCompaction": {
@@ -161,6 +161,12 @@
         "shadow",
         "native"
       ]
+    },
+    "prepareTimeoutSeconds": {
+      "type": "number",
+      "title": "Preparation deadline (seconds)",
+      "description": "One deadline shared by builder, verifier, retries and backend fallbacks. Obsolete work is cancelled after native compaction. Positive integer, at most 600.",
+      "default": 360
     }
   }
 }

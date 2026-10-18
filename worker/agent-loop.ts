@@ -439,6 +439,11 @@ function submit(
   inspection: Inspection,
   args: Record<string, unknown>,
 ): Outcome {
+  // Some providers encode a nested object as JSON text. Decode that transport
+  // representation once; the exact same strict schema/citation checks follow.
+  if (typeof args.checkpoint === "string") {
+    args = { ...args, checkpoint: JSON.parse(args.checkpoint) as unknown };
+  }
   const archive = inspection.archive;
   if (role === "builder") {
     inspection.requireCompletion();
@@ -522,6 +527,7 @@ export async function runCheckpointAgent(run: AgentRun): Promise<AgentResult> {
     }
     usage.totalTokens += response.usage?.totalTokens ?? 0;
     usage.cost += response.usage?.cost?.total ?? 0;
+    if (run.signal.aborted) fail("deadline reached");
     if (response.stopReason === "error" || response.stopReason === "aborted" || response.stopReason === "length") {
       const detail = response.errorMessage ? `: ${sanitizeForContext(response.errorMessage, "").slice(0, 500)}` : "";
       fail(`stopped with ${response.stopReason}${detail}`);
@@ -552,7 +558,7 @@ export async function runCheckpointAgent(run: AgentRun): Promise<AgentResult> {
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           if (submitAttempts >= MAX_SUBMIT_ATTEMPTS) fail(`${submitName} rejected ${submitAttempts} times: ${message}`);
-          outcome = { done: false, text: `${submitName} rejected: ${message}`, isError: true };
+          outcome = { done: false, text: `${submitName} rejected: ${message}. Pass checkpoint as an object, not text. Every section is an array of {text, evidenceRefs} objects; verificationState adds status (verified or unverified). File paths belong in text. Keep the already-inspected evidence; correct the submission arguments.`, isError: true };
         }
       } else {
         try {
