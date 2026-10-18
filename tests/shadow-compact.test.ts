@@ -157,6 +157,28 @@ describe("working context", () => {
     expect(!isSkipped(all) && all.tailStart).toBe(6);
   });
 
+  test("a single long agentic turn compacts by assistant/tool rounds", async () => {
+    const agentic: SessionMessage[] = [message("user", `one prompt ${long}`)];
+    for (let i = 0; i < 6; i += 1) {
+      agentic.push(message("assistant", `step ${i} ${long}`, {
+        toolUses: [{ tool_use_id: `t${i}`, tool: "Read", input: {}, text: "read" }],
+      }));
+      agentic.push(message("user", "", { toolResults: [{ tool_use_id: `t${i}`, text: `body ${long}`, isError: false }] }));
+    }
+    agentic.push(message("assistant", "final"));
+    // Covered through the 4th tool result (index 8); keep 2 rounds.
+    const built = buildCandidate(agentic, 8, 2, "# Continuation Checkpoint");
+    expect(isSkipped(built)).toBe(false);
+    if (!isSkipped(built)) {
+      // Rounds start at 0, 1, 3, 5, 7, 9, 11, 13: the last two are 11 and 13.
+      expect(built.tailStart).toBe(9);
+      expect(hasOrphanedToolResult(built.messages!.slice(1))).toBe(false);
+    }
+    // Coverage mid-round (the call at 9, its result uncovered) keeps that round whole.
+    const mid = buildCandidate(agentic, 9, 1, "# Continuation Checkpoint");
+    expect(!isSkipped(mid) && mid.tailStart).toBe(9);
+  });
+
   test("stale coverage and no-savings candidates are refused", async () => {
     expect(isSkipped(buildCandidate(messages, 99, 2, "x"))).toBe(true);
     const tiny: SessionMessage[] = [message("user", "hi"), message("assistant", "hello")];
@@ -498,7 +520,11 @@ type PiWorker = (request: PiRunRequest) => PiRunResult | "crash";
 interface HostFakes {
   /** Answers private agent spawns through `turn.complete`; absent, spawns fail. */
   agentReply?: Reply;
+  /** Agent answers land only after this many host sleeps (a slow pipeline). */
+  agentDelaySleeps?: number;
   piWorker?: PiWorker;
+  /** Host `sleep` fails, as on a host without it or Node. */
+  noSleep?: boolean;
 }
 
 function host(options: Record<string, number | string> = {}, reply?: Reply, fakes: HostFakes = {}) {
@@ -511,6 +537,9 @@ function host(options: Record<string, number | string> = {}, reply?: Reply, fake
   let selfCompactions = 0;
   const files = new Map<string, string>();
   const piRuns: PiRunRequest[] = [];
+  let now = 0;
+  let sleeps = 0;
+  const delayed: Array<{ at: number; deliver: () => Promise<void> }> = [];
   const on = ((event: string, ...args: unknown[]) => {
     const head = args.length >= 2 ? (args[0] as { command?: string }) : undefined;
     const key = head && typeof head.command === "string" ? `${event}:${head.command}` : event;
@@ -530,6 +559,7 @@ function host(options: Record<string, number | string> = {}, reply?: Reply, fake
     clock: {
       after: (_delay: number, callback: () => void) => scheduled.push(callback),
       sleep: () => new Promise(() => undefined),
+      now: async () => now,
     },
     command: { run: async () => { throw new Error("Shadow must not run commands"); } },
     fs: {
@@ -541,10 +571,20 @@ function host(options: Record<string, number | string> = {}, reply?: Reply, fake
       },
     },
     process: {
-      run: async (argv: string[], init: { stdin: string }) => {
+      run: async (argv: string[], init: { stdin?: string }) => {
+        if (argv[0] === "sleep" || argv[1] === "-e") {
+          if (fakes.noSleep) throw new Error("ENOENT");
+          sleeps += 1;
+          now += Number(argv[1] ?? 1) * 1000 || 1000;
+          for (const due of delayed.filter((entry) => entry.at <= sleeps)) {
+            delayed.splice(delayed.indexOf(due), 1);
+            await due.deliver();
+          }
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
         if (!fakes.piWorker) throw new Error("Shadow must not start processes");
         expect(argv[1]).toBe("/plugin/dist/pi-checkpoint-worker.mjs");
-        const request = JSON.parse(init.stdin) as PiRunRequest;
+        const request = JSON.parse(init.stdin!) as PiRunRequest;
         piRuns.push(request);
         const result = fakes.piWorker(request);
         if (result === "crash") return { exitCode: 1, stdout: "", stderr: "node: bad bundle" };
@@ -558,10 +598,17 @@ function host(options: Record<string, number | string> = {}, reply?: Reply, fake
       const agentId = `agent-${spawns}`;
       const system = request.subagentType.endsWith("builder") ? BUILDER_SYSTEM_PROMPT : VERIFIER_SYSTEM_PROMPT;
       const answer = fakes.agentReply({ system, prompt: request.prompt });
+      const deliver = async () => {
+        await handlers.get("turn.complete")!($, { agentId, answer }, async () => ({}));
+      };
+      if (fakes.agentDelaySleeps !== undefined) {
+        delayed.push({ at: sleeps + fakes.agentDelaySleeps, deliver });
+        return { agentId };
+      }
       // The answer lands after Shadow has started waiting for it.
       void (async () => {
         for (let i = 0; i < 10; i += 1) await Promise.resolve();
-        await handlers.get("turn.complete")!($, { agentId, answer }, async () => ({}));
+        await deliver();
       })();
       return { agentId };
     } },
@@ -581,6 +628,12 @@ function host(options: Record<string, number | string> = {}, reply?: Reply, fake
     files,
     piRuns,
     get selfCompactions() { return selfCompactions; },
+    get sleeps() { return sleeps; },
+    /** Delivers every held agent answer, as a slow pipeline finishing late. */
+    deliverLate: async () => {
+      for (const due of delayed.splice(0)) await due.deliver();
+      await settle();
+    },
     setCanonical: (messages: SessionMessage[]) => { canonical = messages; },
     append: (uuid: string, role: "user" | "assistant", text: string, door = role === "user" ? "prompt" : "response") =>
       handlers.get("session.append")!(
@@ -605,14 +658,17 @@ function host(options: Record<string, number | string> = {}, reply?: Reply, fake
       messages: SessionMessage[],
       trigger = "auto",
       core: SessionMessage[] = [message("user", "native summary")],
+      signal?: AbortSignal,
     ) => {
       let coreCalls = 0;
-      const result = await handlers.get("session.compact")!(
-        $, { trigger, messages }, async () => {
+      const next = Object.assign(
+        async () => {
           coreCalls += 1;
           return { messages: core };
         },
+        signal ? { signal } : {},
       );
+      const result = await handlers.get("session.compact")!($, { trigger, messages }, next);
       return { result: result as { messages?: SessionMessage[]; skip?: string }, coreCalls };
     },
     flush: async () => {
@@ -826,6 +882,93 @@ describe("compaction install", () => {
   });
 });
 
+describe("checkpoint-first compaction gate", () => {
+  /** Rows archived and preparation started, with agent answers held back. */
+  async function preparingHost(delaySleeps: number, options: Record<string, number | string> = {}) {
+    const h = host({ recentTurns: 1, ...options }, undefined, { agentReply: covering("a2"), agentDelaySleeps: delaySleeps });
+    for (const [id, role, text] of turns) await h.append(id, role, text);
+    await h.measure(160_000);
+    expect(await h.status()).toContain("phase=preparing");
+    return h;
+  }
+
+  test("a compaction during preparation waits for the checkpoint and installs it without core", async () => {
+    // The builder answers after 3 host sleeps, the verifier 3 after that.
+    const h = await preparingHost(3);
+    const { result, coreCalls } = await h.compact(transcript());
+    expect(coreCalls).toBe(0);
+    expect(result.messages?.[0]?.text).toContain("Covers the session through entry a2");
+    expect(result.messages?.slice(1).map((entry) => entry.handle)).toEqual(["h-u3", "h-a3"]);
+    const status = await h.status();
+    expect(status).toContain("lastCompact=trigger=auto shadow:");
+    expect(status).toContain(":done");
+    expect(h.sleeps).toBeGreaterThan(0);
+  });
+
+  test("a preparation outliving the wait falls back to native once and never publishes stale", async () => {
+    const h = await preparingHost(1_000, { compactWaitSeconds: 5 });
+    const { coreCalls } = await h.compact(transcript());
+    expect(coreCalls).toBe(1);
+    expect(h.sleeps).toBe(5);
+    expect(await h.status()).toContain("native:no-checkpoint waited=5s:timeout");
+    // The slow pipeline finishes after native summarized a2 away.
+    await h.append("ns", "user", "native summary", "compaction");
+    await h.deliverLate();
+    await h.deliverLate();
+    const status = await h.status();
+    expect(status).toContain("checkpoint=none");
+    expect(status).toContain("stale:coverage a2 compacted away");
+  });
+
+  test("with nothing preparing, the compaction starts one just-in-time attempt", async () => {
+    const h = host({ recentTurns: 1 }, undefined, { agentReply: covering("a2"), agentDelaySleeps: 2 });
+    for (const [id, role, text] of turns) await h.append(id, role, text);
+    expect(h.spawns).toBe(0);
+    const { result, coreCalls } = await h.compact(transcript());
+    expect(coreCalls).toBe(0);
+    expect(h.spawns).toBe(2);
+    expect(result.messages?.[0]?.text).toContain("Covers the session through entry a2");
+  });
+
+  test("a failed preparation is not retried at compaction", async () => {
+    const h = host();
+    await h.append("u1", "user", "task");
+    await h.append("a1", "assistant", "answer");
+    await h.measure(160_000);
+    expect(h.spawns).toBe(1);
+    const { coreCalls } = await h.compact(transcript(turns.slice(0, 2)));
+    expect(coreCalls).toBe(1);
+    expect(h.spawns).toBe(1);
+    expect(h.sleeps).toBe(0);
+  });
+
+  test("compactWaitSeconds 0 keeps the immediate native fallback", async () => {
+    const h = await preparingHost(3, { compactWaitSeconds: 0 });
+    const { coreCalls } = await h.compact(transcript());
+    expect(coreCalls).toBe(1);
+    expect(h.sleeps).toBe(0);
+    expect(await h.status()).toMatch(/native:no-checkpoint$/);
+  });
+
+  test("a host that cannot sleep stops waiting instead of spinning", async () => {
+    const h = host({ recentTurns: 1 }, undefined, { agentReply: covering("a2"), agentDelaySleeps: 3, noSleep: true });
+    for (const [id, role, text] of turns) await h.append(id, role, text);
+    await h.measure(160_000);
+    const { coreCalls } = await h.compact(transcript());
+    expect(coreCalls).toBe(1);
+    expect(await h.status()).toContain(":no-pause");
+  });
+
+  test("an interrupted held compaction leaves the conversation as it is", async () => {
+    const h = await preparingHost(1_000);
+    const controller = new AbortController();
+    controller.abort();
+    const { result, coreCalls } = await h.compact(transcript(), "auto", undefined, controller.signal);
+    expect(coreCalls).toBe(0);
+    expect(result.skip).toContain("interrupted");
+  });
+});
+
 const PI_BOTH = {
   builderBackend: "pi",
   verifierBackend: "pi",
@@ -945,7 +1088,9 @@ describe("pi backend", () => {
     // The second preparation skips Pi entirely.
     expect(h.piRuns.length).toBe(1);
     expect(await h.status()).toContain("lastFallback=pi-unavailable:");
-    expect(await h.status()).toContain("checkpoint=shadow-");
+    // Native compaction removed a2, so a checkpoint covering it is born stale.
+    expect(await h.status()).toContain("stale:coverage a2 compacted away");
+    expect(await h.status()).toContain("checkpoint=none");
   });
 
   test("mixed mode runs the Pi builder with the Claude agent verifier", async () => {
@@ -991,7 +1136,7 @@ describe("engine integration", () => {
     expect(result.text).toContain("verifier=claude:haiku");
     expect(result.text).toContain("lastFallback=none");
     expect(result.text).toContain("lastCompact=unseen");
-    expect(result.text).toContain("v0.4.4");
+    expect(result.text).toContain("v0.4.5");
   });
 
   test("compact with no checkpoint defers without inventing messages", async ($, on) => {

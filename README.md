@@ -108,11 +108,27 @@ no/unproven checkpoint ──► next(e): Claude native compaction (fail closed)
   replacement. Claude Code's `/compact` and auto-compaction are the
   install points. The `session.compact` hook proves coverage by
   identity: the checkpoint's coverage row uuid must sit in the live
-  transcript index, never a saved position. The tail starts at the turn
+  transcript index, never a saved position. The tail starts at the round
   holding the first uncovered message, keeping at least `recentTurns`
-  turns, no tool result is orphaned from its call, and the candidate
-  must actually shrink the context. Any failure defers to native
-  compaction unchanged; `precompute` compactions are skipped.
+  rounds (a round is a prompt with its reply, or one assistant response
+  with its tool results, so a long single-prompt agentic turn can still
+  compact); no tool result is orphaned from its call, and the candidate
+  must actually shrink the context. `precompute` compactions are skipped.
+- **Checkpoint-first gate.** A checkpoint that is still preparing is not
+  a failed one. When Claude Code compacts before the checkpoint is ready,
+  Shadow holds that compaction for up to `compactWaitSeconds` (120 by
+  default) while the in-flight preparation finishes, then installs it;
+  when nothing is preparing it starts one just-in-time attempt and waits
+  on that. The wait runs as a chain of one-second host `sleep` processes
+  (or Node, where `sleep` is missing), because a hook's 10-second budget
+  pauses during host calls but not during `$.clock` waits. Native
+  compaction runs only when the wait times out, the preparation fails,
+  coverage still cannot be proven, or a failed preparation has not been
+  re-armed (failures are never retried at compaction). A preparation that
+  finishes after a compaction removed its covered row is discarded
+  instead of published. `lastCompact` records the wait, e.g.
+  `waited=48s:done`. Set `compactWaitSeconds` to `0` for the old
+  immediate native fallback.
 - **Install confirmation.** Returning the checkpoint is an attempt, not
   an install. It counts once canonical history (`$.session.messages()`)
   opens with that checkpoint's coverage line; `/shadow-status` shows
@@ -178,7 +194,8 @@ Set via the plugin's `userConfig` (Claude Code `/config` or
 | `autoCompactWindowTokens` | `190000` | The window Shadow sets; must exceed `prepareThresholdTokens` and be below the model's context window |
 | `configureIdleCompaction` | `true` | Lower Claude Code's idle-compaction floor and prepare at a completed turn above it |
 | `idleCompactMinTokens` | `100000` | Idle-compaction floor; values under 100,000 use 100,000 |
-| `recentTurns` | `10` | Minimum recent turns kept verbatim |
+| `recentTurns` | `10` | Minimum recent rounds kept verbatim (prompt + reply, or assistant response + its tool results) |
+| `compactWaitSeconds` | `120` | How long a compaction waits for a preparing checkpoint before native fallback; `0` never waits, at most `600` |
 | `builderModel` / `verifierModel` | `haiku` | Checkpoint agent models; `inherit` uses the session model |
 | `manualCompactMode` | `shadow` | `shadow` or `native` for manual `/compact` |
 | `builderBackend` / `verifierBackend` | `claude` | `claude` or `pi` per role (see [Optional Pi backend](#optional-pi-backend)) |
@@ -248,7 +265,7 @@ claude plugin marketplace update claude-shadow-compact
 claude plugin update shadow-compact@claude-shadow-compact
 ```
 
-`/shadow-status` shows the running version (`v0.4.4`).
+`/shadow-status` shows the running version (`v0.4.5`).
 
 ## Deferred from the Pi version
 

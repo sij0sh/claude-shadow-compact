@@ -5,8 +5,10 @@
  * - `session.measure` starts background preparation at the prepare threshold
  * - private builder/verifier agents (hidden via `agent.offer`) produce a
  *   verified checkpoint; strict-JSON answers are validated in `prepare.ts`
- * - `session.compact` installs checkpoint + exact handle tail, or defers
- *   to native compaction (`next(e)`) whenever coverage cannot be proven
+ * - `session.compact` installs checkpoint + exact handle tail; when the
+ *   checkpoint is still preparing (or none was started) it holds the
+ *   compaction for a bounded wait, and defers to native compaction
+ *   (`next(e)`) only when coverage still cannot be proven after it
  * - `/shadow-compact`, `/compact-native`, `/shadow-status` commands
  *
  * Shadow never starts a compaction itself: `$.session.compact()` runs
@@ -72,8 +74,13 @@ const BUILDER_TYPE = "shadow-compact:checkpoint-builder";
 const VERIFIER_TYPE = "shadow-compact:checkpoint-verifier";
 const AGENT_TIMEOUT_MS = 600_000;
 
+/** How often a held compaction checks on its preparation. */
+const COMPACT_POLL_SECONDS = 1;
+/** A held compaction stops waiting while this much hook budget is left. */
+const COMPACT_BUDGET_RESERVE_MS = 2_000;
+
 /** Running plugin version shown in status; bump with the manifest. */
-const PLUGIN_VERSION = "0.4.4";
+const PLUGIN_VERSION = "0.4.5";
 
 /** Inline evidence cap for the model.complete fallback. */
 const INLINE_EVIDENCE_CHARS = 120_000;
@@ -116,6 +123,8 @@ interface Runtime {
   piStats: PiStats;
   /** Last preparation's backend and duration for status. */
   lastPrepare: string | null;
+  /** Which host command pauses a held compaction; -1 when none works. */
+  pauseCommand: number | null;
 }
 
 function createRuntime(config: ShadowConfig): Runtime {
@@ -139,6 +148,7 @@ function createRuntime(config: ShadowConfig): Runtime {
     piStatus: usesPi(config) ? "unchecked" : "off",
     piStats: emptyPiStats(),
     lastPrepare: null,
+    pauseCommand: null,
   };
 }
 
@@ -392,7 +402,15 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
       rendered: prepared.rendered,
       coverageEndEntryId: prepared.coverageEndEntryId,
     };
-    if (rt.state.publish(generation, checkpoint)) {
+    // A compaction that ran meanwhile may have removed the covered row:
+    // such a checkpoint could never install, so it is never published.
+    if (!rt.messageRowIds.includes(checkpoint.coverageEndEntryId)) {
+      if (rt.state.discardStale(generation)) {
+        notes.push(`stale:coverage ${checkpoint.coverageEndEntryId} compacted away`);
+        rt.lastFallback = notes.join(" then ");
+        $.ui.log(`shadow-compact: discarded a checkpoint born stale (covers ${checkpoint.coverageEndEntryId})`, { to: "debug" });
+      }
+    } else if (rt.state.publish(generation, checkpoint)) {
       rows.setPreviousCheckpoint(checkpoint.rendered, checkpoint.coverageEndEntryId);
       $.ui.log(
         `shadow-compact: verified checkpoint ready (covers ${prepared.coverageEndEntryId}); it installs at the next /compact or auto-compaction`,
@@ -405,6 +423,86 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
     rt.lastPrepare = `failed ${Math.round(performance.now() - started)}ms`;
     $.ui.log(`shadow-compact: preparation failed (${oneLine(error)})`, { to: "debug" });
   }
+}
+
+type InstallPlan =
+  | { messages: SessionMessage[]; tailStart: number; checkpointId: string }
+  | { reason: string };
+
+/**
+ * Plans installing the serving checkpoint over the live compaction's
+ * transcript. Coverage is proven only by the covered row's uuid in the
+ * live index; a checkpoint whose row is gone is discarded.
+ */
+function planInstall(rt: Runtime, messages: readonly SessionMessage[]): InstallPlan {
+  const published = rt.state.published;
+  if (!published) return { reason: "no-checkpoint" };
+  if (rt.messageRowIds.length !== messages.length) return { reason: "index-misaligned" };
+  const coveredIndex = rt.messageRowIds.indexOf(published.coverageEndEntryId);
+  if (coveredIndex < 0) {
+    rt.state.discardPublished();
+    return { reason: "coverage-unproven" };
+  }
+  const built = buildCandidate(messages, coveredIndex, rt.config.recentTurns, published.rendered);
+  if (isSkipped(built) || !built.messages) {
+    return { reason: isSkipped(built) ? built.skipped : "no-candidate" };
+  }
+  return { messages: built.messages, tailStart: built.tailStart, checkpointId: published.checkpointId };
+}
+
+/** Host commands that sleep one poll; the first that works is kept. */
+function pauseCommands(rt: Runtime): string[][] {
+  return [
+    ["sleep", String(COMPACT_POLL_SECONDS)],
+    [rt.config.piNodePath, "-e", `setTimeout(() => {}, ${COMPACT_POLL_SECONDS * 1000})`],
+  ];
+}
+
+/**
+ * Pauses one poll through a host process. A hook's 10 s budget stops
+ * while its `$` calls are in flight, except `$.clock` waits, and awaiting
+ * the preparation Promise itself would count too: a chain of short host
+ * sleeps is the wait that costs the compact hook nothing. Resolves false
+ * when the host cannot sleep, so the caller stops instead of spinning.
+ */
+async function hostPause($: EngineInterface, rt: Runtime): Promise<boolean> {
+  const commands = pauseCommands(rt);
+  const order = rt.pauseCommand === null ? commands.map((_, index) => index) : [rt.pauseCommand];
+  for (const index of order) {
+    if (index < 0) return false;
+    const run = await $.process
+      .run(commands[index]!, { timeoutMs: COMPACT_POLL_SECONDS * 1000 + 10_000 })
+      .catch(() => undefined);
+    if (run?.exitCode === 0) {
+      rt.pauseCommand = index;
+      return true;
+    }
+  }
+  rt.pauseCommand = -1;
+  return false;
+}
+
+type WaitOutcome = "done" | "timeout" | "interrupted" | "budget" | "no-pause";
+
+/**
+ * Holds a live compaction while a preparation runs, up to the configured
+ * wait. Preparation keeps running in its own dispatches (agent answers
+ * arrive through `turn.complete`, Pi through its own process); this only
+ * watches for it to settle.
+ */
+async function waitForPreparation(
+  $: EngineInterface,
+  rt: Runtime,
+  next: { signal?: AbortSignal; budget?: { remainingMs: number } },
+): Promise<WaitOutcome> {
+  const deadline = (await $.clock.now()) + rt.config.compactWaitSeconds * 1000;
+  while (rt.state.preparing) {
+    if (next.signal?.aborted) return "interrupted";
+    if (next.budget && next.budget.remainingMs < COMPACT_BUDGET_RESERVE_MS) return "budget";
+    if ((await $.clock.now()) >= deadline) return "timeout";
+    if (!(await hostPause($, rt))) return "no-pause";
+  }
+  return "done";
 }
 
 /**
@@ -500,7 +598,8 @@ function statusText(rt: Runtime): string {
       ? `checkpoint=${published.checkpointId} coverage=${published.coverageEndEntryId}`
       : "checkpoint=none",
     `installs=${rt.state.installCount}`,
-    `prepare=${rt.config.prepareThresholdTokens} tokens recentTurns=${rt.config.recentTurns}`,
+    `prepare=${rt.config.prepareThresholdTokens} tokens recentRounds=${rt.config.recentTurns}`,
+    `compactWait=${rt.config.compactWaitSeconds}s`,
     `autoCompactWindow=${rt.autoCompactWindow ?? "unseen"}`,
     `idleCompact=${rt.idleCompact ?? "unseen"}`,
     `builder=${describeRole(rt.config, "builder")}`,
@@ -647,31 +746,40 @@ export const register: Register = (on, options) => {
       rt.state.rejectInstall();
       rt.lastFallback = "install-unconfirmed";
     }
+    let waited = "";
+    let firstReason: string | undefined;
     const native = (reason: string) => {
-      rt.lastCompact = `trigger=${e.trigger} native:${reason}`;
+      const why = firstReason && firstReason !== reason ? `${firstReason}${waited} then:${reason}` : `${reason}${waited}`;
+      rt.lastCompact = `trigger=${e.trigger} native:${why}`;
       $.ui.log(`shadow-compact: ${rt.lastCompact}`, { to: "debug" });
       return compactNatively(rt, e.messages, () => next(e));
     };
     if (rt.config.manualCompactMode === "native" && e.trigger === "manual") return native("manual-mode");
-    const published = rt.state.published;
-    if (!published) return native("no-checkpoint");
-    if (rt.messageRowIds.length !== e.messages.length) return native("index-misaligned");
-    // Coverage is proven only by the covered row's uuid in the live index.
-    const coveredIndex = rt.messageRowIds.indexOf(published.coverageEndEntryId);
-    if (coveredIndex < 0) {
-      rt.state.discardPublished();
-      return native("coverage-unproven");
+    let plan = planInstall(rt, e.messages);
+    // Checkpoint-first: a checkpoint still preparing is not a failed one.
+    // Hold this compaction for it (or for one just-in-time attempt when
+    // none is running) instead of letting native win the race.
+    if ("reason" in plan && plan.reason !== "index-misaligned" && rt.config.compactWaitSeconds > 0) {
+      firstReason = plan.reason;
+      if (!rt.state.preparing) void runPreparation($, rt, false);
+      if (rt.state.preparing) {
+        const started = await $.clock.now();
+        const outcome = await waitForPreparation($, rt, next);
+        waited = ` waited=${Math.round(((await $.clock.now()) - started) / 1000)}s:${outcome}`;
+        if (outcome === "interrupted") {
+          rt.lastCompact = `trigger=${e.trigger} interrupted${waited}`;
+          return { skip: "Shadow Compact: compaction interrupted while its checkpoint prepared" };
+        }
+        plan = planInstall(rt, e.messages);
+      }
     }
-    const built = buildCandidate(e.messages, coveredIndex, rt.config.recentTurns, published.rendered);
-    if (isSkipped(built) || !built.messages) {
-      return native(isSkipped(built) ? built.skipped : "no-candidate");
-    }
+    if ("reason" in plan) return native(plan.reason);
     rt.state.attemptInstall();
     rt.awaitingCompactionRow = true;
-    rt.messageRowIds = [SUMMARY_PLACEHOLDER, ...rt.messageRowIds.slice(built.tailStart)];
-    rt.lastCompact = `trigger=${e.trigger} shadow:${published.checkpointId} tailStart=${built.tailStart}`;
+    rt.messageRowIds = [SUMMARY_PLACEHOLDER, ...rt.messageRowIds.slice(plan.tailStart)];
+    rt.lastCompact = `trigger=${e.trigger} shadow:${plan.checkpointId} tailStart=${plan.tailStart}${waited}`;
     $.ui.log(`shadow-compact: ${rt.lastCompact}`, { to: "debug" });
-    return { messages: built.messages };
+    return { messages: plan.messages };
   });
 
   on("command.run", { command: "shadow-status" }, async ($, _e, _next) => {
@@ -733,6 +841,7 @@ export const register: Register = (on, options) => {
     rt.piStatus = usesPi(rt.config) ? "unchecked" : "off";
     rt.piStats = emptyPiStats();
     rt.lastPrepare = null;
+    rt.pauseCommand = null;
     return result;
   });
 };

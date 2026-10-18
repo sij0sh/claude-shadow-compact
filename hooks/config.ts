@@ -22,6 +22,13 @@ export const DEFAULT_AUTO_COMPACT_WINDOW_TOKENS = 190_000;
 export const DEFAULT_IDLE_COMPACT_MIN_TOKENS = 100_000;
 export const MIN_IDLE_COMPACT_MIN_TOKENS = 100_000;
 export const DEFAULT_RECENT_TURNS = 10;
+/**
+ * How long a live compaction waits for an in-flight (or just-started)
+ * preparation before Claude Code's native summarizer runs. 0 never waits.
+ */
+export const DEFAULT_COMPACT_WAIT_SECONDS = 120;
+/** `$.process.run` refuses longer children; the wait is a chain of them. */
+export const MAX_COMPACT_WAIT_SECONDS = 600;
 /** Default checkpoint-agent model: cheap and fast, never the session model. */
 export const DEFAULT_MODEL = "haiku";
 
@@ -39,7 +46,9 @@ export interface ShadowConfig {
   configureAutoCompactWindow: boolean;
   idleCompactMinTokens: number;
   configureIdleCompaction: boolean;
+  /** Recent assistant/tool rounds kept verbatim (option key kept from turns). */
   recentTurns: number;
+  compactWaitSeconds: number;
   builderModel: string;
   verifierModel: string;
   manualCompactMode: ManualCompactMode;
@@ -56,6 +65,13 @@ function positiveInt(value: unknown, fallback: number): number {
   if (typeof value !== "number" && typeof value !== "string") return fallback;
   const parsed = typeof value === "number" ? value : Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < 1) return fallback;
+  return parsed;
+}
+
+function nonNegativeInt(value: unknown, fallback: number): number {
+  if (typeof value !== "number" && typeof value !== "string") return fallback;
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) return fallback;
   return parsed;
 }
 
@@ -92,6 +108,10 @@ export function resolveConfig(options: PluginOptions): ShadowConfig {
     ),
     configureIdleCompaction: options.configureIdleCompaction !== false,
     recentTurns: positiveInt(options.recentTurns, DEFAULT_RECENT_TURNS),
+    compactWaitSeconds: Math.min(
+      MAX_COMPACT_WAIT_SECONDS,
+      nonNegativeInt(options.compactWaitSeconds, DEFAULT_COMPACT_WAIT_SECONDS),
+    ),
     builderModel: model(options.builderModel),
     verifierModel: model(options.verifierModel),
     manualCompactMode: options.manualCompactMode === "native" ? "native" : "shadow",

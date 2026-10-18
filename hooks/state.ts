@@ -69,6 +69,18 @@ export class ShadowState {
     return true;
   }
 
+  /**
+   * A completion whose coverage a compaction already removed from the
+   * transcript: never published, and the refresh gate re-arms so the
+   * next measure prepares against the history that is actually live.
+   */
+  discardStale(generation: number): boolean {
+    if (this.#preparing !== generation) return false;
+    this.#preparing = undefined;
+    this.#refreshArmed = true;
+    return true;
+  }
+
   /** A failed preparation stays failed until the next compaction re-arms. */
   fail(generation: number): boolean {
     if (this.#preparing !== generation) return false;

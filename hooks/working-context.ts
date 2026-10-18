@@ -24,14 +24,27 @@ export function isSkipped(result: TailResult): result is { skipped: TailSkipReas
   return "skipped" in result;
 }
 
-/** A turn starts at a user message that is not a tool-result carrier. */
-export function isTurnStart(message: SessionMessage): boolean {
-  return message.role === "user" && !(message.toolResults && message.toolResults.length > 0);
+function isToolResultCarrier(message: SessionMessage): boolean {
+  return message.role === "user" && (message.toolResults?.length ?? 0) > 0;
 }
 
 /**
- * Plans the tail: it starts at the turn containing the first uncovered
- * message, moved earlier when needed to keep `recentTurns` whole turns,
+ * A round starts at a person's prompt, or at the assistant response that
+ * follows tool results. A round is a prompt with its reply, or one
+ * assistant response with the tool results it asked for, so a single
+ * long agentic turn still has many places the tail can start.
+ */
+export function isRoundStart(messages: readonly SessionMessage[], index: number): boolean {
+  const message = messages[index];
+  if (!message) return false;
+  if (message.role === "user") return !isToolResultCarrier(message);
+  const previous = messages[index - 1];
+  return message.role === "assistant" && previous !== undefined && isToolResultCarrier(previous);
+}
+
+/**
+ * Plans the tail: it starts at the round containing the first uncovered
+ * message, moved earlier when needed to keep `recentRounds` whole rounds,
  * so every dropped message is covered by the checkpoint.
  * `coveredIndex` is the transcript index of the last covered message
  * (-1 when the checkpoint covers nothing yet). Returns a skip when the
@@ -40,25 +53,25 @@ export function isTurnStart(message: SessionMessage): boolean {
 export function planTail(
   messages: readonly SessionMessage[],
   coveredIndex: number,
-  recentTurns: number,
+  recentRounds: number,
 ): TailResult {
   if (messages.length === 0) return { skipped: "empty-tail" };
   if (coveredIndex < -1 || coveredIndex >= messages.length) return { skipped: "stale-coverage" };
 
-  const turnStarts: number[] = [];
-  messages.forEach((message, index) => {
-    if (isTurnStart(message)) turnStarts.push(index);
+  const roundStarts: number[] = [];
+  messages.forEach((_message, index) => {
+    if (isRoundStart(messages, index)) roundStarts.push(index);
   });
-  if (turnStarts.length === 0) turnStarts.push(0);
+  if (roundStarts[0] !== 0) roundStarts.unshift(0);
 
-  // Start of the turn holding the first uncovered message (the last turn
-  // when everything is covered); 0 when it precedes every turn start.
+  // Start of the round holding the first uncovered message (the last
+  // round when everything is covered).
   const firstUncovered = Math.min(coveredIndex + 1, messages.length - 1);
   let tailStart = 0;
-  for (const start of turnStarts) if (start <= firstUncovered) tailStart = start;
-  // Recent-turns minimum: keep at least `recentTurns` whole turns.
-  const keep = Math.max(1, Math.floor(recentTurns));
-  const recentStart = turnStarts[Math.max(0, turnStarts.length - keep)]!;
+  for (const start of roundStarts) if (start <= firstUncovered) tailStart = start;
+  // Recent-rounds minimum: keep at least `recentRounds` whole rounds.
+  const keep = Math.max(1, Math.floor(recentRounds));
+  const recentStart = roundStarts[Math.max(0, roundStarts.length - keep)]!;
   if (recentStart < tailStart) tailStart = recentStart;
 
   if (tailStart <= 0) return { skipped: "no-drop" };
@@ -101,10 +114,10 @@ export function estimateMessagesTokens(messages: readonly SessionMessage[]): num
 export function buildCandidate(
   messages: readonly SessionMessage[],
   coveredIndex: number,
-  recentTurns: number,
+  recentRounds: number,
   renderedCheckpoint: string,
 ): TailResult & { messages?: SessionMessage[] } {
-  const plan = planTail(messages, coveredIndex, recentTurns);
+  const plan = planTail(messages, coveredIndex, recentRounds);
   if (isSkipped(plan)) return plan;
   const candidate: SessionMessage[] = [
     { role: "user", text: renderedCheckpoint, toolUses: [] },
