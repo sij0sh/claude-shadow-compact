@@ -127,7 +127,20 @@ no/unproven checkpoint ──► next(e): Claude native compaction (fail closed)
   settings `autoCompactWindow` (including `auto`), or managed settings.
   It decides once per model and remembers that, so a later
   `/autocompact` of yours is never overwritten; `/shadow-status` shows
-  the outcome as `autoCompactWindow=`. A failed preparation is not retried
+  the outcome as `autoCompactWindow=`.
+- **Idle compaction.** Claude Code (2.1.290+) compacts a long conversation
+  that has sat idle for about 54 minutes, just before its one-hour prompt
+  cache expires, as an ordinary `auto` compaction that Shadow intercepts.
+  Its floor is 200,000 tokens; Shadow lowers it to 100,000 (the lowest
+  Claude Code accepts) by setting `CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS` for
+  the session, unless you already set that variable or turned idle
+  compaction off with `"idleCompaction": false`. When a turn completes
+  between that floor and the checkpoint threshold, Shadow prepares a
+  checkpoint so it is ready before the idle compaction fires; reaching the
+  checkpoint threshold later refreshes it once. Idle compaction itself is
+  rolled out by Claude Code and needs an interactive session with the
+  one-hour cache; `/shadow-status` shows the floor outcome as
+  `idleCompact=`. A failed preparation is not retried
   until the next compaction or a manual `/shadow-compact`. Rolling refresh
   re-arms after a Shadow install followed by below-checkpoint context, or
   after native compaction.
@@ -150,7 +163,7 @@ Or, from a local checkout, load it for one session with
 |---|---|
 | `/shadow-compact` | Start background preparation now (honest when history is too short); run `/compact` to install a ready checkpoint |
 | `/compact-native` | Run Claude Code native compaction once, bypassing Shadow |
-| `/shadow-status` | Version, phase, archive size, checkpoint coverage, installs, threshold, auto-compact window outcome, last fallback, last compaction decision |
+| `/shadow-status` | Version, phase, archive size, checkpoint coverage, installs, threshold, auto-compact window and idle-compaction outcomes, last fallback, last compaction decision |
 | `/shadow-export` | Print the verified checkpoint for manual copy-paste |
 
 ## Configuration
@@ -163,6 +176,8 @@ Set via the plugin's `userConfig` (Claude Code `/config` or
 | `prepareThresholdTokens` | `150000` | Start background checkpoint preparation |
 | `configureAutoCompactWindow` | `true` | Set Claude Code's auto-compact window once per model unless one is already chosen |
 | `autoCompactWindowTokens` | `190000` | The window Shadow sets; must exceed `prepareThresholdTokens` and be below the model's context window |
+| `configureIdleCompaction` | `true` | Lower Claude Code's idle-compaction floor and prepare at a completed turn above it |
+| `idleCompactMinTokens` | `100000` | Idle-compaction floor; values under 100,000 use 100,000 |
 | `recentTurns` | `10` | Minimum recent turns kept verbatim |
 | `builderModel` / `verifierModel` | `haiku` | Checkpoint agent models; `inherit` uses the session model |
 | `manualCompactMode` | `shadow` | `shadow` or `native` for manual `/compact` |
@@ -187,7 +202,7 @@ claude plugin marketplace update claude-shadow-compact
 claude plugin update shadow-compact@claude-shadow-compact
 ```
 
-`/shadow-status` shows the running version (`v0.4.1`).
+`/shadow-status` shows the running version (`v0.4.2`).
 
 ## Deferred from the Pi version
 

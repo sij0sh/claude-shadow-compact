@@ -5,7 +5,7 @@ import {
   validateCheckpointObject,
   type Checkpoint,
 } from "../hooks/checkpoint.js";
-import { decideAutoCompactWindow, describeModel, isAtOrAbove, resolveConfig, type WindowFacts } from "../hooks/config.js";
+import { decideAutoCompactWindow, decideIdleCompaction, describeModel, isAtOrAbove, resolveConfig, type WindowFacts } from "../hooks/config.js";
 import { EvidenceArchive } from "../hooks/evidence.js";
 import { redactSecretValue, sanitizeForContext } from "../hooks/normalize.js";
 import { prepareCheckpoint } from "../hooks/prepare.js";
@@ -339,6 +339,30 @@ describe("config", () => {
     expect(resolveConfig({ configureAutoCompactWindow: false }).configureAutoCompactWindow).toBe(false);
     expect(resolveConfig({ autoCompactWindowTokens: -5 }).autoCompactWindowTokens).toBe(190_000);
   });
+
+  test("idle-compaction floor defaults to 100k, on, and never goes below 100k", async () => {
+    const config = resolveConfig({});
+    expect(config.idleCompactMinTokens).toBe(100_000);
+    expect(config.configureIdleCompaction).toBe(true);
+    expect(resolveConfig({ idleCompactMinTokens: 50_000 }).idleCompactMinTokens).toBe(100_000);
+    expect(resolveConfig({ idleCompactMinTokens: 120_000 }).idleCompactMinTokens).toBe(120_000);
+    expect(resolveConfig({ configureIdleCompaction: false }).configureIdleCompaction).toBe(false);
+  });
+});
+
+describe("idle-compaction floor decision", () => {
+  const config = resolveConfig({});
+
+  test("applies when nothing chose a floor", async () => {
+    expect(decideIdleCompaction(config, { envValue: undefined, settings: {} })).toEqual({ apply: true });
+  });
+
+  test("keeps a person's floor, respects idleCompaction false and the toggle", async () => {
+    expect(decideIdleCompaction(config, { envValue: "150000", settings: {} })).toEqual({ apply: false, reason: "kept-env 150000" });
+    expect(decideIdleCompaction(config, { envValue: undefined, settings: { idleCompaction: false } })).toEqual({ apply: false, reason: "off-settings" });
+    const off = resolveConfig({ configureIdleCompaction: false });
+    expect(decideIdleCompaction(off, { envValue: undefined, settings: {} })).toEqual({ apply: false, reason: "disabled" });
+  });
 });
 
 describe("auto-compact window decision", () => {
@@ -378,7 +402,7 @@ describe("auto-compact window decision", () => {
 });
 
 describe("auto-compact window setup", () => {
-  function startHost(options: Record<string, number | string | boolean>, initial: { source: string; raw: number }, settings = {}) {
+  function startHost(options: Record<string, number | string | boolean>, initial: { source: string; raw: number }, settings = {}, env: Record<string, string> = {}) {
     const store = new Map<string, unknown>();
     const runs: Array<{ command: string; args: string }> = [];
     let effective = { ...initial };
@@ -409,6 +433,13 @@ describe("auto-compact window setup", () => {
         },
       },
       settings: { read: async () => settings },
+      env: {
+        get: async (name: string) => env[name],
+        set: async (name: string, value: string | undefined) => {
+          if (value === undefined) delete env[name];
+          else env[name] = value;
+        },
+      },
       store: { get: async (key: string) => store.get(key), set: async (key: string, value: unknown) => { store.set(key, value); } },
       fs: { write: async () => undefined },
       ui: { log: () => undefined },
@@ -417,6 +448,7 @@ describe("auto-compact window setup", () => {
     return {
       runs,
       store,
+      env,
       start: () => handlers.get("session.start")!($, { cwd: "/repo" }, async (e: { cwd: string }) => ({ cwd: e.cwd })),
     };
   }
@@ -442,6 +474,15 @@ describe("auto-compact window setup", () => {
     await h.start();
     expect(h.runs.length).toBe(0);
     expect(h.store.size).toBe(0);
+  });
+
+  test("lowers the idle-compaction floor unless the person set one", async () => {
+    const h = startHost({}, { source: "model-default", raw: 1_000_000 });
+    await h.start();
+    expect(h.env.CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS).toBe("100000");
+    const kept = startHost({}, { source: "model-default", raw: 1_000_000 }, {}, { CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS: "180000" });
+    await kept.start();
+    expect(kept.env.CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS).toBe("180000");
   });
 });
 
@@ -583,6 +624,35 @@ describe("token threshold", () => {
     expect(h.selfCompactions).toBe(0);
     const reply = await h.runCommand("shadow-compact");
     expect(reply.text).toContain("run /compact to install");
+  });
+
+  test("a completed turn above the idle floor prepares for idle compaction, refreshed once at the threshold", async () => {
+    const h = host();
+    await h.append("u1", "user", "task");
+    await h.append("a1", "assistant", "answer");
+    await h.measure(99_999);
+    await h.complete();
+    expect(h.spawns).toBe(0);
+    await h.measure(120_000);
+    expect(h.spawns).toBe(0);
+    await h.complete();
+    expect(h.spawns).toBe(1);
+    await h.flush();
+    await h.complete();
+    expect(h.spawns).toBe(1);
+    await h.measure(150_000);
+    expect(h.spawns).toBe(2);
+    await h.measure(160_000);
+    expect(h.spawns).toBe(2);
+  });
+
+  test("idle preparation stays off when the toggle is off", async () => {
+    const h = host({ configureIdleCompaction: false } as unknown as Record<string, number | string>);
+    await h.append("u1", "user", "task");
+    await h.append("a1", "assistant", "answer");
+    await h.measure(120_000);
+    await h.complete();
+    expect(h.spawns).toBe(0);
   });
 
   test("a failed preparation is not retried while context stays high", async () => {
@@ -731,7 +801,7 @@ describe("engine integration", () => {
     expect(result.text).toContain("verifier=claude:haiku");
     expect(result.text).toContain("lastFallback=none");
     expect(result.text).toContain("lastCompact=unseen");
-    expect(result.text).toContain("v0.4.1");
+    expect(result.text).toContain("v0.4.2");
   });
 
   test("compact with no checkpoint defers without inventing messages", async ($, on) => {

@@ -13,6 +13,13 @@ export const DEFAULT_PREPARE_THRESHOLD_TOKENS = 150_000;
  * the gap above the prepare threshold is checkpoint-preparation time.
  */
 export const DEFAULT_AUTO_COMPACT_WINDOW_TOKENS = 190_000;
+/**
+ * Context floor Shadow gives Claude Code's idle compaction (which fires
+ * shortly before the one-hour prompt cache expires). Claude Code's own
+ * default is 200k and it refuses anything under 100k.
+ */
+export const DEFAULT_IDLE_COMPACT_MIN_TOKENS = 100_000;
+export const MIN_IDLE_COMPACT_MIN_TOKENS = 100_000;
 export const DEFAULT_RECENT_TURNS = 10;
 /** Default checkpoint-agent model: cheap and fast, never the session model. */
 export const DEFAULT_MODEL = "haiku";
@@ -23,6 +30,8 @@ export interface ShadowConfig {
   prepareThresholdTokens: number;
   autoCompactWindowTokens: number;
   configureAutoCompactWindow: boolean;
+  idleCompactMinTokens: number;
+  configureIdleCompaction: boolean;
   recentTurns: number;
   builderModel: string;
   verifierModel: string;
@@ -45,6 +54,11 @@ export function resolveConfig(options: PluginOptions): ShadowConfig {
     prepareThresholdTokens: positiveInt(options.prepareThresholdTokens, DEFAULT_PREPARE_THRESHOLD_TOKENS),
     autoCompactWindowTokens: positiveInt(options.autoCompactWindowTokens, DEFAULT_AUTO_COMPACT_WINDOW_TOKENS),
     configureAutoCompactWindow: options.configureAutoCompactWindow !== false,
+    idleCompactMinTokens: Math.max(
+      MIN_IDLE_COMPACT_MIN_TOKENS,
+      positiveInt(options.idleCompactMinTokens, DEFAULT_IDLE_COMPACT_MIN_TOKENS),
+    ),
+    configureIdleCompaction: options.configureIdleCompaction !== false,
     recentTurns: positiveInt(options.recentTurns, DEFAULT_RECENT_TURNS),
     builderModel: model(options.builderModel),
     verifierModel: model(options.verifierModel),
@@ -108,5 +122,22 @@ export function decideAutoCompactWindow(config: ShadowConfig, facts: WindowFacts
   if (config.autoCompactWindowTokens >= facts.modelWindow) {
     return { apply: false, reason: "model-window-smaller", final: false };
   }
+  return { apply: true };
+}
+
+export type IdleCompactDecision = { apply: true } | { apply: false; reason: string };
+
+/**
+ * Whether Shadow should set Claude Code's idle-compaction floor
+ * (`CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS`) for this process: never over
+ * a floor the person set, nor when idle compaction is turned off.
+ */
+export function decideIdleCompaction(
+  config: ShadowConfig,
+  facts: { envValue: string | undefined; settings: Settings },
+): IdleCompactDecision {
+  if (!config.configureIdleCompaction) return { apply: false, reason: "disabled" };
+  if (facts.settings.idleCompaction === false) return { apply: false, reason: "off-settings" };
+  if (facts.envValue !== undefined && facts.envValue !== "") return { apply: false, reason: `kept-env ${facts.envValue}` };
   return { apply: true };
 }

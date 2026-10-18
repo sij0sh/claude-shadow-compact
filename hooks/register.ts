@@ -14,6 +14,9 @@
  * this mod's replacement. Claude Code's own `/compact` and auto-compaction
  * are the install boundaries; on a model's first session Shadow sets its
  * auto-compact window through `/autocompact` unless one is already chosen.
+ * Claude Code's idle compaction (just before the prompt cache expires) is
+ * a third: Shadow lowers its floor and prepares at a completed turn above
+ * it, so a checkpoint is ready when the idle compaction fires.
  *
  * Deferred from the Pi version (spec §10): request-local mid-turn swaps
  * (Claude pins the transcript in `turn.step`) and native-summarizer
@@ -32,6 +35,7 @@ import type {
 import { CHECKPOINT_HEADING, coverageLine } from "./checkpoint.js";
 import {
   decideAutoCompactWindow,
+  decideIdleCompaction,
   describeModel,
   isAtOrAbove,
   resolveConfig,
@@ -52,7 +56,7 @@ const VERIFIER_TYPE = "shadow-compact:checkpoint-verifier";
 const AGENT_TIMEOUT_MS = 600_000;
 
 /** Running plugin version shown in status; bump with the manifest. */
-const PLUGIN_VERSION = "0.4.1";
+const PLUGIN_VERSION = "0.4.2";
 
 /** Inline evidence cap for the model.complete fallback. */
 const INLINE_EVIDENCE_CHARS = 120_000;
@@ -83,6 +87,13 @@ interface Runtime {
   lastCompact: string | null;
   /** This session's auto-compact window outcome for status. */
   autoCompactWindow: string | null;
+  /** This session's idle-compaction floor outcome for status. */
+  idleCompact: string | null;
+  /** Last main-loop context tokens `session.measure` reported. */
+  lastTokens: number | null;
+  /** The serving or preparing checkpoint was started below the prepare
+   * threshold for idle compaction; refresh it once the threshold is hit. */
+  idleCheckpoint: boolean;
 }
 
 function createRuntime(config: ShadowConfig): Runtime {
@@ -100,6 +111,9 @@ function createRuntime(config: ShadowConfig): Runtime {
     lastFallback: null,
     lastCompact: null,
     autoCompactWindow: null,
+    idleCompact: null,
+    lastTokens: null,
+    idleCheckpoint: false,
   };
 }
 
@@ -353,6 +367,31 @@ async function configureAutoCompactWindow($: EngineInterface, rt: Runtime): Prom
   }
 }
 
+/**
+ * Lowers Claude Code's idle-compaction floor for this process. The engine
+ * reads `CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS` when it considers an idle
+ * compaction, so the value set here applies to this session; a floor the
+ * person set, or `"idleCompaction": false`, is left as it is.
+ */
+async function configureIdleCompaction($: EngineInterface, rt: Runtime): Promise<void> {
+  try {
+    const decision = decideIdleCompaction(rt.config, {
+      envValue: await $.env.get("CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS"),
+      settings: await $.settings.read(),
+    });
+    if (!decision.apply) {
+      rt.idleCompact = decision.reason;
+      return;
+    }
+    const floor = rt.config.idleCompactMinTokens;
+    await $.env.set("CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS", String(floor));
+    rt.idleCompact = `applied ${floor} (env)`;
+  } catch (error) {
+    rt.idleCompact = `failed:${oneLine(error)}`;
+    $.ui.log(`shadow-compact: idle compaction floor not configured (${oneLine(error)})`, { to: "debug" });
+  }
+}
+
 function statusText(rt: Runtime): string {
   const published = rt.state.published;
   return [
@@ -364,6 +403,7 @@ function statusText(rt: Runtime): string {
     `installs=${rt.state.installCount}`,
     `prepare=${rt.config.prepareThresholdTokens} tokens recentTurns=${rt.config.recentTurns}`,
     `autoCompactWindow=${rt.autoCompactWindow ?? "unseen"}`,
+    `idleCompact=${rt.idleCompact ?? "unseen"}`,
     `builder=${describeModel(rt.config.builderModel)}`,
     `verifier=${describeModel(rt.config.verifierModel)}`,
     `lastFallback=${rt.lastFallback ?? "none"}`,
@@ -421,6 +461,7 @@ export const register: Register = (on, options) => {
       .catch(() => undefined);
     const result = await next(e);
     await configureAutoCompactWindow($, rt);
+    await configureIdleCompaction($, rt);
     return result;
   });
 
@@ -444,10 +485,24 @@ export const register: Register = (on, options) => {
     return result;
   });
 
-  on("turn.complete", async (_$, e, next) => {
+  on("turn.complete", async ($, e, next) => {
     if (e.agentId) {
       rt.pendingAnswers.get(e.agentId)?.(e.answer);
       rt.pendingAnswers.delete(e.agentId);
+      return next(e);
+    }
+    // A finished main turn may be the last before idle compaction:
+    // prepare now so the checkpoint is ready long before it fires.
+    const tokens = rt.lastTokens;
+    if (
+      rt.config.configureIdleCompaction &&
+      tokens !== null &&
+      tokens >= rt.config.idleCompactMinTokens &&
+      tokens < rt.config.prepareThresholdTokens &&
+      !rt.state.preparing
+    ) {
+      void runPreparation($, rt, false);
+      if (rt.state.preparing) rt.idleCheckpoint = true;
     }
     return next(e);
   });
@@ -457,10 +512,17 @@ export const register: Register = (on, options) => {
     await confirmInstall($, rt);
     const tokens = e.context.tokens;
     if (typeof tokens === "number" && Number.isFinite(tokens)) {
+      rt.lastTokens = tokens;
       if (rt.state.phase === "installed" && tokens < rt.config.prepareThresholdTokens) {
         rt.state.rearm();
       }
       if (isAtOrAbove(e.context, rt.config.prepareThresholdTokens)) {
+        // An idle-floor checkpoint would leave a long tail at engine
+        // compaction: refresh it once now that the threshold is reached.
+        if (rt.idleCheckpoint && !rt.state.preparing) {
+          rt.idleCheckpoint = false;
+          rt.state.rearm();
+        }
         void runPreparation($, rt, false);
       }
     }
@@ -558,6 +620,9 @@ export const register: Register = (on, options) => {
     rt.lastFallback = null;
     rt.lastCompact = null;
     rt.autoCompactWindow = null;
+    rt.idleCompact = null;
+    rt.lastTokens = null;
+    rt.idleCheckpoint = false;
     return result;
   });
 };

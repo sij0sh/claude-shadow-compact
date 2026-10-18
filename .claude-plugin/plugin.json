@@ -1,6 +1,6 @@
 {
   "name": "shadow-compact",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Verified-checkpoint compaction for Claude Code: a private builder and independent verifier prepare an evidence-grounded checkpoint in the background, and Claude Code's own /compact or auto-compaction installs it through session.compact with the exact recent tail preserved by handle.",
   "author": {
     "name": "pi-shadow-compact port"
@@ -23,6 +23,18 @@
       "title": "Auto-compact window (tokens)",
       "description": "Window Shadow sets for Claude Code auto-compaction. The engine compacts somewhat below it (~175k for 190k); keep it above the checkpoint threshold.",
       "default": 190000
+    },
+    "configureIdleCompaction": {
+      "type": "boolean",
+      "title": "Lower Claude's idle-compaction floor",
+      "description": "Set CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS for the session (unless already set, or idleCompaction is false) and prepare a checkpoint when a turn completes above it, so Claude Code's idle compaction installs Shadow's checkpoint.",
+      "default": true
+    },
+    "idleCompactMinTokens": {
+      "type": "number",
+      "title": "Idle-compaction floor (tokens)",
+      "description": "Minimum context for Claude Code's idle compaction, which fires shortly before the one-hour prompt cache expires. Claude Code's default is 200000 and it refuses less than 100000.",
+      "default": 100000
     },
     "recentTurns": {
       "type": "number",
