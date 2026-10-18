@@ -216,6 +216,10 @@ export class EvidenceArchive {
     this.#previousCoverageEndEntryId = coverageEndEntryId;
   }
 
+  get previousCoverageEndEntryId(): string | null {
+    return this.#previousCoverageEndEntryId;
+  }
+
   previousCheckpoint(): { evidenceId: string; summary: string } | null {
     if (this.#previousCheckpointSummary === undefined) return null;
     return {

@@ -163,7 +163,7 @@ Or, from a local checkout, load it for one session with
 |---|---|
 | `/shadow-compact` | Start background preparation now (honest when history is too short); run `/compact` to install a ready checkpoint |
 | `/compact-native` | Run Claude Code native compaction once, bypassing Shadow |
-| `/shadow-status` | Version, phase, archive size, checkpoint coverage, installs, threshold, auto-compact window and idle-compaction outcomes, last fallback, last compaction decision |
+| `/shadow-status` | Version, phase, archive size, checkpoint coverage, installs, threshold, auto-compact window and idle-compaction outcomes, per-role backend, Pi check and usage, last preparation, last fallback, last compaction decision |
 | `/shadow-export` | Print the verified checkpoint for manual copy-paste |
 
 ## Configuration
@@ -181,12 +181,57 @@ Set via the plugin's `userConfig` (Claude Code `/config` or
 | `recentTurns` | `10` | Minimum recent turns kept verbatim |
 | `builderModel` / `verifierModel` | `haiku` | Checkpoint agent models; `inherit` uses the session model |
 | `manualCompactMode` | `shadow` | `shadow` or `native` for manual `/compact` |
+| `builderBackend` / `verifierBackend` | `claude` | `claude` or `pi` per role (see [Optional Pi backend](#optional-pi-backend)) |
+| `piBuilderProvider` / `piBuilderModel` | `""` | Pi provider and model id for a `pi` builder |
+| `piVerifierProvider` / `piVerifierModel` | `""` | Pi provider and model id for a `pi` verifier |
+| `piNodePath` | `node` | Node.js executable that runs the Pi worker |
 
 Token settings must be positive safe integers; invalid values use the
 default. The former `hardThresholdTokens` setting is gone (Shadow now sets
 Claude Code's `autoCompactWindow`), as are the older percentage settings.
 
 Builder and verifier run as private Claude agents with file access to the paged evidence archive. When agents are unavailable the pipeline retries with `model.complete` on inline evidence, then fails closed to native compaction. Agent spawn failures are logged at debug level without prompt contents, and `/shadow-status` shows the resolved model per role plus the last fallback reason.
+
+## Optional Pi backend
+
+Either role can run through the [Pi SDK](https://github.com/earendil-works/pi)
+instead of a Claude agent. Claude is the default, and Pi is used only when
+you set it on purpose. You can mix them, e.g. a Pi builder with a Claude verifier.
+
+**Privacy:** a Pi role sends the sanitized evidence archive (and the
+previous checkpoint) to the provider you configure. That provider is outside Claude Code.
+
+Setup:
+
+1. Install Pi and run `pi`, then `/login` for the provider you want. The
+   worker uses Pi's stored credentials and model catalog.
+2. Set `builderBackend` and/or `verifierBackend` to `pi`, plus that role's
+   `pi*Provider` / `pi*Model`. Node.js 20+ must be on `PATH`, or set `piNodePath`.
+
+How it runs:
+
+- Hooks have no Node, so each role answer is its own bounded
+  `$.process.run` of the bundled worker `dist/pi-checkpoint-worker.mjs`, capped at
+  10 minutes. Builder and verifier are separate calls.
+- The worker runs Pi's tool-calling checkpoint loop over a frozen
+  snapshot of the evidence. Its only tools are evidence reads
+  (manifest, turns, rows, search, previous checkpoint) and submit. It has no
+  shell, edit, write, or repository reads. Each agent can cite only rows
+  it was actually served, and it has to read the required turns before submitting.
+- The answer is written atomically to a result file tagged with a
+  per-call nonce. Stdout carries only a one-line status. Shadow then
+  validates the answer exactly as it does a Claude agent's.
+- At session start Shadow runs a check that confirms each model exists and
+  has credentials. This check makes no inference call.
+- **Fallback:** if Pi fails at any point, Shadow redoes the whole
+  preparation with the Claude models. Pi failures include a bad check, a worker crash, a provider error,
+  a rejected answer, or an `unusable` verdict. A worker that cannot run or
+  start is not launched again that session.
+
+`/shadow-status` shows `builder=` / `verifier=` per backend, `pi=` (check
+state), `piUsage` (calls, failures, tokens, cost) and `lastPrepare`
+(backend and duration); `lastFallback` records the chain, e.g.
+`pi:... then agents:...`.
 
 ## Managed installs and updates
 
@@ -202,7 +247,7 @@ claude plugin marketplace update claude-shadow-compact
 claude plugin update shadow-compact@claude-shadow-compact
 ```
 
-`/shadow-status` shows the running version (`v0.4.2`).
+`/shadow-status` shows the running version (`v0.4.3`).
 
 ## Deferred from the Pi version
 
@@ -219,8 +264,12 @@ claude plugin update shadow-compact@claude-shadow-compact
 
 ```bash
 npm install
-npm run check   # tsc --noEmit && claude plugin validate . && claude plugin test .
+npm run check   # typecheck, claude plugin validate ., claude plugin test ., worker tests
+npm run build   # rebuild dist/pi-checkpoint-worker.mjs after changing worker/ or hooks/pi-protocol.ts
 ```
+
+The Pi worker bundle in `dist/` is committed so installs need no build
+step; `npm run test:worker` runs the worker's agent-loop tests under Node.
 
 `.claude/types/claude-code.d.ts` is the generated mod API declaration
 (written by Claude Code 2.1.277); regenerate it with `/plugin-types`

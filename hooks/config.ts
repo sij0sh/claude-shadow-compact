@@ -5,6 +5,7 @@
  * can predate the manifest's options.
  */
 import type { ContextWindowSource, PluginOptions, Settings } from "claude-code";
+import type { CheckpointRole, PiTarget } from "./pi-protocol.js";
 
 export const DEFAULT_PREPARE_THRESHOLD_TOKENS = 150_000;
 /**
@@ -26,6 +27,11 @@ export const DEFAULT_MODEL = "haiku";
 
 export type ManualCompactMode = "shadow" | "native";
 
+/** Who answers a checkpoint role. `pi` is opt-in only; `claude` is the default. */
+export type CheckpointBackend = "claude" | "pi";
+
+export const DEFAULT_NODE_PATH = "node";
+
 export interface ShadowConfig {
   prepareThresholdTokens: number;
   autoCompactWindowTokens: number;
@@ -36,6 +42,13 @@ export interface ShadowConfig {
   builderModel: string;
   verifierModel: string;
   manualCompactMode: ManualCompactMode;
+  builderBackend: CheckpointBackend;
+  verifierBackend: CheckpointBackend;
+  /** Pi provider/model per role; null when either half is missing. */
+  piBuilder: PiTarget | null;
+  piVerifier: PiTarget | null;
+  /** Node executable that runs the bundled Pi worker. */
+  piNodePath: string;
 }
 
 function positiveInt(value: unknown, fallback: number): number {
@@ -47,6 +60,19 @@ function positiveInt(value: unknown, fallback: number): number {
 
 function model(value: unknown): string {
   return typeof value === "string" && value.trim() !== "" ? value.trim() : DEFAULT_MODEL;
+}
+
+function text(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function backend(value: unknown): CheckpointBackend {
+  return value === "pi" ? "pi" : "claude";
+}
+
+function piTarget(provider: unknown, modelId: unknown): PiTarget | null {
+  const target = { provider: text(provider), model: text(modelId) };
+  return target.provider && target.model ? target : null;
 }
 
 export function resolveConfig(options: PluginOptions): ShadowConfig {
@@ -63,12 +89,39 @@ export function resolveConfig(options: PluginOptions): ShadowConfig {
     builderModel: model(options.builderModel),
     verifierModel: model(options.verifierModel),
     manualCompactMode: options.manualCompactMode === "native" ? "native" : "shadow",
+    builderBackend: backend(options.builderBackend),
+    verifierBackend: backend(options.verifierBackend),
+    piBuilder: piTarget(options.piBuilderProvider, options.piBuilderModel),
+    piVerifier: piTarget(options.piVerifierProvider, options.piVerifierModel),
+    piNodePath: text(options.piNodePath) || DEFAULT_NODE_PATH,
   };
 }
 
 /** Human-readable model for `/shadow-status`. */
 export function describeModel(claudeModel: string): string {
   return `claude:${claudeModel}`;
+}
+
+export function roleBackend(config: ShadowConfig, role: CheckpointRole): CheckpointBackend {
+  return role === "builder" ? config.builderBackend : config.verifierBackend;
+}
+
+export function piTargetFor(config: ShadowConfig, role: CheckpointRole): PiTarget | null {
+  return role === "builder" ? config.piBuilder : config.piVerifier;
+}
+
+/** True when any role is configured for the Pi worker. */
+export function usesPi(config: ShadowConfig): boolean {
+  return config.builderBackend === "pi" || config.verifierBackend === "pi";
+}
+
+/** A role's backend and model for `/shadow-status`. */
+export function describeRole(config: ShadowConfig, role: CheckpointRole): string {
+  if (roleBackend(config, role) === "claude") {
+    return describeModel(role === "builder" ? config.builderModel : config.verifierModel);
+  }
+  const target = piTargetFor(config, role);
+  return target ? `pi:${target.provider}/${target.model}` : "pi:unconfigured";
 }
 
 export interface ThresholdUsage {

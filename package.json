@@ -1,20 +1,26 @@
 {
   "name": "claude-shadow-compact",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "private": true,
   "type": "module",
   "description": "Shadow Compact ported to a Claude Code mod: verified checkpoints with exact recent-tail preservation.",
   "license": "MIT",
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "build": "node scripts/build-worker.mjs",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p worker",
     "validate": "claude plugin validate .",
     "test": "claude plugin test .",
-    "check": "npm run typecheck && npm run validate && npm test"
+    "test:worker": "node scripts/test-worker.mjs",
+    "check": "npm run typecheck && npm run validate && npm test && npm run test:worker"
   },
   "engines": {
     "node": ">=22"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "1.3.0",
+    "@earendil-works/pi-coding-agent": "1.3.0",
+    "@types/node": "^22.20.5",
+    "esbuild": "^0.25.12",
     "typescript": "^5.8.0"
   }
 }

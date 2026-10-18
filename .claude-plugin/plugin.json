@@ -1,6 +1,6 @@
 {
   "name": "shadow-compact",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Verified-checkpoint compaction for Claude Code: a private builder and independent verifier prepare an evidence-grounded checkpoint in the background, and Claude Code's own /compact or auto-compaction installs it through session.compact with the exact recent tail preserved by handle.",
   "author": {
     "name": "pi-shadow-compact port"
@@ -65,6 +65,56 @@
         "sonnet",
         "opus"
       ]
+    },
+    "builderBackend": {
+      "type": "string",
+      "title": "Builder backend",
+      "description": "claude runs the builder as a private Claude agent (default). pi runs it through Shadow's bundled Pi SDK worker with the provider and model below; this sends the sanitized evidence archive to that external provider. If a Pi preparation fails, Shadow redoes it with the Claude models.",
+      "default": "claude",
+      "options": [
+        "claude",
+        "pi"
+      ]
+    },
+    "verifierBackend": {
+      "type": "string",
+      "title": "Verifier backend",
+      "description": "claude runs the verifier as a private Claude agent (default). pi runs it through Shadow's bundled Pi SDK worker with the provider and model below; this sends the sanitized evidence archive to that external provider. If a Pi preparation fails, Shadow redoes it with the Claude models.",
+      "default": "claude",
+      "options": [
+        "claude",
+        "pi"
+      ]
+    },
+    "piBuilderProvider": {
+      "type": "string",
+      "title": "Pi builder provider",
+      "description": "Pi provider id for the builder when its backend is pi (e.g. openrouter, openai, anthropic). Credentials come from Pi itself: run pi and /login.",
+      "default": ""
+    },
+    "piBuilderModel": {
+      "type": "string",
+      "title": "Pi builder model",
+      "description": "Model id in Pi's catalog for the builder when its backend is pi.",
+      "default": ""
+    },
+    "piVerifierProvider": {
+      "type": "string",
+      "title": "Pi verifier provider",
+      "description": "Pi provider id for the verifier when its backend is pi (e.g. openrouter, openai, anthropic). Credentials come from Pi itself: run pi and /login.",
+      "default": ""
+    },
+    "piVerifierModel": {
+      "type": "string",
+      "title": "Pi verifier model",
+      "description": "Model id in Pi's catalog for the verifier when its backend is pi.",
+      "default": ""
+    },
+    "piNodePath": {
+      "type": "string",
+      "title": "Node for the Pi worker",
+      "description": "Node.js (20+) executable that runs the Pi worker; used only when a backend is pi.",
+      "default": "node"
     },
     "manualCompactMode": {
       "type": "string",

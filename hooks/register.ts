@@ -22,6 +22,11 @@
  * (Claude pins the transcript in `turn.step`) and native-summarizer
  * token-cap recovery (no stable signal in the compact result).
  *
+ * Optionally either role runs on a Pi SDK model instead (`pi-backend.ts`),
+ * in its own bounded Node process. Pi is opt-in; when a preparation that
+ * involves Pi fails for any reason, Shadow redoes the whole preparation
+ * with the configured Claude models before giving up.
+ *
  * Helpers are top-level functions taking `$` explicitly: the engine's
  * validator statically follows `$` only into top-level or imported
  * functions, never into closures capturing it.
@@ -36,9 +41,11 @@ import { CHECKPOINT_HEADING, coverageLine } from "./checkpoint.js";
 import {
   decideAutoCompactWindow,
   decideIdleCompaction,
-  describeModel,
+  describeRole,
   isAtOrAbove,
   resolveConfig,
+  roleBackend,
+  usesPi,
   type ShadowConfig,
 } from "./config.js";
 import { EvidenceArchive } from "./evidence.js";
@@ -48,6 +55,16 @@ import {
   prepareCheckpoint,
   type AskFn,
 } from "./prepare.js";
+import {
+  PiWorkerUnavailable,
+  askViaPi,
+  checkPi,
+  describePiStats,
+  emptyPiStats,
+  writePiEvidence,
+  type PiStats,
+} from "./pi-backend.js";
+import { PI_EVIDENCE_ACCESS } from "./pi-protocol.js";
 import { ShadowState, type PublishedCheckpoint } from "./state.js";
 import { buildCandidate, isSkipped } from "./working-context.js";
 
@@ -56,7 +73,7 @@ const VERIFIER_TYPE = "shadow-compact:checkpoint-verifier";
 const AGENT_TIMEOUT_MS = 600_000;
 
 /** Running plugin version shown in status; bump with the manifest. */
-const PLUGIN_VERSION = "0.4.2";
+const PLUGIN_VERSION = "0.4.3";
 
 /** Inline evidence cap for the model.complete fallback. */
 const INLINE_EVIDENCE_CHARS = 120_000;
@@ -94,6 +111,11 @@ interface Runtime {
   /** The serving or preparing checkpoint was started below the prepare
    * threshold for idle compaction; refresh it once the threshold is hit. */
   idleCheckpoint: boolean;
+  /** Pi backend availability: off, checking, ok, or failed:<reason>. */
+  piStatus: string;
+  piStats: PiStats;
+  /** Last preparation's backend and duration for status. */
+  lastPrepare: string | null;
 }
 
 function createRuntime(config: ShadowConfig): Runtime {
@@ -114,6 +136,9 @@ function createRuntime(config: ShadowConfig): Runtime {
     idleCompact: null,
     lastTokens: null,
     idleCheckpoint: false,
+    piStatus: usesPi(config) ? "unchecked" : "off",
+    piStats: emptyPiStats(),
+    lastPrepare: null,
   };
 }
 
@@ -205,12 +230,16 @@ async function confirmInstall($: EngineInterface, rt: Runtime): Promise<void> {
 }
 
 /** Evidence access text for agents: read the paged archive file. */
+function dataDir($: EngineInterface, rt: Runtime): string {
+  return `${$.plugin.root}/.shadow-data/${rt.sessionId}`;
+}
+
 async function evidenceAccess(
   $: EngineInterface,
   rt: Runtime,
   rows: EvidenceArchive,
 ): Promise<string> {
-  const path = `${$.plugin.root}/.shadow-data/${rt.sessionId}/evidence.jsonl`;
+  const path = `${dataDir($, rt)}/evidence.jsonl`;
   // An unwritten file would send agents to stale or missing evidence.
   await $.fs.write(path, rows.fullText());
   const previous = rows.previousCheckpoint();
@@ -256,12 +285,59 @@ function askViaAgent($: EngineInterface, rt: Runtime, kind: "builder" | "verifie
   };
 }
 
-/** One AskFn routing builder/verifier systems to their agent types. */
+/** One AskFn routing each role to its private agent type. */
 function askViaAgents($: EngineInterface, rt: Runtime): AskFn {
   const builder = askViaAgent($, rt, "builder");
   const verifier = askViaAgent($, rt, "verifier");
-  return (request) =>
-    request.system.includes("create evidence-grounded") ? builder(request) : verifier(request);
+  return (request) => (request.role === "builder" ? builder(request) : verifier(request));
+}
+
+/**
+ * One preparation with Pi on its configured roles and Claude agents on
+ * the rest. Each Pi role reads the snapshot through the worker's tools;
+ * a Claude role reads the evidence file.
+ */
+async function prepareWithPi($: EngineInterface, rt: Runtime, snapshot: EvidenceArchive) {
+  const dir = dataDir($, rt);
+  const evidencePath = `${dir}/pi-evidence.json`;
+  await writePiEvidence($, evidencePath, snapshot);
+  const pi = askViaPi($, rt.config, { evidencePath, dataDir: dir }, rt.piStats);
+  const claudeRoles = roleBackend(rt.config, "builder") === "claude" || roleBackend(rt.config, "verifier") === "claude";
+  const claudeAccess = claudeRoles ? await evidenceAccess($, rt, snapshot) : "";
+  const agents = askViaAgents($, rt);
+  const ask: AskFn = (request) =>
+    roleBackend(rt.config, request.role) === "pi" ? pi(request) : agents(request);
+  const access = {
+    builder: roleBackend(rt.config, "builder") === "pi" ? PI_EVIDENCE_ACCESS : claudeAccess,
+    verifier: roleBackend(rt.config, "verifier") === "pi" ? PI_EVIDENCE_ACCESS : claudeAccess,
+  };
+  return prepareCheckpoint(ask, snapshot, access, {
+    builder: rt.config.builderModel,
+    verifier: rt.config.verifierModel,
+  });
+}
+
+/** Claude-only preparation: private agents, then inline `model.complete`. */
+async function prepareWithClaude(
+  $: EngineInterface,
+  rt: Runtime,
+  snapshot: EvidenceArchive,
+  notes: string[],
+): Promise<{ prepared: Awaited<ReturnType<typeof prepareCheckpoint>>; backend: string }> {
+  const models = { builder: rt.config.builderModel, verifier: rt.config.verifierModel };
+  // Side agents read the paged evidence file; when agents are
+  // unavailable the whole pipeline retries on inline evidence.
+  const access = await evidenceAccess($, rt, snapshot);
+  try {
+    return { prepared: await prepareCheckpoint(askViaAgents($, rt), snapshot, access, models), backend: "claude-agents" };
+  } catch (error) {
+    notes.push(`agents:${oneLine(error)}`);
+    rt.lastFallback = notes.join(" then ");
+  }
+  return {
+    prepared: await prepareCheckpoint(askViaComplete($), snapshot, inlineEvidence(snapshot), models),
+    backend: "claude-complete",
+  };
 }
 
 /** The prompt already carries the inline snapshot evidence as its access text. */
@@ -289,18 +365,28 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
   if (generation === undefined) return;
   // Rows appended mid-preparation (agent hand-backs, new turns) stay out.
   const snapshot = rows.snapshot(rows.size - 1);
+  const started = performance.now();
+  const notes: string[] = [];
   try {
-    const models = { builder: rt.config.builderModel, verifier: rt.config.verifierModel };
-    // Side agents read the paged evidence file; when agents are
-    // unavailable the whole pipeline retries on inline evidence.
-    const access = await evidenceAccess($, rt, snapshot);
-    let prepared;
-    try {
-      prepared = await prepareCheckpoint(askViaAgents($, rt), snapshot, access, models);
-    } catch (error) {
-      rt.lastFallback = `agents:${oneLine(error)}`;
-      prepared = await prepareCheckpoint(askViaComplete($), snapshot, inlineEvidence(snapshot), models);
+    let prepared: Awaited<ReturnType<typeof prepareCheckpoint>> | undefined;
+    let backend = "";
+    if (usesPi(rt.config)) {
+      if (rt.piStatus.startsWith("failed")) {
+        notes.push(`pi-unavailable:${rt.piStatus.slice("failed:".length)}`);
+      } else {
+        try {
+          prepared = await prepareWithPi($, rt, snapshot);
+          backend = rt.config.builderBackend === rt.config.verifierBackend ? "pi" : "mixed";
+        } catch (error) {
+          // Any Pi-involving failure redoes the whole preparation on Claude.
+          if (error instanceof PiWorkerUnavailable) rt.piStatus = `failed:${oneLine(error)}`;
+          notes.push(`pi:${oneLine(error)}`);
+        }
+      }
+      if (notes.length > 0) rt.lastFallback = notes.join(" then ");
     }
+    if (!prepared) ({ prepared, backend } = await prepareWithClaude($, rt, snapshot, notes));
+    rt.lastPrepare = `${backend} ${Math.round(performance.now() - started)}ms`;
     const checkpoint: PublishedCheckpoint = {
       checkpointId: `shadow-${generation}-${prepared.coverageEndEntryId}`,
       rendered: prepared.rendered,
@@ -314,7 +400,9 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
     }
   } catch (error) {
     rt.state.fail(generation);
-    rt.lastFallback = `failed:${oneLine(error)}`;
+    notes.push(`failed:${oneLine(error)}`);
+    rt.lastFallback = notes.join(" then ");
+    rt.lastPrepare = `failed ${Math.round(performance.now() - started)}ms`;
     $.ui.log(`shadow-compact: preparation failed (${oneLine(error)})`, { to: "debug" });
   }
 }
@@ -392,6 +480,17 @@ async function configureIdleCompaction($: EngineInterface, rt: Runtime): Promise
   }
 }
 
+async function startPiCheck($: EngineInterface, rt: Runtime): Promise<void> {
+  try {
+    rt.piStatus = await checkPi($, rt.config);
+  } catch (error) {
+    rt.piStatus = `failed:${oneLine(error)}`;
+  }
+  if (rt.piStatus !== "ok") {
+    $.ui.log(`shadow-compact: Pi backend unavailable, using Claude models (${rt.piStatus})`);
+  }
+}
+
 function statusText(rt: Runtime): string {
   const published = rt.state.published;
   return [
@@ -404,8 +503,11 @@ function statusText(rt: Runtime): string {
     `prepare=${rt.config.prepareThresholdTokens} tokens recentTurns=${rt.config.recentTurns}`,
     `autoCompactWindow=${rt.autoCompactWindow ?? "unseen"}`,
     `idleCompact=${rt.idleCompact ?? "unseen"}`,
-    `builder=${describeModel(rt.config.builderModel)}`,
-    `verifier=${describeModel(rt.config.verifierModel)}`,
+    `builder=${describeRole(rt.config, "builder")}`,
+    `verifier=${describeRole(rt.config, "verifier")}`,
+    `pi=${rt.piStatus}`,
+    ...(usesPi(rt.config) ? [`piUsage ${describePiStats(rt.piStats)}`] : []),
+    `lastPrepare=${rt.lastPrepare ?? "none"}`,
     `lastFallback=${rt.lastFallback ?? "none"}`,
     `lastCompact=${rt.lastCompact ?? "unseen"}`,
   ].join(" · ");
@@ -462,6 +564,11 @@ export const register: Register = (on, options) => {
     const result = await next(e);
     await configureAutoCompactWindow($, rt);
     await configureIdleCompaction($, rt);
+    // Availability only (no inference); preparation never waits on it.
+    if (usesPi(rt.config) && rt.piStatus === "unchecked") {
+      rt.piStatus = "checking";
+      void startPiCheck($, rt);
+    }
     return result;
   });
 
@@ -623,6 +730,9 @@ export const register: Register = (on, options) => {
     rt.idleCompact = null;
     rt.lastTokens = null;
     rt.idleCheckpoint = false;
+    rt.piStatus = usesPi(rt.config) ? "unchecked" : "off";
+    rt.piStats = emptyPiStats();
+    rt.lastPrepare = null;
     return result;
   });
 };

@@ -5,10 +5,12 @@ import {
   validateCheckpointObject,
   type Checkpoint,
 } from "../hooks/checkpoint.js";
-import { decideAutoCompactWindow, decideIdleCompaction, describeModel, isAtOrAbove, resolveConfig, type WindowFacts } from "../hooks/config.js";
+import { decideAutoCompactWindow, decideIdleCompaction, describeModel, describeRole, isAtOrAbove, resolveConfig, usesPi, type WindowFacts } from "../hooks/config.js";
 import { EvidenceArchive } from "../hooks/evidence.js";
 import { redactSecretValue, sanitizeForContext } from "../hooks/normalize.js";
-import { prepareCheckpoint } from "../hooks/prepare.js";
+import { BUILDER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT, prepareCheckpoint } from "../hooks/prepare.js";
+import { checkPi } from "../hooks/pi-backend.js";
+import { PI_EVIDENCE_ACCESS, type PiEvidenceFile, type PiRunRequest, type PiRunResult } from "../hooks/pi-protocol.js";
 import { register } from "../hooks/register.js";
 import { ShadowState, type PublishedCheckpoint } from "../hooks/state.js";
 import { buildCandidate, hasOrphanedToolResult, isSkipped } from "../hooks/working-context.js";
@@ -490,7 +492,16 @@ describe("auto-compact window setup", () => {
 // compaction are deterministic and never invoke real models or core.
 type Reply = (request: { system: string; prompt: string }) => string;
 
-function host(options: Record<string, number | string> = {}, reply?: Reply) {
+/** What the fake Pi worker does with one run request. */
+type PiWorker = (request: PiRunRequest) => PiRunResult | "crash";
+
+interface HostFakes {
+  /** Answers private agent spawns through `turn.complete`; absent, spawns fail. */
+  agentReply?: Reply;
+  piWorker?: PiWorker;
+}
+
+function host(options: Record<string, number | string> = {}, reply?: Reply, fakes: HostFakes = {}) {
   type Handler = ($: EngineInterface, e: any, next: (e: any) => Promise<any>) => any;
   const handlers = new Map<string, Handler>();
   const scheduled: Array<() => void> = [];
@@ -498,6 +509,8 @@ function host(options: Record<string, number | string> = {}, reply?: Reply) {
   let canonical: SessionMessage[] = [];
   let spawns = 0;
   let selfCompactions = 0;
+  const files = new Map<string, string>();
+  const piRuns: PiRunRequest[] = [];
   const on = ((event: string, ...args: unknown[]) => {
     const head = args.length >= 2 ? (args[0] as { command?: string }) : undefined;
     const key = head && typeof head.command === "string" ? `${event}:${head.command}` : event;
@@ -519,10 +532,38 @@ function host(options: Record<string, number | string> = {}, reply?: Reply) {
       sleep: () => new Promise(() => undefined),
     },
     command: { run: async () => { throw new Error("Shadow must not run commands"); } },
-    fs: { write: async () => undefined },
-    agent: { spawn: async () => {
+    fs: {
+      write: async (path: string, text: string) => { files.set(path, text); },
+      read: async (path: string) => {
+        const text = files.get(path);
+        if (text === undefined) throw new Error(`ENOENT ${path}`);
+        return text;
+      },
+    },
+    process: {
+      run: async (argv: string[], init: { stdin: string }) => {
+        if (!fakes.piWorker) throw new Error("Shadow must not start processes");
+        expect(argv[1]).toBe("/plugin/dist/pi-checkpoint-worker.mjs");
+        const request = JSON.parse(init.stdin) as PiRunRequest;
+        piRuns.push(request);
+        const result = fakes.piWorker(request);
+        if (result === "crash") return { exitCode: 1, stdout: "", stderr: "node: bad bundle" };
+        files.set(request.outputPath, JSON.stringify(result));
+        return { exitCode: 0, stdout: '{"ok":true}', stderr: "" };
+      },
+    },
+    agent: { spawn: async (request: { subagentType: string; prompt: string }) => {
       spawns += 1;
-      throw new Error("Agents unavailable in test");
+      if (!fakes.agentReply) throw new Error("Agents unavailable in test");
+      const agentId = `agent-${spawns}`;
+      const system = request.subagentType.endsWith("builder") ? BUILDER_SYSTEM_PROMPT : VERIFIER_SYSTEM_PROMPT;
+      const answer = fakes.agentReply({ system, prompt: request.prompt });
+      // The answer lands after Shadow has started waiting for it.
+      void (async () => {
+        for (let i = 0; i < 10; i += 1) await Promise.resolve();
+        await handlers.get("turn.complete")!($, { agentId, answer }, async () => ({}));
+      })();
+      return { agentId };
     } },
     model: { complete: async (request: { system: string; prompt: string }) => {
       if (!reply) throw new Error("Models unavailable in test");
@@ -537,6 +578,8 @@ function host(options: Record<string, number | string> = {}, reply?: Reply) {
   return {
     logs,
     get spawns() { return spawns; },
+    files,
+    piRuns,
     get selfCompactions() { return selfCompactions; },
     setCanonical: (messages: SessionMessage[]) => { canonical = messages; },
     append: (uuid: string, role: "user" | "assistant", text: string, door = role === "user" ? "prompt" : "response") =>
@@ -662,7 +705,7 @@ describe("token threshold", () => {
     await h.measure(160_000);
     await h.measure(170_000);
     expect(h.spawns).toBe(1);
-    expect(await h.status()).toContain("lastFallback=failed:");
+    expect(await h.status()).toContain("then failed:");
   });
 });
 
@@ -777,9 +820,151 @@ describe("compaction install", () => {
     expect(h.spawns).toBe(1);
     const status = await h.status();
     expect(status).toContain("checkpoint=none");
-    expect(status).toContain("lastFallback=failed:Models unavailable in test");
+    expect(status).toContain("lastFallback=agents:Agents unavailable in test then failed:Models unavailable in test");
     expect(status).toContain("builder=claude:haiku");
     expect(status).toContain("verifier=claude:haiku");
+  });
+});
+
+const PI_BOTH = {
+  builderBackend: "pi",
+  verifierBackend: "pi",
+  piBuilderProvider: "openrouter",
+  piBuilderModel: "builder-model",
+  piVerifierProvider: "openrouter",
+  piVerifierModel: "verifier-model",
+};
+
+const usage = { totalTokens: 1_000, cost: 0.01 };
+
+/** A Pi worker answering like `covering`, echoing each request's nonce. */
+const piCovering = (coverage: string): PiWorker => (request) => ({
+  nonce: request.nonce,
+  ok: true,
+  answer: covering(coverage)({ system: request.system, prompt: request.prompt }),
+  usage,
+  toolRounds: 3,
+  durationMs: 10,
+});
+
+async function fill(h: ReturnType<typeof host>) {
+  for (const [id, role, text] of turns) await h.append(id, role, text);
+  await h.measure(160_000);
+}
+
+describe("pi backend", () => {
+  test("Pi stays off by default and Claude never starts a process", async () => {
+    const config = resolveConfig({});
+    expect(usesPi(config)).toBe(false);
+    expect(describeRole(config, "builder")).toBe("claude:haiku");
+    const h = await readyHost();
+    expect(await h.status()).toContain("pi=off");
+    expect(await h.status()).not.toContain("piUsage");
+  });
+
+  test("config resolves per-role backends and needs both provider and model", async () => {
+    const config = resolveConfig({ builderBackend: "pi", piBuilderProvider: "openrouter", verifierBackend: "bogus" });
+    expect(config.verifierBackend).toBe("claude");
+    expect(config.piBuilder).toBe(null);
+    expect(describeRole(config, "builder")).toBe("pi:unconfigured");
+    expect(describeRole(resolveConfig(PI_BOTH), "verifier")).toBe("pi:openrouter/verifier-model");
+    expect(resolveConfig(PI_BOTH).piNodePath).toBe("node");
+  });
+
+  test("Pi answers both roles in separate worker runs and the checkpoint publishes", async () => {
+    const h = host({ ...PI_BOTH, recentTurns: 1 }, undefined, { piWorker: piCovering("a2") });
+    await fill(h);
+    expect(h.spawns).toBe(0);
+    expect(h.piRuns.map((run) => `${run.role}:${run.target.model}`)).toEqual([
+      "builder:builder-model",
+      "verifier:verifier-model",
+    ]);
+    // Each run gets its own nonce; both read one frozen snapshot.
+    expect(new Set(h.piRuns.map((run) => run.nonce)).size).toBe(2);
+    expect(h.piRuns[0]!.prompt).toContain(PI_EVIDENCE_ACCESS);
+    const evidence = JSON.parse(h.files.get(h.piRuns[0]!.evidencePath)!) as PiEvidenceFile;
+    expect(evidence.rows.map((row) => row.id)).toEqual(["u1", "a1", "u2", "a2", "u3", "a3"]);
+    const status = await h.status();
+    expect(status).toContain("checkpoint=shadow-");
+    expect(status).toContain("builder=pi:openrouter/builder-model");
+    expect(status).toContain("piUsage calls=2 failures=0 tokens=2000 cost=$0.0200");
+    expect(status).toContain("lastPrepare=pi ");
+    expect(status).toContain("lastFallback=none");
+    const { coreCalls } = await h.compact(transcript());
+    expect(coreCalls).toBe(0);
+  });
+
+  test("a failed Pi preparation is redone with the Claude models", async () => {
+    const failing: PiWorker = (request) => ({ nonce: request.nonce, ok: false, error: "provider 429", usage, durationMs: 5 });
+    const h = host({ ...PI_BOTH, recentTurns: 1 }, covering("a2"), { piWorker: failing });
+    await fill(h);
+    const status = await h.status();
+    expect(status).toContain("checkpoint=shadow-");
+    expect(status).toContain("lastFallback=pi:pi builder (openrouter/builder-model): provider 429 then agents:");
+    expect(status).toContain("lastPrepare=claude-complete ");
+    expect(status).toContain("piUsage calls=1 failures=1");
+    // Ordinary model failures leave Pi enabled for the next preparation.
+    expect(status).toContain("pi=unchecked");
+  });
+
+  test("an unusable Pi verdict also falls back to Claude", async () => {
+    const unusable: PiWorker = (request) =>
+      request.role === "builder"
+        ? piCovering("a2")(request)
+        : { nonce: request.nonce, ok: true, answer: JSON.stringify({ verdict: "unusable", reason: "ungrounded" }), usage, toolRounds: 1, durationMs: 5 };
+    const h = host({ ...PI_BOTH, recentTurns: 1 }, covering("a2"), { piWorker: unusable });
+    await fill(h);
+    const status = await h.status();
+    expect(status).toContain("checkpoint=shadow-");
+    expect(status).toContain("lastFallback=pi:Verifier rejected the checkpoint as unusable: ungrounded");
+  });
+
+  test("a stale result file from another run is never trusted", async () => {
+    const stale: PiWorker = (request) => ({ ...(piCovering("a2")(request) as PiRunResult), nonce: "old-run" });
+    const h = host({ ...PI_BOTH, recentTurns: 1 }, covering("a2"), { piWorker: stale });
+    await fill(h);
+    const status = await h.status();
+    expect(status).toContain("checkpoint=shadow-");
+    expect(status).toContain("lastPrepare=claude-complete ");
+    expect(status).toContain("pi=failed:pi builder worker exited 0");
+  });
+
+  test("a worker that cannot run disables Pi for the session instead of relaunching", async () => {
+    const h = host({ ...PI_BOTH, recentTurns: 1 }, covering("a2"), { piWorker: () => "crash" });
+    await fill(h);
+    expect(h.piRuns.length).toBe(1);
+    expect(await h.status()).toContain("pi=failed:pi builder worker exited 1: node: bad bundle");
+    await h.runCommand("compact-native");
+    await h.flush();
+    await h.measure(160_000);
+    // The second preparation skips Pi entirely.
+    expect(h.piRuns.length).toBe(1);
+    expect(await h.status()).toContain("lastFallback=pi-unavailable:");
+    expect(await h.status()).toContain("checkpoint=shadow-");
+  });
+
+  test("mixed mode runs the Pi builder with the Claude agent verifier", async () => {
+    const config = { builderBackend: "pi", piBuilderProvider: "openrouter", piBuilderModel: "builder-model", recentTurns: 1 };
+    const h = host(config, undefined, { piWorker: piCovering("a2"), agentReply: covering("a2") });
+    await fill(h);
+    expect(h.piRuns.map((run) => run.role)).toEqual(["builder"]);
+    expect(h.spawns).toBe(1);
+    const status = await h.status();
+    expect(status).toContain("checkpoint=shadow-");
+    expect(status).toContain("verifier=claude:haiku");
+    expect(status).toContain("lastPrepare=mixed ");
+  });
+
+  test("the availability check reports a missing model or credential without inference", async () => {
+    const config = resolveConfig(PI_BOTH);
+    const fake = (stdout: string, exitCode = 0) =>
+      ({ plugin: { root: "/plugin" }, process: { run: async () => ({ exitCode, stdout, stderr: "boom" }) } }) as unknown as EngineInterface;
+    const ok = JSON.stringify({ ok: true, targets: [{ role: "builder", ok: true }, { role: "verifier", ok: true }] });
+    expect(await checkPi(fake(ok), config)).toBe("ok");
+    const noAuth = JSON.stringify({ ok: false, targets: [{ role: "builder", ok: true }, { role: "verifier", ok: false, error: "no auth for openrouter" }] });
+    expect(await checkPi(fake(noAuth), config)).toBe("failed:verifier: no auth for openrouter");
+    expect(await checkPi(fake("", 127), config)).toBe("failed:worker exited 127: boom");
+    expect(await checkPi(fake(ok), resolveConfig({ builderBackend: "pi" }))).toContain("failed:builder needs piBuilderProvider");
   });
 });
 
@@ -801,7 +986,7 @@ describe("engine integration", () => {
     expect(result.text).toContain("verifier=claude:haiku");
     expect(result.text).toContain("lastFallback=none");
     expect(result.text).toContain("lastCompact=unseen");
-    expect(result.text).toContain("v0.4.2");
+    expect(result.text).toContain("v0.4.3");
   });
 
   test("compact with no checkpoint defers without inventing messages", async ($, on) => {
