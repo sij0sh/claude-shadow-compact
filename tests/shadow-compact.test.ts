@@ -5,7 +5,7 @@ import {
   validateCheckpointObject,
   type Checkpoint,
 } from "../hooks/checkpoint.js";
-import { describeModel, isAtOrAbove, resolveConfig } from "../hooks/config.js";
+import { decideAutoCompactWindow, describeModel, isAtOrAbove, resolveConfig, type WindowFacts } from "../hooks/config.js";
 import { EvidenceArchive } from "../hooks/evidence.js";
 import { redactSecretValue, sanitizeForContext } from "../hooks/normalize.js";
 import { prepareCheckpoint } from "../hooks/prepare.js";
@@ -299,7 +299,7 @@ describe("prepare pipeline", () => {
 
 describe("config", () => {
   test("token default and custom threshold hold", async () => {
-    expect(resolveConfig({}).prepareThresholdTokens).toBe(160_000);
+    expect(resolveConfig({}).prepareThresholdTokens).toBe(150_000);
     expect(resolveConfig({ prepareThresholdTokens: 180_000 }).prepareThresholdTokens).toBe(180_000);
   });
 
@@ -317,7 +317,7 @@ describe("config", () => {
 
   test("invalid token settings use the default", async () => {
     for (const invalid of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "bad", "", true, false]) {
-      expect(resolveConfig({ prepareThresholdTokens: invalid }).prepareThresholdTokens).toBe(160_000);
+      expect(resolveConfig({ prepareThresholdTokens: invalid }).prepareThresholdTokens).toBe(150_000);
     }
     expect(resolveConfig({ prepareThresholdTokens: "200000" }).prepareThresholdTokens).toBe(200_000);
   });
@@ -329,7 +329,119 @@ describe("config", () => {
       expect(isAtOrAbove({ tokens, percent: 100 }, 160_000)).toBe(false);
     }
     const legacy = resolveConfig({ prepareThresholdPercent: 1, hardThresholdTokens: 2 });
-    expect(legacy.prepareThresholdTokens).toBe(160_000);
+    expect(legacy.prepareThresholdTokens).toBe(150_000);
+  });
+
+  test("auto-compact window defaults to 190k and is on", async () => {
+    const config = resolveConfig({});
+    expect(config.autoCompactWindowTokens).toBe(190_000);
+    expect(config.configureAutoCompactWindow).toBe(true);
+    expect(resolveConfig({ configureAutoCompactWindow: false }).configureAutoCompactWindow).toBe(false);
+    expect(resolveConfig({ autoCompactWindowTokens: -5 }).autoCompactWindowTokens).toBe(190_000);
+  });
+});
+
+describe("auto-compact window decision", () => {
+  const facts = (overrides: Partial<WindowFacts> = {}): WindowFacts => ({
+    model: "claude-opus-5-5",
+    modelWindow: 1_000_000,
+    source: "model-default",
+    settings: {},
+    decidedBefore: false,
+    ...overrides,
+  });
+  const config = resolveConfig({});
+
+  test("applies on a model's first session with no chosen window", async () => {
+    expect(decideAutoCompactWindow(config, facts())).toEqual({ apply: true });
+  });
+
+  test("never overrides an env, settings or explicit auto window", async () => {
+    expect(decideAutoCompactWindow(config, facts({ source: "env" }))).toMatchObject({ apply: false, reason: "kept-env", final: true });
+    expect(decideAutoCompactWindow(config, facts({ source: "settings" }))).toMatchObject({ reason: "kept-settings" });
+    // `/autocompact auto` reports model-default, so settings are read too.
+    const explicitAuto = { modelSettings: { "claude-opus-5-5": { autoCompactWindow: "auto" } } };
+    expect(decideAutoCompactWindow(config, facts({ settings: explicitAuto }))).toMatchObject({ reason: "kept-settings" });
+    expect(decideAutoCompactWindow(config, facts({ settings: { autoCompactWindow: 300_000 } }))).toMatchObject({ reason: "kept-settings" });
+    // Another model's choice does not count for this one.
+    const other = { modelSettings: { "claude-sonnet-5-5": { autoCompactWindow: 300_000 } } };
+    expect(decideAutoCompactWindow(config, facts({ settings: other }))).toEqual({ apply: true });
+  });
+
+  test("decides once per model and skips windows that cannot work", async () => {
+    expect(decideAutoCompactWindow(config, facts({ decidedBefore: true }))).toMatchObject({ reason: "decided-before" });
+    expect(decideAutoCompactWindow(resolveConfig({ configureAutoCompactWindow: false }), facts())).toMatchObject({ reason: "disabled", final: false });
+    expect(decideAutoCompactWindow(config, facts({ modelWindow: 190_000 }))).toMatchObject({ reason: "model-window-smaller", final: false });
+    const inverted = resolveConfig({ prepareThresholdTokens: 200_000 });
+    expect(decideAutoCompactWindow(inverted, facts())).toMatchObject({ reason: "window-below-prepare-threshold" });
+  });
+});
+
+describe("auto-compact window setup", () => {
+  function startHost(options: Record<string, number | string | boolean>, initial: { source: string; raw: number }, settings = {}) {
+    const store = new Map<string, unknown>();
+    const runs: Array<{ command: string; args: string }> = [];
+    let effective = { ...initial };
+    const handlers = new Map<string, any>();
+    const on = ((event: string, ...args: unknown[]) => {
+      if (args.length === 1) handlers.set(event, args[0]);
+    }) as On;
+    const $ = {
+      plugin: { root: "/plugin" },
+      session: {
+        cwd: async () => "/repo",
+        id: async () => "window-test",
+        messages: async () => [],
+        usage: async () => ({
+          context: {
+            window: 1_000_000,
+            breakdown: { model: "claude-opus-5-5", rawMaxTokens: effective.raw, autocompactSource: effective.source },
+          },
+        }),
+      },
+      agent: { register: async () => ({}) },
+      command: {
+        register: async () => ({}),
+        run: async (input: { command: string; args: string }) => {
+          runs.push(input);
+          effective = { source: "settings", raw: Number(input.args) };
+          return { text: "set" };
+        },
+      },
+      settings: { read: async () => settings },
+      store: { get: async (key: string) => store.get(key), set: async (key: string, value: unknown) => { store.set(key, value); } },
+      fs: { write: async () => undefined },
+      ui: { log: () => undefined },
+    } as unknown as EngineInterface;
+    register(on, options);
+    return {
+      runs,
+      store,
+      start: () => handlers.get("session.start")!($, { cwd: "/repo" }, async (e: { cwd: string }) => ({ cwd: e.cwd })),
+    };
+  }
+
+  test("sets the window once through /autocompact and remembers the model", async () => {
+    const h = startHost({}, { source: "model-default", raw: 1_000_000 });
+    await h.start();
+    expect(h.runs).toEqual([{ command: "autocompact", args: "190000" }]);
+    expect(h.store.get("autoCompactWindowDecisions")).toEqual({ "claude-opus-5-5": "applied:190000" });
+    await h.start();
+    expect(h.runs.length).toBe(1);
+  });
+
+  test("leaves an existing window alone and records that", async () => {
+    const h = startHost({}, { source: "model-default", raw: 1_000_000 }, { modelSettings: { "claude-opus-5-5": { autoCompactWindow: "auto" } } });
+    await h.start();
+    expect(h.runs.length).toBe(0);
+    expect(h.store.get("autoCompactWindowDecisions")).toEqual({ "claude-opus-5-5": "kept-settings" });
+  });
+
+  test("disabled does nothing and remembers nothing", async () => {
+    const h = startHost({ configureAutoCompactWindow: false }, { source: "model-default", raw: 1_000_000 });
+    await h.start();
+    expect(h.runs.length).toBe(0);
+    expect(h.store.size).toBe(0);
   });
 });
 
@@ -456,9 +568,9 @@ describe("token threshold", () => {
     const h = host();
     await h.append("u1", "user", "task");
     await h.append("a1", "assistant", "answer");
-    await h.measure(159_999, 99);
+    await h.measure(149_999, 99);
     expect(h.spawns).toBe(0);
-    await h.measure(160_000);
+    await h.measure(150_000);
     expect(h.spawns).toBe(1);
   });
 
@@ -613,12 +725,13 @@ describe("engine integration", () => {
     });
     expect(result.text).toContain("shadow-compact: v");
     expect(result.text).toContain("phase=");
-    expect(result.text).toContain("prepare=160000 tokens");
+    expect(result.text).toContain("prepare=150000 tokens");
+    expect(result.text).toContain("autoCompactWindow=");
     expect(result.text).toContain("builder=claude:haiku");
     expect(result.text).toContain("verifier=claude:haiku");
     expect(result.text).toContain("lastFallback=none");
     expect(result.text).toContain("lastCompact=unseen");
-    expect(result.text).toContain("v0.4.0");
+    expect(result.text).toContain("v0.4.1");
   });
 
   test("compact with no checkpoint defers without inventing messages", async ($, on) => {

@@ -4,9 +4,15 @@
  * already filled. Values are re-validated here because stored settings
  * can predate the manifest's options.
  */
-import type { PluginOptions } from "claude-code";
+import type { ContextWindowSource, PluginOptions, Settings } from "claude-code";
 
-export const DEFAULT_PREPARE_THRESHOLD_TOKENS = 160_000;
+export const DEFAULT_PREPARE_THRESHOLD_TOKENS = 150_000;
+/**
+ * Claude Code auto-compact window Shadow sets once per model. The engine
+ * reserves headroom below the window, so compaction lands near ~175k:
+ * the gap above the prepare threshold is checkpoint-preparation time.
+ */
+export const DEFAULT_AUTO_COMPACT_WINDOW_TOKENS = 190_000;
 export const DEFAULT_RECENT_TURNS = 10;
 /** Default checkpoint-agent model: cheap and fast, never the session model. */
 export const DEFAULT_MODEL = "haiku";
@@ -15,6 +21,8 @@ export type ManualCompactMode = "shadow" | "native";
 
 export interface ShadowConfig {
   prepareThresholdTokens: number;
+  autoCompactWindowTokens: number;
+  configureAutoCompactWindow: boolean;
   recentTurns: number;
   builderModel: string;
   verifierModel: string;
@@ -35,6 +43,8 @@ function model(value: unknown): string {
 export function resolveConfig(options: PluginOptions): ShadowConfig {
   return {
     prepareThresholdTokens: positiveInt(options.prepareThresholdTokens, DEFAULT_PREPARE_THRESHOLD_TOKENS),
+    autoCompactWindowTokens: positiveInt(options.autoCompactWindowTokens, DEFAULT_AUTO_COMPACT_WINDOW_TOKENS),
+    configureAutoCompactWindow: options.configureAutoCompactWindow !== false,
     recentTurns: positiveInt(options.recentTurns, DEFAULT_RECENT_TURNS),
     builderModel: model(options.builderModel),
     verifierModel: model(options.verifierModel),
@@ -54,4 +64,49 @@ export interface ThresholdUsage {
 
 export function isAtOrAbove(usage: ThresholdUsage, thresholdTokens: number): boolean {
   return typeof usage.tokens === "number" && Number.isFinite(usage.tokens) && usage.tokens >= thresholdTokens;
+}
+
+export interface WindowFacts {
+  /** The session model's id, as the context breakdown names it. */
+  model: string;
+  /** The model's full context window. */
+  modelWindow: number;
+  source: ContextWindowSource;
+  /** The merged settings, read for an explicit window (`auto` included). */
+  settings: Settings;
+  /** Shadow already decided this model's window in an earlier session. */
+  decidedBefore: boolean;
+}
+
+export type WindowDecision =
+  | { apply: true }
+  | { apply: false; reason: string; /** Remember so later sessions leave it. */ final: boolean };
+
+function hasExplicitWindow(settings: Settings, model: string): boolean {
+  if (settings.autoCompactWindow !== undefined) return true;
+  const perModel = settings.modelSettings;
+  if (typeof perModel !== "object" || perModel === null) return false;
+  const entry = (perModel as Record<string, unknown>)[model];
+  return typeof entry === "object" && entry !== null && "autoCompactWindow" in entry;
+}
+
+/**
+ * Whether Shadow should set Claude Code's auto-compact window for this
+ * model: once, and never over a window the person, an env override or
+ * managed settings already chose.
+ */
+export function decideAutoCompactWindow(config: ShadowConfig, facts: WindowFacts): WindowDecision {
+  if (!config.configureAutoCompactWindow) return { apply: false, reason: "disabled", final: false };
+  if (facts.decidedBefore) return { apply: false, reason: "decided-before", final: true };
+  if (facts.source === "env") return { apply: false, reason: "kept-env", final: true };
+  if (facts.source === "settings" || hasExplicitWindow(facts.settings, facts.model)) {
+    return { apply: false, reason: "kept-settings", final: true };
+  }
+  if (config.autoCompactWindowTokens <= config.prepareThresholdTokens) {
+    return { apply: false, reason: "window-below-prepare-threshold", final: false };
+  }
+  if (config.autoCompactWindowTokens >= facts.modelWindow) {
+    return { apply: false, reason: "model-window-smaller", final: false };
+  }
+  return { apply: true };
 }

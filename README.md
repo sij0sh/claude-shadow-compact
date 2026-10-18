@@ -79,7 +79,7 @@ Coverage through E0031. Builder + verifier; fails closed to native.
 
 ```text
 session.append ──► durable evidence archive (sanitized, stable evidence ids)
-session.measure ≥160k tokens ──► private builder agent (Read/Grep on the archive)
+session.measure ≥150k tokens ──► private builder agent (Read/Grep on the archive)
                       ──► private verifier agent (independent re-read)
                       ──► validated checkpoint published (in memory)
 Claude's /compact or auto-compaction ──► session.compact hook
@@ -117,12 +117,17 @@ no/unproven checkpoint ──► next(e): Claude native compaction (fail closed)
   an install. It counts once canonical history (`$.session.messages()`)
   opens with that checkpoint's coverage line; `/shadow-status` shows
   `phase=installing` until then and `lastCompact` records every decision.
-- **Thresholds.** Background checkpoint preparation starts at 160,000
-  context tokens (absolute, independent of the context window). Set
-  Claude Code's `autoCompactWindow` (or `CLAUDE_CODE_AUTO_COMPACT_WINDOW`)
-  so auto-compaction fires comfortably above that, for example around
-  250,000 tokens, leaving preparation time to finish. Check the effective
-  point in your Claude Code version. A failed preparation is not retried
+- **Thresholds.** Background checkpoint preparation starts at 150,000
+  context tokens (absolute, independent of the context window). On each
+  model's first session Shadow sets Claude Code's auto-compact window to
+  190,000 through `/autocompact` (it applies at once and is saved under
+  `modelSettings` in your user settings), so engine compaction lands near
+  175,000 and preparation has the gap to finish. Shadow leaves the window
+  alone when one is already chosen: `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, a
+  settings `autoCompactWindow` (including `auto`), or managed settings.
+  It decides once per model and remembers that, so a later
+  `/autocompact` of yours is never overwritten; `/shadow-status` shows
+  the outcome as `autoCompactWindow=`. A failed preparation is not retried
   until the next compaction or a manual `/shadow-compact`. Rolling refresh
   re-arms after a Shadow install followed by below-checkpoint context, or
   after native compaction.
@@ -145,7 +150,7 @@ Or, from a local checkout, load it for one session with
 |---|---|
 | `/shadow-compact` | Start background preparation now (honest when history is too short); run `/compact` to install a ready checkpoint |
 | `/compact-native` | Run Claude Code native compaction once, bypassing Shadow |
-| `/shadow-status` | Version, phase, archive size, checkpoint coverage, installs, threshold, last fallback, last compaction decision |
+| `/shadow-status` | Version, phase, archive size, checkpoint coverage, installs, threshold, auto-compact window outcome, last fallback, last compaction decision |
 | `/shadow-export` | Print the verified checkpoint for manual copy-paste |
 
 ## Configuration
@@ -155,14 +160,16 @@ Set via the plugin's `userConfig` (Claude Code `/config` or
 
 | Setting | Default | Behavior |
 |---|---|---|
-| `prepareThresholdTokens` | `160000` | Start background checkpoint preparation |
+| `prepareThresholdTokens` | `150000` | Start background checkpoint preparation |
+| `configureAutoCompactWindow` | `true` | Set Claude Code's auto-compact window once per model unless one is already chosen |
+| `autoCompactWindowTokens` | `190000` | The window Shadow sets; must exceed `prepareThresholdTokens` and be below the model's context window |
 | `recentTurns` | `10` | Minimum recent turns kept verbatim |
 | `builderModel` / `verifierModel` | `haiku` | Checkpoint agent models; `inherit` uses the session model |
 | `manualCompactMode` | `shadow` | `shadow` or `native` for manual `/compact` |
 
-The token threshold must be a positive safe integer; invalid values use the
-default. The former `hardThresholdTokens` setting is gone (use Claude Code's
-`autoCompactWindow`), as are the older percentage settings.
+Token settings must be positive safe integers; invalid values use the
+default. The former `hardThresholdTokens` setting is gone (Shadow now sets
+Claude Code's `autoCompactWindow`), as are the older percentage settings.
 
 Builder and verifier run as private Claude agents with file access to the paged evidence archive. When agents are unavailable the pipeline retries with `model.complete` on inline evidence, then fails closed to native compaction. Agent spawn failures are logged at debug level without prompt contents, and `/shadow-status` shows the resolved model per role plus the last fallback reason.
 
@@ -180,7 +187,7 @@ claude plugin marketplace update claude-shadow-compact
 claude plugin update shadow-compact@claude-shadow-compact
 ```
 
-`/shadow-status` shows the running version (`v0.4.0`).
+`/shadow-status` shows the running version (`v0.4.1`).
 
 ## Deferred from the Pi version
 

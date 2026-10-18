@@ -1,6 +1,6 @@
 {
   "name": "shadow-compact",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Verified-checkpoint compaction for Claude Code: a private builder and independent verifier prepare an evidence-grounded checkpoint in the background, and Claude Code's own /compact or auto-compaction installs it through session.compact with the exact recent tail preserved by handle.",
   "author": {
     "name": "pi-shadow-compact port"
@@ -9,8 +9,20 @@
     "prepareThresholdTokens": {
       "type": "number",
       "title": "Checkpoint threshold (tokens)",
-      "description": "Absolute context token count at which background checkpoint preparation starts. Must be a positive integer; keep it well below Claude Code's auto-compaction point so the checkpoint is ready in time.",
-      "default": 160000
+      "description": "Absolute context token count at which background checkpoint preparation starts. Must be a positive integer below the auto-compact window so the checkpoint is ready before Claude Code compacts.",
+      "default": 150000
+    },
+    "configureAutoCompactWindow": {
+      "type": "boolean",
+      "title": "Set Claude's auto-compact window",
+      "description": "On a model's first session, set Claude Code's auto-compact window (as /autocompact does, saved per model) unless a window is already chosen in settings or CLAUDE_CODE_AUTO_COMPACT_WINDOW.",
+      "default": true
+    },
+    "autoCompactWindowTokens": {
+      "type": "number",
+      "title": "Auto-compact window (tokens)",
+      "description": "Window Shadow sets for Claude Code auto-compaction. The engine compacts somewhat below it (~175k for 190k); keep it above the checkpoint threshold.",
+      "default": 190000
     },
     "recentTurns": {
       "type": "number",

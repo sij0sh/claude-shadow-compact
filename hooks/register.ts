@@ -12,7 +12,8 @@
  * Shadow never starts a compaction itself: `$.session.compact()` runs
  * every hook but the caller's, so a self-started compaction would skip
  * this mod's replacement. Claude Code's own `/compact` and auto-compaction
- * (tune it with `autoCompactWindow`) are the install boundaries.
+ * are the install boundaries; on a model's first session Shadow sets its
+ * auto-compact window through `/autocompact` unless one is already chosen.
  *
  * Deferred from the Pi version (spec §10): request-local mid-turn swaps
  * (Claude pins the transcript in `turn.step`) and native-summarizer
@@ -29,7 +30,13 @@ import type {
   SessionMessage,
 } from "claude-code";
 import { CHECKPOINT_HEADING, coverageLine } from "./checkpoint.js";
-import { describeModel, isAtOrAbove, resolveConfig, type ShadowConfig } from "./config.js";
+import {
+  decideAutoCompactWindow,
+  describeModel,
+  isAtOrAbove,
+  resolveConfig,
+  type ShadowConfig,
+} from "./config.js";
 import { EvidenceArchive } from "./evidence.js";
 import {
   BUILDER_SYSTEM_PROMPT,
@@ -45,10 +52,13 @@ const VERIFIER_TYPE = "shadow-compact:checkpoint-verifier";
 const AGENT_TIMEOUT_MS = 600_000;
 
 /** Running plugin version shown in status; bump with the manifest. */
-const PLUGIN_VERSION = "0.4.0";
+const PLUGIN_VERSION = "0.4.1";
 
 /** Inline evidence cap for the model.complete fallback. */
 const INLINE_EVIDENCE_CHARS = 120_000;
+
+/** Store key: model id -> what Shadow decided for its auto-compact window. */
+const WINDOW_DECISIONS_KEY = "autoCompactWindowDecisions";
 
 /** Index slot for a compaction's summary row until its append names it. */
 const SUMMARY_PLACEHOLDER = "compaction-summary";
@@ -71,6 +81,8 @@ interface Runtime {
   lastFallback: string | null;
   /** Last main-loop compaction decision for status; null until one is seen. */
   lastCompact: string | null;
+  /** This session's auto-compact window outcome for status. */
+  autoCompactWindow: string | null;
 }
 
 function createRuntime(config: ShadowConfig): Runtime {
@@ -87,6 +99,7 @@ function createRuntime(config: ShadowConfig): Runtime {
     lastCompactionRowId: null,
     lastFallback: null,
     lastCompact: null,
+    autoCompactWindow: null,
   };
 }
 
@@ -292,6 +305,54 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
   }
 }
 
+/**
+ * Sets Claude Code's auto-compact window once per model so engine
+ * compaction lands after Shadow's prepare threshold. `/autocompact`
+ * applies to the running session and saves under `modelSettings`; an
+ * existing env, settings or managed window is left as it is.
+ */
+async function configureAutoCompactWindow($: EngineInterface, rt: Runtime): Promise<void> {
+  try {
+    const usage = await $.session.usage({ breakdown: "summary" });
+    const breakdown = usage.context.breakdown;
+    if (!breakdown) {
+      rt.autoCompactWindow = "unknown:no-breakdown";
+      return;
+    }
+    const stored = await $.store.get(WINDOW_DECISIONS_KEY);
+    const decisions: Record<string, string> =
+      typeof stored === "object" && stored !== null ? { ...(stored as Record<string, string>) } : {};
+    const model = breakdown.model;
+    const decision = decideAutoCompactWindow(rt.config, {
+      model,
+      modelWindow: usage.context.window,
+      source: breakdown.autocompactSource,
+      settings: await $.settings.read(),
+      decidedBefore: model in decisions,
+    });
+    const effective = `${breakdown.rawMaxTokens} (${breakdown.autocompactSource})`;
+    if (!decision.apply) {
+      rt.autoCompactWindow = `${decision.reason} ${effective}`;
+      if (decision.final && !(model in decisions)) {
+        await $.store.set(WINDOW_DECISIONS_KEY, { ...decisions, [model]: decision.reason });
+      }
+      return;
+    }
+    const requested = rt.config.autoCompactWindowTokens;
+    await $.command.run({ command: "autocompact", args: String(requested) });
+    const after = (await $.session.usage({ breakdown: "summary" })).context.breakdown;
+    if (after?.autocompactSource !== "settings" || after.rawMaxTokens !== requested) {
+      rt.autoCompactWindow = `unconfirmed requested=${requested} effective=${after ? `${after.rawMaxTokens} (${after.autocompactSource})` : "unknown"}`;
+      return;
+    }
+    await $.store.set(WINDOW_DECISIONS_KEY, { ...decisions, [model]: `applied:${requested}` });
+    rt.autoCompactWindow = `applied ${requested} (settings)`;
+  } catch (error) {
+    rt.autoCompactWindow = `failed:${oneLine(error)}`;
+    $.ui.log(`shadow-compact: auto-compact window not configured (${oneLine(error)})`, { to: "debug" });
+  }
+}
+
 function statusText(rt: Runtime): string {
   const published = rt.state.published;
   return [
@@ -302,6 +363,7 @@ function statusText(rt: Runtime): string {
       : "checkpoint=none",
     `installs=${rt.state.installCount}`,
     `prepare=${rt.config.prepareThresholdTokens} tokens recentTurns=${rt.config.recentTurns}`,
+    `autoCompactWindow=${rt.autoCompactWindow ?? "unseen"}`,
     `builder=${describeModel(rt.config.builderModel)}`,
     `verifier=${describeModel(rt.config.verifierModel)}`,
     `lastFallback=${rt.lastFallback ?? "none"}`,
@@ -357,7 +419,9 @@ export const register: Register = (on, options) => {
     await $.command
       .register({ name: "shadow-export", description: "Print the verified checkpoint for manual copy-paste" })
       .catch(() => undefined);
-    return next(e);
+    const result = await next(e);
+    await configureAutoCompactWindow($, rt);
+    return result;
   });
 
   // The acting model never sees the private checkpoint agents.
@@ -493,6 +557,7 @@ export const register: Register = (on, options) => {
     rt.lastCompactionRowId = null;
     rt.lastFallback = null;
     rt.lastCompact = null;
+    rt.autoCompactWindow = null;
     return result;
   });
 };
