@@ -64,7 +64,7 @@ Completion requirements — before answering you MUST have:
 - inspected every required turn: ${manifest.requiredTurnIds.join(", ") || "(none)"}
 - inspected all turns since the previous checkpoint
 - inspected every error turn flagged in the manifest
-- confirmed coverageEndEntryId: the entryId of the last session row your checkpoint represents
+- confirmed coverageEndEntryId: the entryId of the last user or assistant row your checkpoint represents
 
 Rules:
 - Preserve exact identifiers when continuation depends on them: file paths, symbols, commands, flags, versions, URLs, error text, literal values, and API names.
@@ -148,8 +148,13 @@ function parseSubmission(
   if (typeof parsed.coverageEndEntryId !== "string" || parsed.coverageEndEntryId === "") {
     throw new Error("coverageEndEntryId must name the last covered session row");
   }
-  if (archive.indexOf(parsed.coverageEndEntryId) < 0) {
+  const covered = archive.rows[archive.indexOf(parsed.coverageEndEntryId)];
+  if (!covered) {
     throw new Error(`coverageEndEntryId is not a session row: ${parsed.coverageEndEntryId}`);
+  }
+  // Notices and attachments are absent from the transcript compaction sees.
+  if (!covered.role) {
+    throw new Error(`coverageEndEntryId must name a user or assistant row, not ${covered.door}`);
   }
   return { checkpoint, coverageEndEntryId: parsed.coverageEndEntryId };
 }
@@ -253,7 +258,7 @@ export async function prepareCheckpoint(
   const verified = await runVerifier(ask, archive, draft, evidenceAccess, models.verifier);
   return {
     structured: verified.checkpoint,
-    rendered: renderCheckpoint(verified.checkpoint),
+    rendered: renderCheckpoint(verified.checkpoint, verified.coverageEndEntryId),
     coverageEndEntryId: verified.coverageEndEntryId,
   };
 }

@@ -8,11 +8,6 @@
 
 export const CHARS_PER_TOKEN = 4;
 
-export function tokensToChars(tokens: number): number {
-  if (!Number.isFinite(tokens) || tokens <= 0) return 0;
-  return Math.floor(tokens) * CHARS_PER_TOKEN;
-}
-
 export function estimateTokens(text: string): number {
   if (!text) return 0;
   return Math.max(1, Math.ceil(text.length / CHARS_PER_TOKEN));

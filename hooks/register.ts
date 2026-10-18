@@ -9,6 +9,11 @@
  *   to native compaction (`next(e)`) whenever coverage cannot be proven
  * - `/shadow-compact`, `/compact-native`, `/shadow-status` commands
  *
+ * Shadow never starts a compaction itself: `$.session.compact()` runs
+ * every hook but the caller's, so a self-started compaction would skip
+ * this mod's replacement. Claude Code's own `/compact` and auto-compaction
+ * (tune it with `autoCompactWindow`) are the install boundaries.
+ *
  * Deferred from the Pi version (spec §10): request-local mid-turn swaps
  * (Claude pins the transcript in `turn.step`) and native-summarizer
  * token-cap recovery (no stable signal in the compact result).
@@ -17,14 +22,14 @@
  * validator statically follows `$` only into top-level or imported
  * functions, never into closures capturing it.
  */
-import type { EngineInterface, Register, SessionMessage } from "claude-code";
-import { currentPromptVersions } from "./checkpoint.js";
-import {
-  describeModel,
-  isAtOrAbove,
-  resolveConfig,
-  type ShadowConfig,
-} from "./config.js";
+import type {
+  EngineInterface,
+  Register,
+  SessionCompactResult,
+  SessionMessage,
+} from "claude-code";
+import { CHECKPOINT_HEADING, coverageLine } from "./checkpoint.js";
+import { describeModel, isAtOrAbove, resolveConfig, type ShadowConfig } from "./config.js";
 import { EvidenceArchive } from "./evidence.js";
 import {
   BUILDER_SYSTEM_PROMPT,
@@ -40,13 +45,13 @@ const VERIFIER_TYPE = "shadow-compact:checkpoint-verifier";
 const AGENT_TIMEOUT_MS = 600_000;
 
 /** Running plugin version shown in status; bump with the manifest. */
-const PLUGIN_VERSION = "0.3.0";
-
-/** Max persisted transcript index entries; ids only, never text. */
-const MAX_PERSISTED_INDEX = 2000;
+const PLUGIN_VERSION = "0.4.0";
 
 /** Inline evidence cap for the model.complete fallback. */
 const INLINE_EVIDENCE_CHARS = 120_000;
+
+/** Index slot for a compaction's summary row until its append names it. */
+const SUMMARY_PLACEHOLDER = "compaction-summary";
 
 interface Runtime {
   config: ShadowConfig;
@@ -54,17 +59,18 @@ interface Runtime {
   sessionId: string;
   cwd: string;
   archive: EvidenceArchive | undefined;
-  /** Transcript message order as archive row ids; `native-summary` and
-   * `unknown-N` placeholders keep indexes honest across native compactions. */
+  /** Transcript message order as archive row ids; `unknown-N` marks a
+   * message no append named, so coverage on it can never be proven. */
   messageRowIds: string[];
   bootstrapped: boolean;
   pendingAnswers: Map<string, (answer: string) => void>;
-  installScheduled: boolean;
-  hardLimitReached: boolean;
-  /** Last fallback reason class for status; memory only, never prompt text. */
+  /** A compaction this mod saw is waiting for its summary row's append. */
+  awaitingCompactionRow: boolean;
+  lastCompactionRowId: string | null;
+  /** Last preparation fallback/failure for status; never prompt text. */
   lastFallback: string | null;
-  /** True once a main-loop session.compact dispatch has been observed. */
-  compactHookSeen: boolean;
+  /** Last main-loop compaction decision for status; null until one is seen. */
+  lastCompact: string | null;
 }
 
 function createRuntime(config: ShadowConfig): Runtime {
@@ -77,10 +83,10 @@ function createRuntime(config: ShadowConfig): Runtime {
     messageRowIds: [],
     bootstrapped: false,
     pendingAnswers: new Map(),
-    installScheduled: false,
-    hardLimitReached: false,
+    awaitingCompactionRow: false,
+    lastCompactionRowId: null,
     lastFallback: null,
-    compactHookSeen: false,
+    lastCompact: null,
   };
 }
 
@@ -97,59 +103,77 @@ async function ensureSession($: EngineInterface, rt: Runtime): Promise<EvidenceA
       rt.archive.bootstrap(messages);
       rt.messageRowIds = rt.archive.rows.map((row) => row.id);
     }
-    await restore($, rt);
-    try {
-      const raw = await $.store.get(indexKey(rt.sessionId));
-      if (Array.isArray(raw) && raw.every((entry) => typeof entry === "string")) {
-        const ids = raw as string[];
-        // Only adopt a stored index when we have no live one yet; live
-        // appends after reload win over the snapshot.
-        if (rt.messageRowIds.length === 0 && ids.length > 0) {
-          rt.messageRowIds = ids.slice(-MAX_PERSISTED_INDEX);
-        }
-      }
-    } catch {
-      // A broken index entry must never block the session.
-    }
   }
   return rt.archive;
 }
 
-async function restore($: EngineInterface, rt: Runtime): Promise<void> {
-  try {
-    const raw = await $.store.get(`checkpoint:${rt.sessionId}`);
-    if (!raw || typeof raw !== "object") return;
-    const saved = raw as PublishedCheckpoint;
-    if (saved.sessionId !== rt.sessionId || !saved.coverage || !saved.rendered) return;
-    if (!rt.archive) return;
-    if (rt.archive.indexOf(saved.coverage.coverageEndEntryId) < 0) {
-      // After reload/resume the archive is rebuilt with synthetic
-      // bootstrap ids, so the uuid can miss while the position still
-      // matches. Keep the checkpoint when the saved index is in range;
-      // session.compact re-anchors by position and otherwise fails closed.
-      const at = saved.coverageMessageIndex;
-      if (typeof at !== "number" || at < 0 || at >= rt.archive.size) {
-        rt.state.rearm();
-        return;
-      }
-    }
-    rt.state.restorePublished(saved);
-    rt.archive.setPreviousCheckpoint(saved.rendered, saved.coverage.coverageEndEntryId);
-  } catch {
-    // A broken store entry must never block the session.
+/** A compaction row arrived: name the summary slot, or drop an index a
+ * compaction this mod never saw has invalidated. */
+function noteCompactionRow(rt: Runtime, uuid: string): void {
+  rt.lastCompactionRowId = uuid;
+  if (rt.awaitingCompactionRow) {
+    rt.awaitingCompactionRow = false;
+    rt.messageRowIds[0] = uuid;
+    return;
   }
+  rt.messageRowIds = [uuid];
+  rt.state.discardPublished();
 }
 
-function indexKey(sessionId: string): string {
-  return `shadow-index:${sessionId}`;
+/**
+ * Runs a native compaction and rebuilds the index for its result:
+ * messages kept by handle keep their row ids, the summary (first,
+ * handle-less) takes the compaction row once its append names it.
+ */
+async function compactNatively(
+  rt: Runtime,
+  before: readonly SessionMessage[],
+  run: () => Promise<SessionCompactResult>,
+): Promise<SessionCompactResult> {
+  const byHandle = new Map<string, string>();
+  if (before.length === rt.messageRowIds.length) {
+    before.forEach((message, index) => {
+      if (message.handle) byHandle.set(message.handle, rt.messageRowIds[index]!);
+    });
+  }
+  rt.awaitingCompactionRow = true;
+  const summaryRowBefore = rt.lastCompactionRowId;
+  const result = await run().catch((error: unknown) => {
+    rt.awaitingCompactionRow = false;
+    throw error;
+  });
+  if (!result.messages) {
+    rt.awaitingCompactionRow = false;
+    return result;
+  }
+  // The summary row may already have appended while core compacted.
+  let summary = SUMMARY_PLACEHOLDER;
+  if (rt.lastCompactionRowId !== summaryRowBefore) {
+    summary = rt.lastCompactionRowId!;
+    rt.awaitingCompactionRow = false;
+  }
+  rt.messageRowIds = result.messages.map(
+    (message, index) =>
+      (message.handle && byHandle.get(message.handle)) ||
+      (index === 0 ? summary : `unknown-${index}`),
+  );
+  // Native summarized what the checkpoint covered: prepare afresh.
+  rt.state.discardPublished();
+  rt.state.rearm();
+  return result;
 }
 
-async function persistIndex($: EngineInterface, rt: Runtime): Promise<void> {
-  try {
-    const tail = rt.messageRowIds.slice(-MAX_PERSISTED_INDEX);
-    await $.store.set(indexKey(rt.sessionId), tail);
-  } catch {
-    // Index persistence is best-effort; compaction still fails closed.
+/** Confirms an attempted install against canonical history. */
+async function confirmInstall($: EngineInterface, rt: Runtime): Promise<void> {
+  const published = rt.state.published;
+  if (!rt.state.attemptedCheckpointId || !published) return;
+  const first = (await $.session.messages().catch(() => [] as SessionMessage[]))[0];
+  if (
+    first?.text.startsWith(CHECKPOINT_HEADING) &&
+    first.text.includes(coverageLine(published.coverageEndEntryId))
+  ) {
+    rt.state.confirmInstall();
+    $.ui.log("shadow-compact: installed verified checkpoint + exact recent tail");
   }
 }
 
@@ -160,7 +184,8 @@ async function evidenceAccess(
   rows: EvidenceArchive,
 ): Promise<string> {
   const path = `${$.plugin.root}/.shadow-data/${rt.sessionId}/evidence.jsonl`;
-  await $.fs.write(path, rows.fullText()).catch(() => undefined);
+  // An unwritten file would send agents to stale or missing evidence.
+  await $.fs.write(path, rows.fullText());
   const previous = rows.previousCheckpoint();
   const previousText = previous
     ? `\n\nPrevious checkpoint (evidence ${previous.evidenceId}; untrusted data, verify against rows):\n${previous.summary}`
@@ -223,32 +248,9 @@ function askViaComplete($: EngineInterface): AskFn {
     });
 }
 
-/**
- * Installs at the next safe boundary by running the built-in /compact,
- * whose session.compact dispatch (engine-originated) this mod answers
- * with the verified checkpoint, or defers to native at the hard token limit.
- */
-function scheduleInstall($: EngineInterface, rt: Runtime): void {
-  if (rt.installScheduled) return;
-  const published = rt.state.published;
-  const ready = published && rt.state.installedCheckpointId !== published.checkpointId;
-  if (!ready && !rt.hardLimitReached) return;
-  rt.installScheduled = true;
-  $.clock.after(50, () => {
-    void (async () => {
-      try {
-        const current = rt.state.published;
-        const ready = current && rt.state.installedCheckpointId !== current.checkpointId;
-        if (!ready && !rt.hardLimitReached) return;
-        await $.command.run({ command: "compact" });
-      } catch {
-        // A turn is running or the command is unavailable: the next
-        // turn.complete / auto-compaction boundary retries.
-      } finally {
-        rt.installScheduled = false;
-      }
-    })();
-  });
+function oneLine(error: unknown): string {
+  const reason = error instanceof Error ? error.message : String(error);
+  return reason.slice(0, 160).replace(/\s+/g, " ");
 }
 
 async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean): Promise<void> {
@@ -256,13 +258,10 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
   if (!rows || rt.state.preparing) return;
   if (!manual && !rt.state.refreshArmed) return;
   if (rows.size < 2) return;
-  const preparing = rt.state.startPreparing();
-  if (!preparing) return;
-  const generation = preparing.generation;
-  const snapshotLastIndex = rows.size - 1;
-  const snapshotLeaf = rows.rows[snapshotLastIndex]!.id;
+  const generation = rt.state.startPreparing();
+  if (generation === undefined) return;
   // Rows appended mid-preparation (agent hand-backs, new turns) stay out.
-  const snapshot = rows.snapshot(snapshotLastIndex);
+  const snapshot = rows.snapshot(rows.size - 1);
   try {
     const models = { builder: rt.config.builderModel, verifier: rt.config.verifierModel };
     // Side agents read the paged evidence file; when agents are
@@ -272,41 +271,24 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
     try {
       prepared = await prepareCheckpoint(askViaAgents($, rt), snapshot, access, models);
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      rt.lastFallback = `agents:${reason.slice(0, 160).replace(/\s+/g, " ")}`;
+      rt.lastFallback = `agents:${oneLine(error)}`;
       prepared = await prepareCheckpoint(askViaComplete($), snapshot, inlineEvidence(snapshot), models);
-    }
-    if (rows.indexOf(prepared.coverageEndEntryId) > snapshotLastIndex) {
-      throw new Error("Coverage boundary is past the inspected snapshot");
     }
     const checkpoint: PublishedCheckpoint = {
       checkpointId: `shadow-${generation}-${prepared.coverageEndEntryId}`,
-      sessionId: rt.sessionId,
-      structured: prepared.structured,
       rendered: prepared.rendered,
-      coverage: {
-        sourceStartEntryId: rows.rows[0]?.id ?? null,
-        coverageEndEntryId: prepared.coverageEndEntryId,
-        preparedAtLeafId: snapshotLeaf,
-        publishedAtLeafId: rows.rows[rows.size - 1]?.id ?? snapshotLeaf,
-      },
-      generatedAt: Date.now(),
-      prompts: currentPromptVersions(),
-      coverageMessageIndex: rt.messageRowIds.indexOf(prepared.coverageEndEntryId),
+      coverageEndEntryId: prepared.coverageEndEntryId,
     };
     if (rt.state.publish(generation, checkpoint)) {
-      await $.store.set(`checkpoint:${rt.sessionId}`, checkpoint).catch(() => undefined);
-      void persistIndex($, rt);
-      rows.setPreviousCheckpoint(checkpoint.rendered, checkpoint.coverage.coverageEndEntryId);
-      $.ui.log(`shadow-compact: verified checkpoint ready (covers ${prepared.coverageEndEntryId})`);
-      scheduleInstall($, rt);
+      rows.setPreviousCheckpoint(checkpoint.rendered, checkpoint.coverageEndEntryId);
+      $.ui.log(
+        `shadow-compact: verified checkpoint ready (covers ${prepared.coverageEndEntryId}); it installs at the next /compact or auto-compaction`,
+      );
     }
   } catch (error) {
     rt.state.fail(generation);
-    $.ui.log(
-      `shadow-compact: preparation failed (${error instanceof Error ? error.message : String(error)})`,
-      { to: "debug" },
-    );
+    rt.lastFallback = `failed:${oneLine(error)}`;
+    $.ui.log(`shadow-compact: preparation failed (${oneLine(error)})`, { to: "debug" });
   }
 }
 
@@ -316,13 +298,14 @@ function statusText(rt: Runtime): string {
     `shadow-compact: v${PLUGIN_VERSION} phase=${rt.state.phase}`,
     `archive rows=${rt.archive?.size ?? 0}`,
     published
-      ? `checkpoint=${published.checkpointId} coverage=${published.coverage.coverageEndEntryId} installs=${rt.state.installCount}`
+      ? `checkpoint=${published.checkpointId} coverage=${published.coverageEndEntryId}`
       : "checkpoint=none",
-    `thresholds prepare=${rt.config.prepareThresholdTokens} tokens hard=${rt.config.hardThresholdTokens} tokens recentTurns=${rt.config.recentTurns}`,
+    `installs=${rt.state.installCount}`,
+    `prepare=${rt.config.prepareThresholdTokens} tokens recentTurns=${rt.config.recentTurns}`,
     `builder=${describeModel(rt.config.builderModel)}`,
     `verifier=${describeModel(rt.config.verifierModel)}`,
     `lastFallback=${rt.lastFallback ?? "none"}`,
-    `compact-hook=${rt.compactHookSeen ? "seen" : "unseen"}`,
+    `lastCompact=${rt.lastCompact ?? "unseen"}`,
   ].join(" · ");
 }
 
@@ -363,7 +346,7 @@ export const register: Register = (on, options) => {
       })
       .catch(() => undefined);
     await $.command
-      .register({ name: "shadow-compact", description: "Prepare or install the verified Shadow checkpoint" })
+      .register({ name: "shadow-compact", description: "Prepare the verified Shadow checkpoint now" })
       .catch(() => undefined);
     await $.command
       .register({ name: "compact-native", description: "Run Claude Code native compaction once, bypassing Shadow" })
@@ -385,125 +368,98 @@ export const register: Register = (on, options) => {
     const result = await next(e);
     if (!e.agentId && result.uuid && result.message) {
       const rows = await ensureSession($, rt);
-      rows.addAppend(result.uuid, e.door, result.message, e.origin.kind);
-      if (result.message.role) {
-        if (e.door === "compaction") rt.messageRowIds = [result.uuid];
+      // A replayed uuid is already archived and indexed.
+      const added = rows.addAppend(result.uuid, e.door, result.message, e.origin.kind);
+      if (added && result.message.role) {
+        const isCheckpointRow =
+          rt.awaitingCompactionRow && rows.rows[rows.size - 1]!.text.startsWith(CHECKPOINT_HEADING);
+        if (e.door === "compaction" || isCheckpointRow) noteCompactionRow(rt, result.uuid);
         else rt.messageRowIds.push(result.uuid);
-        void persistIndex($, rt);
       }
     }
     return result;
   });
 
-  on("turn.complete", async ($, e, next) => {
+  on("turn.complete", async (_$, e, next) => {
     if (e.agentId) {
       rt.pendingAnswers.get(e.agentId)?.(e.answer);
       rt.pendingAnswers.delete(e.agentId);
-      return next(e);
     }
-    await ensureSession($, rt);
-    // Retry at a safe boundary for a ready checkpoint or the hard token limit.
-    scheduleInstall($, rt);
     return next(e);
   });
 
   on("session.measure", async ($, e, next) => {
     await ensureSession($, rt);
+    await confirmInstall($, rt);
     const tokens = e.context.tokens;
     if (typeof tokens === "number" && Number.isFinite(tokens)) {
-      rt.hardLimitReached = isAtOrAbove(e.context, rt.config.hardThresholdTokens);
-      if (
-        rt.state.published &&
-        rt.state.installedCheckpointId === rt.state.published.checkpointId &&
-        tokens < rt.config.prepareThresholdTokens
-      ) {
+      if (rt.state.phase === "installed" && tokens < rt.config.prepareThresholdTokens) {
         rt.state.rearm();
       }
-      if (isAtOrAbove(e.context, rt.config.prepareThresholdTokens) && !rt.state.preparing) {
+      if (isAtOrAbove(e.context, rt.config.prepareThresholdTokens)) {
         void runPreparation($, rt, false);
       }
-      // Request our own compaction independently of Claude's auto threshold.
-      // The command can fail during a turn; turn.complete retries it.
-      if (rt.hardLimitReached) scheduleInstall($, rt);
     }
     return next(e);
   });
 
   on("session.compact", async ($, e, next) => {
+    if (e.agentId) return next(e);
+    // A precomputed result is speculative and could later stand in for
+    // the live compaction; Shadow decides only on live compactions.
+    if (e.trigger === "precompute") return { skip: "Shadow Compact decides at live compaction" };
     await ensureSession($, rt);
-    if (!e.agentId) rt.compactHookSeen = true;
-    // Native path helper: after any core compaction, realign the
-    // transcript index with placeholders so later coverage math fails
-    // closed or counts indexes honestly.
-    const native = async () => {
-      const result = await next(e);
-      if (result.messages && !e.agentId && e.trigger !== "precompute") {
-        rt.hardLimitReached = false;
-        rt.state.rearm();
-        rt.messageRowIds = result.messages.map((_, index) =>
-          index === 0 ? "native-summary" : `unknown-${index}`,
-        );
-        void persistIndex($, rt);
-      }
-      return result;
+    await confirmInstall($, rt);
+    if (rt.state.attemptedCheckpointId) {
+      rt.state.rejectInstall();
+      rt.lastFallback = "install-unconfirmed";
+    }
+    const native = (reason: string) => {
+      rt.lastCompact = `trigger=${e.trigger} native:${reason}`;
+      $.ui.log(`shadow-compact: ${rt.lastCompact}`, { to: "debug" });
+      return compactNatively(rt, e.messages, () => next(e));
     };
-    if (e.agentId) return native();
-    if (rt.state.consumeNativeBypass()) return native();
-    if (rt.config.manualCompactMode === "native" && e.trigger === "manual") return native();
+    if (rt.config.manualCompactMode === "native" && e.trigger === "manual") return native("manual-mode");
     const published = rt.state.published;
-    if (!published) return native();
-    if (rt.messageRowIds.length !== e.messages.length) return native();
-    let coveredIndex = rt.messageRowIds.indexOf(published.coverage.coverageEndEntryId);
+    if (!published) return native("no-checkpoint");
+    if (rt.messageRowIds.length !== e.messages.length) return native("index-misaligned");
+    // Coverage is proven only by the covered row's uuid in the live index.
+    const coveredIndex = rt.messageRowIds.indexOf(published.coverageEndEntryId);
     if (coveredIndex < 0) {
-      // Reload/resume rebuilds the archive with synthetic ids, so the
-      // uuid can miss while the saved position still matches. Re-anchor
-      // by position only when lengths agree and the index is in range.
-      const at = published.coverageMessageIndex;
-      if (typeof at !== "number" || at < 0 || at >= e.messages.length) {
-        rt.state.discardPublished();
-        return native();
-      }
-      coveredIndex = at;
+      rt.state.discardPublished();
+      return native("coverage-unproven");
     }
     const built = buildCandidate(e.messages, coveredIndex, rt.config.recentTurns, published.rendered);
-    if (isSkipped(built) || !built.messages) return native();
-    if (e.trigger !== "precompute") {
-      rt.hardLimitReached = false;
-      rt.state.markInstalled();
-      rt.state.clearPendingNativeFallback();
-      rt.messageRowIds = [
-        `checkpoint:${published.checkpointId}`,
-        ...rt.messageRowIds.slice(built.tailStart),
-      ];
-      rt.archive?.setPreviousCheckpoint(published.rendered, published.coverage.coverageEndEntryId);
-      void persistIndex($, rt);
-      $.ui.log("shadow-compact: installed verified checkpoint + exact recent tail");
+    if (isSkipped(built) || !built.messages) {
+      return native(isSkipped(built) ? built.skipped : "no-candidate");
     }
+    rt.state.attemptInstall();
+    rt.awaitingCompactionRow = true;
+    rt.messageRowIds = [SUMMARY_PLACEHOLDER, ...rt.messageRowIds.slice(built.tailStart)];
+    rt.lastCompact = `trigger=${e.trigger} shadow:${published.checkpointId} tailStart=${built.tailStart}`;
+    $.ui.log(`shadow-compact: ${rt.lastCompact}`, { to: "debug" });
     return { messages: built.messages };
   });
 
   on("command.run", { command: "shadow-status" }, async ($, _e, _next) => {
     await ensureSession($, rt);
+    await confirmInstall($, rt);
     return { text: statusText(rt) };
   });
 
   on("command.run", { command: "shadow-compact" }, async ($, _e, _next) => {
     await ensureSession($, rt);
-    if (rt.state.published && rt.state.installedCheckpointId !== rt.state.published.checkpointId) {
-      scheduleInstall($, rt);
-      return { text: "shadow-compact: installing verified checkpoint at this boundary." };
+    const published = rt.state.published;
+    if (published && rt.state.installedCheckpointId !== published.checkpointId) {
+      return { text: "shadow-compact: verified checkpoint ready; run /compact to install it." };
     }
     const blocker = preparationBlocker(rt);
     if (blocker) {
-      const rows = rt.archive?.size ?? 0;
-      if (rt.state.preparing) {
-        return { text: "shadow-compact: checkpoint preparation already in progress." };
-      }
-      return { text: `shadow-compact: idle (${blocker}; archive rows=${rows}).` };
+      return { text: `shadow-compact: idle (${blocker}; archive rows=${rt.archive?.size ?? 0}).` };
     }
     void runPreparation($, rt, true);
     return {
-      text: `shadow-compact: background builder/verifier preparation started (archive rows=${rt.archive?.size ?? 0}); it installs at the next safe compaction boundary.`,
+      text: `shadow-compact: background builder/verifier preparation started (archive rows=${rt.archive?.size ?? 0}); it installs at the next /compact or auto-compaction.`,
     };
   });
 
@@ -516,13 +472,15 @@ export const register: Register = (on, options) => {
     return { text: published.rendered };
   });
 
+  // `$.session.compact()` skips this mod's own hook: exactly a native run.
   on("command.run", { command: "compact-native" }, async ($, _e, _next) => {
     await ensureSession($, rt);
-    rt.state.armNativeBypass();
     $.clock.after(50, () => {
-      void $.command.run({ command: "compact" }).catch(() => undefined);
+      void compactNatively(rt, [], () => $.session.compact()).catch((error: unknown) => {
+        $.ui.log(`shadow-compact: native compaction failed (${oneLine(error)})`);
+      });
     });
-    return { text: "shadow-compact: next compaction will use Claude Code native compaction." };
+    return { text: "shadow-compact: running Claude Code native compaction." };
   });
 
   on("session.end", async ($, e, next) => {
@@ -531,10 +489,10 @@ export const register: Register = (on, options) => {
     rt.archive = undefined;
     rt.messageRowIds = [];
     rt.bootstrapped = false;
-    rt.hardLimitReached = false;
+    rt.awaitingCompactionRow = false;
+    rt.lastCompactionRowId = null;
     rt.lastFallback = null;
+    rt.lastCompact = null;
     return result;
   });
 };
-
-

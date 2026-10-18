@@ -81,10 +81,10 @@ Coverage through E0031. Builder + verifier; fails closed to native.
 session.append ──► durable evidence archive (sanitized, stable evidence ids)
 session.measure ≥160k tokens ──► private builder agent (Read/Grep on the archive)
                       ──► private verifier agent (independent re-read)
-                      ──► validated checkpoint published + persisted ($.store)
-next safe boundary ──► /compact dispatch ──► session.compact hook
+                      ──► validated checkpoint published (in memory)
+Claude's /compact or auto-compaction ──► session.compact hook
                       ──► [checkpoint message] + [exact tail by handle]
-no/invalid checkpoint ──► next(e): Claude native compaction (fail closed)
+no/unproven checkpoint ──► next(e): Claude native compaction (fail closed)
 ```
 
 - **Evidence archive.** Every main-loop `session.append` row is mirrored
@@ -102,24 +102,35 @@ no/invalid checkpoint ──► next(e): Claude native compaction (fail closed)
   retrying with the validation error fed back. If agent spawning fails,
   preparation retries through `$.model.complete` with inlined evidence.
   An `unusable` verifier verdict fails closed.
-- **Compaction.** The `session.compact` hook proves coverage: the
-  checkpoint's coverage row must sit in the current transcript at a
-  known index, the tail starts at a whole-turn boundary keeping at
-  least `recentTurns` turns, no tool result is orphaned from its call,
-  and the candidate must actually shrink the context. Any failure
-  defers to native compaction unchanged.
+- **Compaction.** Shadow never starts a compaction itself: Claude Code
+  runs a plugin's own `$.session.compact()` through every hook except
+  the caller's, so a self-started compaction would skip Shadow's
+  replacement. Claude Code's `/compact` and auto-compaction are the
+  install points. The `session.compact` hook proves coverage by
+  identity: the checkpoint's coverage row uuid must sit in the live
+  transcript index, never a saved position. The tail starts at the turn
+  holding the first uncovered message, keeping at least `recentTurns`
+  turns, no tool result is orphaned from its call, and the candidate
+  must actually shrink the context. Any failure defers to native
+  compaction unchanged; `precompute` compactions are skipped.
+- **Install confirmation.** Returning the checkpoint is an attempt, not
+  an install. It counts once canonical history (`$.session.messages()`)
+  opens with that checkpoint's coverage line; `/shadow-status` shows
+  `phase=installing` until then and `lastCompact` records every decision.
 - **Thresholds.** Background checkpoint preparation starts at 160,000
-  context tokens, and a verified checkpoint installs at the next safe
-  compaction boundary. At 250,000 tokens the extension requests compaction
-  even if preparation has not finished; without a usable checkpoint it
-  uses native compaction. Both limits are absolute token counts, independent
-  of the model's context window and Claude's auto-compaction threshold.
-  Claude's auto-compaction settings are left unchanged and may trigger
-  earlier. Rolling refresh re-arms after a Shadow install followed by
-  below-checkpoint context, or after native compaction.
-- **Persistence.** The small checkpoint record lives in `$.store`
-  keyed by session id; the large evidence archive is a paged file
-  under the plugin's `.shadow-data/<session-id>/` directory.
+  context tokens (absolute, independent of the context window). Set
+  Claude Code's `autoCompactWindow` (or `CLAUDE_CODE_AUTO_COMPACT_WINDOW`)
+  so auto-compaction fires comfortably above that, for example around
+  250,000 tokens, leaving preparation time to finish. Check the effective
+  point in your Claude Code version. A failed preparation is not retried
+  until the next compaction or a manual `/shadow-compact`. Rolling refresh
+  re-arms after a Shadow install followed by below-checkpoint context, or
+  after native compaction.
+- **State.** The checkpoint and transcript index live in memory for the
+  session. After a restart or resume, Shadow re-prepares rather than
+  trusting a checkpoint it cannot prove against the live transcript. The
+  evidence snapshot for the side agents is a file under the plugin's
+  `.shadow-data/<session-id>/` directory.
 
 ## Install
 
@@ -132,9 +143,9 @@ Or, from a local checkout, load it for one session with
 
 | Command | Behavior |
 |---|---|
-| `/shadow-compact` | Start background preparation, or install the ready checkpoint (honest when history is too short) |
-| `/compact-native` | Bypass Shadow for the next compaction (native summary) |
-| `/shadow-status` | Version, phase, archive size, checkpoint coverage, thresholds, last fallback, compact-hook |
+| `/shadow-compact` | Start background preparation now (honest when history is too short); run `/compact` to install a ready checkpoint |
+| `/compact-native` | Run Claude Code native compaction once, bypassing Shadow |
+| `/shadow-status` | Version, phase, archive size, checkpoint coverage, installs, threshold, last fallback, last compaction decision |
 | `/shadow-export` | Print the verified checkpoint for manual copy-paste |
 
 ## Configuration
@@ -145,20 +156,13 @@ Set via the plugin's `userConfig` (Claude Code `/config` or
 | Setting | Default | Behavior |
 |---|---|---|
 | `prepareThresholdTokens` | `160000` | Start background checkpoint preparation |
-| `hardThresholdTokens` | `250000` | Request compaction at the next safe boundary |
 | `recentTurns` | `10` | Minimum recent turns kept verbatim |
 | `builderModel` / `verifierModel` | `haiku` | Checkpoint agent models; `inherit` uses the session model |
 | `manualCompactMode` | `shadow` | `shadow` or `native` for manual `/compact` |
 
-Token thresholds must be positive safe integers. Invalid values use the
-corresponding default; a hard threshold at or below the checkpoint threshold
-is raised to one token above it. The checkpoint threshold must leave room
-for a higher hard threshold. The former `prepareThresholdPercent`,
-`swapThresholdPercent`, and `nativeFallbackThresholdPercent` settings are
-no longer used; replace any saved overrides with token values.
-
-The hard threshold is a trigger, not a strict cap on a running turn: Claude
-pins the transcript during a turn, so compaction retries when the turn ends.
+The token threshold must be a positive safe integer; invalid values use the
+default. The former `hardThresholdTokens` setting is gone (use Claude Code's
+`autoCompactWindow`), as are the older percentage settings.
 
 Builder and verifier run as private Claude agents with file access to the paged evidence archive. When agents are unavailable the pipeline retries with `model.complete` on inline evidence, then fails closed to native compaction. Agent spawn failures are logged at debug level without prompt contents, and `/shadow-status` shows the resolved model per role plus the last fallback reason.
 
@@ -166,7 +170,7 @@ Builder and verifier run as private Claude agents with file access to the paged 
 
 On organization-managed Claude Code, `session.compact` hooks run only for
 org-listed plugins. If yours is not listed, Shadow prepares but never
-installs: `/shadow-status` shows `compact-hook=unseen`. Ask the org to
+installs: `/shadow-status` shows `lastCompact=unseen` after a compaction. Ask the org to
 allowlist `shadow-compact`, or copy `/shadow-export` output by hand.
 
 If the marketplace reports a stale version after a release, refresh it:
@@ -176,14 +180,14 @@ claude plugin marketplace update claude-shadow-compact
 claude plugin update shadow-compact@claude-shadow-compact
 ```
 
-`/shadow-status` shows the running version (`v0.2.1`).
+`/shadow-status` shows the running version (`v0.4.0`).
 
 ## Deferred from the Pi version
 
 - **Request-local mid-turn swaps.** Pi rewrites an individual model
   request without touching canonical history; Claude pins the
   transcript in `turn.step`, so Shadow installs canonically through
-  `session.compact` at the next safe boundary. A very long single turn
+  `session.compact` when Claude Code compacts. A very long single turn
   cannot be swapped halfway through.
 - **Native-summarizer token-cap recovery.** Claude's compact result
   exposes no stable truncation signal, so the v1 policy is simply:

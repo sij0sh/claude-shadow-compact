@@ -7,7 +7,6 @@
 import type { PluginOptions } from "claude-code";
 
 export const DEFAULT_PREPARE_THRESHOLD_TOKENS = 160_000;
-export const DEFAULT_HARD_THRESHOLD_TOKENS = 250_000;
 export const DEFAULT_RECENT_TURNS = 10;
 /** Default checkpoint-agent model: cheap and fast, never the session model. */
 export const DEFAULT_MODEL = "haiku";
@@ -16,7 +15,6 @@ export type ManualCompactMode = "shadow" | "native";
 
 export interface ShadowConfig {
   prepareThresholdTokens: number;
-  hardThresholdTokens: number;
   recentTurns: number;
   builderModel: string;
   verifierModel: string;
@@ -35,13 +33,8 @@ function model(value: unknown): string {
 }
 
 export function resolveConfig(options: PluginOptions): ShadowConfig {
-  let prepare = positiveInt(options.prepareThresholdTokens, DEFAULT_PREPARE_THRESHOLD_TOKENS);
-  // Leave room for a strictly higher hard limit, even for stored settings.
-  if (prepare === Number.MAX_SAFE_INTEGER) prepare = DEFAULT_PREPARE_THRESHOLD_TOKENS;
-  const hard = positiveInt(options.hardThresholdTokens, DEFAULT_HARD_THRESHOLD_TOKENS);
   return {
-    prepareThresholdTokens: prepare,
-    hardThresholdTokens: Math.max(hard, prepare + 1),
+    prepareThresholdTokens: positiveInt(options.prepareThresholdTokens, DEFAULT_PREPARE_THRESHOLD_TOKENS),
     recentTurns: positiveInt(options.recentTurns, DEFAULT_RECENT_TURNS),
     builderModel: model(options.builderModel),
     verifierModel: model(options.verifierModel),

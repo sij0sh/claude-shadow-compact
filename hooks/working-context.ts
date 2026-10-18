@@ -30,8 +30,9 @@ export function isTurnStart(message: SessionMessage): boolean {
 }
 
 /**
- * Plans the tail: it starts at the first turn start after the covered
- * message, moved earlier when needed to keep `recentTurns` whole turns.
+ * Plans the tail: it starts at the turn containing the first uncovered
+ * message, moved earlier when needed to keep `recentTurns` whole turns,
+ * so every dropped message is covered by the checkpoint.
  * `coveredIndex` is the transcript index of the last covered message
  * (-1 when the checkpoint covers nothing yet). Returns a skip when the
  * coverage anchor is off-transcript (stale checkpoint, fail closed).
@@ -50,8 +51,11 @@ export function planTail(
   });
   if (turnStarts.length === 0) turnStarts.push(0);
 
-  // First turn start strictly after the covered message.
-  let tailStart = turnStarts.find((start) => start > coveredIndex) ?? turnStarts[turnStarts.length - 1]!;
+  // Start of the turn holding the first uncovered message (the last turn
+  // when everything is covered); 0 when it precedes every turn start.
+  const firstUncovered = Math.min(coveredIndex + 1, messages.length - 1);
+  let tailStart = 0;
+  for (const start of turnStarts) if (start <= firstUncovered) tailStart = start;
   // Recent-turns minimum: keep at least `recentTurns` whole turns.
   const keep = Math.max(1, Math.floor(recentTurns));
   const recentStart = turnStarts[Math.max(0, turnStarts.length - keep)]!;

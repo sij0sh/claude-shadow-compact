@@ -2,14 +2,13 @@
  * Durable evidence archive (spec §4.2). `session.append` hands every
  * transcript row to the mod before storage under a stable uuid; this
  * archive mirrors main-loop rows in append order, sanitizes their text,
- * and serves the builder/verifier through a manifest + paged reads.
+ * and serves the builder/verifier through a manifest + paged file.
  * Evidence ids (`E0001`, ...) are stable per archive position; `E0000`
  * names the previous checkpoint, exactly as in the Pi version.
  */
 import { estimateTokens, redactSecretValue, sanitizeForContext } from "./normalize.js";
 
 export const PREVIOUS_CHECKPOINT_EVIDENCE_ID = "E0000";
-export const DEFAULT_MAX_PAGE_CHARS = 48_000;
 
 export function evidenceIdForIndex(index: number): string {
   return `E${String(index + 1).padStart(4, "0")}`;
@@ -229,13 +228,6 @@ export class EvidenceArchive {
     return this.#indexById.get(id) ?? -1;
   }
 
-  rowByEvidenceId(evidenceId: string): EvidenceRow | undefined {
-    if (evidenceId === PREVIOUS_CHECKPOINT_EVIDENCE_ID) return undefined;
-    const match = /^E(\d+)$/.exec(evidenceId);
-    if (!match) return undefined;
-    return this.rows[Number(match[1]) - 1];
-  }
-
   /** Every evidence id a checkpoint may cite. */
   knownRefs(): Set<string> {
     const refs = new Set(this.rows.map((row) => row.evidenceId));
@@ -294,25 +286,6 @@ export class EvidenceArchive {
     };
   }
 
-  /** One bounded page of rows as builder/verifier reading text. */
-  page(startIndex: number, count: number, maxChars = DEFAULT_MAX_PAGE_CHARS): string {
-    const lines: string[] = [];
-    let used = 0;
-    for (let i = Math.max(0, startIndex); i < Math.min(this.rows.length, startIndex + count); i++) {
-      const row = this.rows[i]!;
-      const line = JSON.stringify({
-        evidenceId: row.evidenceId,
-        entryId: row.id,
-        role: row.role ?? row.door,
-        text: row.text,
-      });
-      if (used + line.length > maxChars && lines.length > 0) break;
-      lines.push(line);
-      used += line.length + 1;
-    }
-    return lines.join("\n");
-  }
-
   /** Full sanitized evidence as paged text files' content (for agent Read). */
   fullText(): string {
     return this.rows
@@ -325,21 +298,5 @@ export class EvidenceArchive {
         }),
       )
       .join("\n");
-  }
-
-  search(query: string, limit = 10): Array<{ evidenceId: string; entryId: string; snippet: string }> {
-    const needle = query.toLowerCase();
-    const hits: Array<{ evidenceId: string; entryId: string; snippet: string }> = [];
-    for (const row of this.rows) {
-      const at = row.text.toLowerCase().indexOf(needle);
-      if (at < 0) continue;
-      hits.push({
-        evidenceId: row.evidenceId,
-        entryId: row.id,
-        snippet: row.text.slice(Math.max(0, at - 60), at + query.length + 120),
-      });
-      if (hits.length >= limit) break;
-    }
-    return hits;
   }
 }

@@ -1,7 +1,7 @@
 {
   "name": "shadow-compact",
-  "version": "0.3.0",
-  "description": "Verified-checkpoint compaction for Claude Code: a private builder and independent verifier prepare an evidence-grounded checkpoint in the background, and session.compact installs it with the exact recent tail preserved by handle.",
+  "version": "0.4.0",
+  "description": "Verified-checkpoint compaction for Claude Code: a private builder and independent verifier prepare an evidence-grounded checkpoint in the background, and Claude Code's own /compact or auto-compaction installs it through session.compact with the exact recent tail preserved by handle.",
   "author": {
     "name": "pi-shadow-compact port"
   },
@@ -9,14 +9,8 @@
     "prepareThresholdTokens": {
       "type": "number",
       "title": "Checkpoint threshold (tokens)",
-      "description": "Absolute context token count at which background checkpoint preparation starts. Must be a positive integer below the hard threshold.",
+      "description": "Absolute context token count at which background checkpoint preparation starts. Must be a positive integer; keep it well below Claude Code's auto-compaction point so the checkpoint is ready in time.",
       "default": 160000
-    },
-    "hardThresholdTokens": {
-      "type": "number",
-      "title": "Hard compaction threshold (tokens)",
-      "description": "Absolute context token count at which compaction is requested at the next safe boundary, using a verified checkpoint when available or native compaction otherwise. Must be a positive integer above the checkpoint threshold.",
-      "default": 250000
     },
     "recentTurns": {
       "type": "number",

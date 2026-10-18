@@ -7,43 +7,6 @@
  */
 
 export const CHECKPOINT_SCHEMA_VERSION = 3;
-export const SUMMARY_PROMPT_VERSION = 3;
-export const VERIFIER_PROMPT_VERSION = 3;
-
-export interface PromptVersions {
-  summaryPromptVersion: number;
-  verifierPromptVersion: number;
-}
-
-export function currentPromptVersions(): PromptVersions {
-  return {
-    summaryPromptVersion: SUMMARY_PROMPT_VERSION,
-    verifierPromptVersion: VERIFIER_PROMPT_VERSION,
-  };
-}
-
-/**
- * Where a checkpoint's evidence grounding ends, in Claude row uuids.
- * `coverageEndEntryId` is the last session row the checkpoint is
- * guaranteed to represent, as attested by the builder and audited by
- * the verifier; it is never inferred from when generation finished.
- */
-export interface CheckpointCoverage {
-  sourceStartEntryId: string | null;
-  coverageEndEntryId: string;
-  preparedAtLeafId: string;
-  publishedAtLeafId: string;
-}
-
-export interface ShadowCheckpoint {
-  schemaVersion: typeof CHECKPOINT_SCHEMA_VERSION;
-  structured: Checkpoint;
-  rendered: string;
-  coverage: CheckpointCoverage;
-  generatedAt: number;
-  prompts: PromptVersions;
-}
-
 const MAX_ITEM_CHARS = 8_000;
 const MAX_ITEMS_PER_SECTION = 100;
 const MAX_REFS_PER_ITEM = 32;
@@ -276,17 +239,29 @@ function safeText(value: string): string {
   return value.replace(/\s*\r?\n+\s*/g, " ").trim();
 }
 
-export function renderCheckpoint(checkpoint: Checkpoint): string {
+function cited(text: string, refs: readonly string[]): string {
+  return `${safeText(text)} [${refs.join(", ")}]`;
+}
+
+/** The header line of every rendered checkpoint; install confirmation matches it. */
+export const CHECKPOINT_HEADING = "# Continuation Checkpoint";
+
+/** Coverage metadata line, also how canonical history proves which checkpoint installed. */
+export function coverageLine(coverageEndEntryId: string): string {
+  return `Covers the session through entry ${coverageEndEntryId} (schema v${CHECKPOINT_SCHEMA_VERSION}).`;
+}
+
+export function renderCheckpoint(checkpoint: Checkpoint, coverageEndEntryId: string): string {
   const sections = SECTIONS.map((section) => {
     const title = section
       .replace(/([a-z])([A-Z])/g, "$1 $2")
       .replace(/^./, (char) => char.toUpperCase());
-    const lines = checkpoint[section].map((item) => `- ${safeText(item.text)}`);
+    const lines = checkpoint[section].map((item) => `- ${cited(item.text, item.evidenceRefs)}`);
     return `## ${title}\n${lines.length ? lines.join("\n") : "(none)"}`;
   });
   const verification = checkpoint.verificationState ?? [];
   if (verification.length > 0) {
-    const lines = verification.map((item) => `- [${item.status}] ${safeText(item.text)}`);
+    const lines = verification.map((item) => `- [${item.status}] ${cited(item.text, item.evidenceRefs)}`);
     sections.push(`## Verification State\n${lines.join("\n")}`);
   }
   const continuation = checkpoint.continuationState;
@@ -298,7 +273,7 @@ export function renderCheckpoint(checkpoint: Checkpoint): string {
       `## Continuation\n- Goal: ${safeText(continuation.currentGoal) || "(none)"}\n- Approach: ${safeText(continuation.currentApproach) || "(none)"}\n- Next: ${safeText(continuation.immediateNextStep) || "(none)"}`,
     );
   }
-  const rendered = `# Continuation Checkpoint\n\n${sections.join("\n\n")}\n`;
+  const rendered = `${CHECKPOINT_HEADING}\n\n${coverageLine(coverageEndEntryId)}\n\n${sections.join("\n\n")}\n`;
   if (rendered.length > MAX_RENDERED_CHARS) {
     throw new Error("Rendered checkpoint exceeds size limit");
   }
