@@ -14,5 +14,6 @@
     "jsxFactory": "h",
     "jsxFragmentFactory": "Fragment"
   },
-  "include": [".claude/types", "hooks", "tests"]
+  "include": [".claude/types", "hooks", "tests"],
+  "exclude": ["tests/support/core-host.d.ts"]
 }

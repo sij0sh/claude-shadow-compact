@@ -3,7 +3,7 @@
 A Claude Code **mod** (plugin of function hooks) that ports
 [pi-shadow-compact](https://github.com/sij0sh/pi-shadow-compact) to
 Claude Code. It is a real compactor, not a hooks-plus-context shim:
-when compaction fires, Shadow answers with a **verified structured
+when compaction fires, Shadow answers with a **checked structured
 checkpoint plus the exact recent tail** (original messages carried by
 their engine handles, untouched), instead of Claude's native summary.
 
@@ -12,8 +12,11 @@ their engine handles, untouched), instead of Claude's native summary.
 Native compaction writes a prose summary of what it saw. Shadow writes a
 checked checkpoint: every claim points at saved session entries, tested work
 is marked verified, untested work stays unverified, and the checkpoint names
-exactly how far it covers. An independent verifier checks the builder. If the check
-fails, the session falls back to native compaction.
+exactly how far it covers. By default an independent verifier checks every
+draft. Opt-in `verificationMode: "adaptive"` allows eligible low-risk drafts
+to publish after deterministic checks and integrated self-review; high-risk
+drafts still require independent verification. Failed quality checks fall
+back to native compaction.
 
 The example is synthetic and shows the same session on each side, so
 compare shape, not size. Task and paths are generic on purpose.
@@ -77,16 +80,18 @@ Coverage through E0031. Builder + verifier; fails closed to native.
 
 ## How it works
 
-```text
-session.start / before preparation ──► serialize + reconcile canonical history
-session.append ──► durable evidence archive + ordered live-message index
-session.measure ≥150k tokens ──► isolated Claude CLI builder worker
-                      ──► isolated verifier worker (independent re-read)
-                      ──► verified checkpoint + covered-prefix SHA-256 proof
-Claude's /compact or auto-compaction ──► session.compact hook
-                      ──► prove the covered prefix; repair from e.messages if needed
-                      ──► [checkpoint message] + [all uncovered / recent rounds by handle]
-unrecoverable preparation / coverage failure ──► Claude native compaction
+```mermaid
+flowchart TD
+  E["Reconciled evidence and index"] --> G["Generator and self-review"]
+  G --> V["Deterministic validation"]
+  V --> R{"Adaptive and low risk?"}
+  R -->|Yes| P["Ready checkpoint"]
+  R -->|No| I["Independent verifier"]
+  I -->|Accept or repair| P
+  I -->|Reject| N["Native fallback"]
+  V -->|Invalid after correction| N
+  P --> C["Prefix proof and exact tail"]
+  C -->|Unproven| N
 ```
 
 - **Evidence archive and reconciliation.** Every main-loop `session.append`
@@ -98,7 +103,7 @@ unrecoverable preparation / coverage failure ──► Claude native compaction
   A normal Shadow install retains original evidence for later grounding.
   Canonical reads reaching Claude's 4,096-entry cap are refused; the complete
   live compaction input provides the recovery snapshot instead.
-- **Builder → verifier.** Each Claude role runs in its own bundled Node worker
+- **Generate → validate → route.** Each Claude role runs in its own bundled Node worker
   launching `claude --safe-mode --print`, using existing Claude authentication.
   Safe mode disables installed plugins, user hooks, CLAUDE.md, skills and other
   customizations (managed policy still applies); only Read/Grep tools are offered. The child runs from the
@@ -107,9 +112,23 @@ unrecoverable preparation / coverage failure ──► Claude native compaction
   maintenance JSON into the main conversation. A nonce-tagged result file is
   written atomically; stdout contains short status metadata only. Strict JSON,
   evidence references, coverage and continuation state are validated with
-  bounded retries. If the worker fails, `model.complete` can retry with at most
+  one bounded generator correction. The generator includes a claim-by-claim
+  self-review. Deterministic validation checks schema, continuation, known refs,
+  coverage monotonicity, forward citations and final size, not semantic truth.
+  Adaptive routing is conservative: counts, completion/success/acceptance claims,
+  corrections, rejected approaches, errors, truncation and missing user-context
+  citations require independent verification. The default `always` policy
+  retains the independent verifier for every draft.
+  If a worker transport fails, `model.complete` can retry with at most
   120,000 characters of inline evidence. Structured and legacy text completion
-  results are normalized. An `unusable` verifier verdict fails closed.
+  results are normalized. Both Pi and Claude drafts survive verifier transport
+  failures, so only verification is repeated. An `unusable` verdict is terminal
+  and cannot be retried on another backend for acceptance.
+- **Evidence navigation.** Cached turns, manifests, full-text projections and
+  an `evidence-index.json` provide row locations and risk hints. The manifest
+  includes contiguous inspection ranges, including turns spanning prior coverage.
+  Index entries do not establish claim support. Truncated rows retain provenance
+  and require independent verification; the existing row-text cap is unchanged.
 - **Prefix proof and exact tail.** A checkpoint records its session, history
   epoch, snapshot ID, covered message count, covered-prefix SHA-256 digest,
   and evidence digest. Installation checks the entire covered prefix, including
@@ -203,7 +222,7 @@ Or, from a local checkout, load it for one session with
 | `/shadow-compact` | Reconcile history and prepare a checkpoint; `/compact` checks live coverage and installs |
 | `/compact-native` | Run Claude Code native compaction once, bypassing Shadow |
 | `/shadow-status` | Version, phase, archive size, checkpoint coverage, installs, threshold, auto-compact window and idle-compaction outcomes, per-role backend, Pi check and usage, last preparation, last fallback, last compaction decision |
-| `/shadow-export` | Print the verified checkpoint for manual copy-paste |
+| `/shadow-export` | Print the ready checkpoint for manual copy-paste |
 
 ## Configuration
 
@@ -221,6 +240,7 @@ Set via the plugin's `userConfig` (Claude Code `/config` or
 | `holdCompaction` | `true` | Hold a compaction until its checkpoint preparation finishes or fails (the preparation deadline is the failure signal); `false` falls back to native at once. The former `compactWaitSeconds: 0` still turns it off |
 | `prepareTimeoutSeconds` | `360` | Overall preparation deadline across roles, retries and backend fallbacks, and the only thing that ends a compaction hold on a slow preparation; positive integer, at most `600` |
 | `builderModel` / `verifierModel` | `haiku` | Checkpoint worker models; `inherit` uses the session model |
+| `verificationMode` | `always` | `always` independently verifies every draft; opt-in `adaptive` skips verification only for eligible low-risk drafts |
 | `builderEffort` / `verifierEffort` | `high` | Reasoning effort for the isolated Claude checkpoint workers (`low` … `max`) |
 | `manualCompactMode` | `shadow` | `shadow` or `native` for manual `/compact` |
 | `builderBackend` / `verifierBackend` | `claude` | `claude` or `pi` per role (see [Optional Pi backend](#optional-pi-backend)) |
@@ -238,8 +258,15 @@ Claude workers use your existing CLI authentication and selected model/effort.
 They require Claude Code with `--safe-mode` support and Node.js 22+ on PATH
 (or configured through `claudePath` / `piNodePath`). If a worker cannot run,
 inline completion remains available within its evidence-size limit.
-`/shadow-status` shows reconciliation status, verification versus eligibility,
-per-role backend, and the last fallback reason.
+`/shadow-status` distinguishes `validated` from independently `verified`, live
+eligibility and confirmed installation. It also shows policy, risk level,
+per-role backend and the last fallback reason. Each preparation's `outcome.json`
+records stage timings, role invocation counts, correction count, routing reasons,
+readiness, total time and fallback/cancellation outcomes. Role invocations are
+not provider inference-call counts: evidence-reading workers may use tool rounds.
+
+See [the adaptive rollout notes](docs/release-0.4.10.md) for quality gates,
+source-archive prerequisites and the limits of the portable checks.
 
 ## Optional Pi backend
 
@@ -276,8 +303,9 @@ How it runs:
   keeps that draft and redoes only the verifier with the Claude models.
   A failure before any draft redoes the whole preparation with the
   Claude models, and only while at least a quarter of the preparation
-  deadline remains. Pi failures include a bad check, a worker crash, a provider error,
-  a rejected answer, or an `unusable` verdict. A worker that cannot run or
+  deadline remains. Recoverable Pi failures include a bad check, a worker crash,
+  or a provider error. Exhausted validation and an `unusable` verdict go directly
+  to native fallback. A worker that cannot run or
   start is not launched again that session.
 
 `/shadow-status` shows `builder=` / `verifier=` per backend, `pi=` (check
@@ -299,7 +327,7 @@ claude plugin marketplace update claude-shadow-compact
 claude plugin update shadow-compact@claude-shadow-compact
 ```
 
-`/shadow-status` shows the running version (`v0.4.9`).
+`/shadow-status` shows the running version (`v0.4.10`).
 
 ## Deferred from the Pi version
 
@@ -318,6 +346,8 @@ claude plugin update shadow-compact@claude-shadow-compact
 npm install
 npm run check   # typecheck, claude plugin validate ., claude plugin test ., worker tests
 npm run build   # rebuild the shipped Claude and Pi checkpoint workers
+npm run typecheck:core # standalone core check with minimal test input types
+npm run test:hooks     # same hook regressions under Node; engine-only cases skipped
 ```
 
 Both worker bundles in `dist/` are committed so installs need no build

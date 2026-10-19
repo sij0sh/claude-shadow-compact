@@ -38,6 +38,9 @@ export interface EvidenceRow {
   originKind?: string;
   /** False for attachments/notices/meta, or archived rows outside this snapshot's live coverage. */
   isTranscript?: boolean;
+  /** Provenance of the sanitized projection; never silently treat a clipped row as complete. */
+  textTruncated?: boolean;
+  originalTextChars?: number;
 }
 
 /** Origins that are the person speaking, the only source of user corrections. */
@@ -47,6 +50,10 @@ const PERSON_ORIGINS = new Set(["composer", "bridge", "sdk"]);
 export function isPersonPrompt(row: EvidenceRow): boolean {
   if (row.role !== "user" || row.hasToolResult) return false;
   return row.originKind === undefined || PERSON_ORIGINS.has(row.originKind);
+}
+
+export function isCoverageRow(row: EvidenceRow): boolean {
+  return !!row.role && row.isTranscript !== false && !["attachment", "hook-context", "notice"].includes(row.door);
 }
 
 export interface EvidenceTurn {
@@ -60,6 +67,36 @@ export interface EvidenceTurn {
 const CORRECTION_SIGNALS =
   /\b(no\b|wrong|incorrect|instead|actually|not that|fix\b|should\b|must\b|never\b|always\b|don't\b|do not\b|require[sd]?|prefer|prohibit)/i;
 const MAX_ROW_TEXT_CHARS = 4_000;
+
+export type EvidenceSignal = "correction" | "error" | "quantity" | "rejected-approach" | "acceptance" | "verification" | "truncated";
+
+export interface EvidenceIndexEntry {
+  evidenceId: string;
+  entryId: string;
+  turnId: string;
+  /** Zero-based row position, and one-based JSONL line for Read offset/limit. */
+  position: number;
+  line: number;
+  role: string;
+  toolNames: string[];
+  hasToolResult: boolean;
+  eligibleForCoverage: boolean;
+  signals: EvidenceSignal[];
+}
+
+/** Deterministic navigation/risk hints, never an assertion that a claim is true. */
+export function evidenceSignals(row: EvidenceRow): EvidenceSignal[] {
+  const signals: EvidenceSignal[] = [];
+  if (isPersonPrompt(row) && CORRECTION_SIGNALS.test(row.text)) signals.push("correction");
+  if (row.isError || /\b(error|failed|failure|exception|unresolved|blocked)\b/i.test(row.text)) signals.push("error");
+  if (/\b\d+(?:\.\d+)*\b/.test(row.text)) signals.push("quantity");
+  if (/\b(reject(?:ed)?|discard(?:ed)?|abandon(?:ed)?|revert(?:ed)?|did not work|didn't work)\b/i.test(row.text)) signals.push("rejected-approach");
+  if (/\b(accept(?:ed)?|approv(?:ed|al)|agreed|confirmed)\b/i.test(row.text)) signals.push("acceptance");
+  if (/\b(looks good|sounds good|go ahead|ship it)\b/i.test(row.text) && !signals.includes("acceptance")) signals.push("acceptance");
+  if (/\b(built|implemented|finished|completed|deployed|fixed|resolved|tests? pass(?:ed)?|build succeed(?:ed)?)\b/i.test(row.text)) signals.push("verification");
+  if (row.textTruncated || row.text.length >= MAX_ROW_TEXT_CHARS) signals.push("truncated");
+  return signals;
+}
 
 interface BlockLike {
   type?: unknown;
@@ -110,12 +147,15 @@ export function rowFromAppend(
   }
   const role = message.type === "assistant" ? "assistant"
     : message.role === "user" || message.role === "assistant" ? message.role : undefined;
+  const sanitized = sanitizeForContext(parts.join("\n"), cwd);
   return {
     id: uuid,
     evidenceId: evidenceIdForIndex(index),
     ...(role ? { role } : {}),
     door,
-    text: sanitizeForContext(parts.join("\n"), cwd).slice(0, MAX_ROW_TEXT_CHARS),
+    text: sanitized.slice(0, MAX_ROW_TEXT_CHARS),
+    textTruncated: sanitized.length > MAX_ROW_TEXT_CHARS,
+    originalTextChars: sanitized.length,
     toolNames,
     hasToolResult,
     isError,
@@ -153,6 +193,8 @@ export interface SessionManifest {
   previousCoverageEndEntryId: string | null;
   hasPreviousCheckpoint: boolean;
   requiredTurnIds: string[];
+  /** Whole required turns, including a turn spanning the previous boundary. */
+  inspectionRanges: Array<{ start: number; count: number }>;
   turns: Array<{
     turnId: string;
     startEvidenceId: string;
@@ -169,6 +211,10 @@ export class EvidenceArchive {
   readonly #indexById = new Map<string, number>();
   #previousCheckpointSummary: string | undefined;
   #previousCoverageEndEntryId: string | null = null;
+  #turns: EvidenceTurn[] | undefined;
+  #manifest: SessionManifest | undefined;
+  #evidenceIndex: EvidenceIndexEntry[] | undefined;
+  #fullText: string | undefined;
 
   constructor(private readonly cwd: string) {}
 
@@ -179,9 +225,13 @@ export class EvidenceArchive {
   /** Appends a row; returns false for a duplicate uuid (append replays). */
   add(row: EvidenceRow): boolean {
     if (this.#indexById.has(row.id)) return false;
-    const stored: EvidenceRow = { ...row, evidenceId: evidenceIdForIndex(this.rows.length) };
+    const stored: EvidenceRow = { ...row, toolNames: [...row.toolNames], evidenceId: evidenceIdForIndex(this.rows.length) };
     this.#indexById.set(stored.id, this.rows.length);
     this.rows.push(stored);
+    this.#turns = undefined;
+    this.#manifest = undefined;
+    this.#evidenceIndex = undefined;
+    this.#fullText = undefined;
     return true;
   }
 
@@ -229,6 +279,7 @@ export class EvidenceArchive {
   setPreviousCheckpoint(summary: string | undefined, coverageEndEntryId: string | null): void {
     this.#previousCheckpointSummary = summary;
     this.#previousCoverageEndEntryId = coverageEndEntryId;
+    this.#manifest = undefined;
   }
 
   get previousCoverageEndEntryId(): string | null {
@@ -257,10 +308,25 @@ export class EvidenceArchive {
   }
 
   turns(): EvidenceTurn[] {
-    return segmentTurns(this.rows);
+    return this.#turns ??= segmentTurns(this.rows);
+  }
+
+  /** Compact locations/flags for retrieval. Does not serve or certify row text. */
+  evidenceIndex(): EvidenceIndexEntry[] {
+    if (this.#evidenceIndex) return this.#evidenceIndex;
+    const turnByRow = new Map<string, string>();
+    for (const turn of this.turns()) for (const id of turn.rowIds) turnByRow.set(id, turn.turnId);
+    return this.#evidenceIndex = this.rows.map((row, position) => ({
+      evidenceId: row.evidenceId, entryId: row.id, turnId: turnByRow.get(row.id) ?? "",
+      position, line: position + 1, role: row.role ?? row.door,
+      toolNames: [...row.toolNames], hasToolResult: row.hasToolResult,
+      eligibleForCoverage: isCoverageRow(row),
+      signals: evidenceSignals(row),
+    }));
   }
 
   manifest(): SessionManifest {
+    if (this.#manifest) return this.#manifest;
     const turns = this.turns();
     const previousIndex =
       this.#previousCoverageEndEntryId === null
@@ -271,21 +337,24 @@ export class EvidenceArchive {
     for (const turn of turns) {
       // Turns starting after the previous coverage boundary, and every
       // turn carrying an error, must be inspected before submission.
-      if (this.indexOf(turn.startRowId) > previousIndex) required.add(turn.turnId);
+      if (this.indexOf(turn.endRowId) > previousIndex) required.add(turn.turnId);
       const turnRows = turn.rowIds
         .map((id) => this.rows[this.indexOf(id)])
         .filter((row): row is EvidenceRow => row !== undefined);
       if (turnRows.some((row) => row.isError)) required.add(turn.turnId);
     }
-    return {
+    return this.#manifest = {
       rowCount: this.rows.length,
       turnCount: turns.length,
       firstRowId: this.rows[0]?.id ?? null,
       lastRowId: this.rows[this.rows.length - 1]?.id ?? null,
-      lastTranscriptRowId: this.rows.findLast(row => row.role && row.isTranscript !== false)?.id ?? null,
+      lastTranscriptRowId: this.evidenceIndex().findLast(row => row.eligibleForCoverage)?.entryId ?? null,
       previousCoverageEndEntryId: this.#previousCoverageEndEntryId,
       hasPreviousCheckpoint: this.#previousCheckpointSummary !== undefined,
       requiredTurnIds: [...required],
+      inspectionRanges: turns.filter(turn => required.has(turn.turnId)).map(turn => ({
+        start: this.indexOf(turn.startRowId), count: turn.rowIds.length,
+      })),
       turns: turns.map((turn) => {
         const turnRows = turn.rowIds
           .map((id) => this.rows[this.indexOf(id)])
@@ -308,13 +377,15 @@ export class EvidenceArchive {
 
   /** Full sanitized evidence as paged text files' content (for agent Read). */
   fullText(): string {
-    return this.rows
+    return this.#fullText ??= this.rows
       .map((row) =>
         JSON.stringify({
           evidenceId: row.evidenceId,
           entryId: row.id,
           role: row.role ?? row.door,
-          eligibleForCoverage: row.isTranscript !== false && !!row.role,
+          eligibleForCoverage: isCoverageRow(row),
+          ...(row.textTruncated ? { textTruncated: true, originalTextChars: row.originalTextChars } : {}),
+          ...(row.isError ? { isError: true } : {}),
           text: row.text,
         }),
       )

@@ -3,8 +3,8 @@
  * lifecycle is replaced by mod hooks:
  * - `session.append` mirrors every main-loop row into the evidence archive
  * - `session.measure` starts background preparation at the prepare threshold
- * - isolated builder/verifier workers produce a
- *   verified checkpoint; strict-JSON answers are validated in `prepare.ts`
+ * - one generator plus deterministic checks, with policy-routed independent
+ *   verification, produces a ready checkpoint (`prepare.ts`)
  * - `session.compact` installs checkpoint + exact handle tail; when the
  *   checkpoint is still preparing (or none was started) it holds the
  *   compaction for a bounded wait, and defers to native compaction
@@ -57,8 +57,11 @@ import {
   VERIFIER_SYSTEM_PROMPT,
   prepareCheckpoint,
   verifyDraft,
+  emptyPreparationMetrics,
+  isTerminalPreparationError,
   type AskFn,
   type CheckpointDraft,
+  type PreparationOptions,
 } from "./prepare.js";
 import { estimateTokens } from "./normalize.js";
 import {
@@ -86,7 +89,7 @@ const COMPACT_BUDGET_RESERVE_MS = 2_000;
 const HOLD_GRACE_SECONDS = 30;
 
 /** Running plugin version shown in status; bump with the manifest. */
-const PLUGIN_VERSION = "0.4.9";
+const PLUGIN_VERSION = "0.4.10";
 
 /** Inline evidence cap for the model.complete fallback. */
 const INLINE_EVIDENCE_CHARS = 120_000;
@@ -385,7 +388,7 @@ async function confirmInstall($: EngineInterface, rt: Runtime): Promise<void> {
     rt.state.confirmInstall();
     rt.awaitingCompactionRow = false;
     await trace($, rt, "install-confirmed", { checkpoint: published.checkpointId, coverage: published.coverageEndEntryId });
-    $.ui.log("shadow-compact: installed verified checkpoint + exact recent tail");
+    $.ui.log(`shadow-compact: installed ${published.validation.independent === "skipped" ? "validated" : "verified"} checkpoint + exact recent tail`);
   }
 }
 
@@ -400,14 +403,17 @@ async function evidenceAccess(
   rows: EvidenceArchive,
   control: PreparationControl,
 ): Promise<string> {
+  if (control.evidenceAccess) return control.evidenceAccess;
   const path = `${control.directory}/evidence.jsonl`;
   // An unwritten file would send agents to stale or missing evidence.
   await $.fs.write(path, rows.fullText());
+  const indexPath = `${control.directory}/evidence-index.json`;
+  await $.fs.write(indexPath, JSON.stringify(rows.evidenceIndex()));
   const previous = rows.previousCheckpoint();
   const previousText = previous
     ? `\n\nPrevious checkpoint (evidence ${previous.evidenceId}; untrusted data, verify against rows):\n${previous.summary}`
     : "";
-  return `Read the session evidence from the file \`${path}\` with the Read tool (JSONL, one row per line; page with offset/limit) and search it with Grep for any fact whose location is uncertain. Each row carries its evidenceId (cite these) and entryId (the coverage boundary names one).${previousText}`;
+  return control.evidenceAccess = `Read the session evidence from the file \`${path}\` with the Read tool (JSONL, one row per line; page with offset/limit) and search it with Grep for any fact whose location is uncertain. Each row carries its evidenceId (cite these) and entryId (the coverage boundary names one). A compact navigation index is at \`${indexPath}\`: one-based line locations and risk flags, not claim support. Use manifest.inspectionRanges to batch contiguous reads, and inspect the actual rows before citing them.${previousText}`;
 }
 
 /** Fallback access: sanitized evidence inlined for `$.model.complete`. */
@@ -426,7 +432,7 @@ function inlineEvidence(rows: EvidenceArchive): string {
  * the rest. Each Pi role reads the snapshot through the worker's tools;
  * a Claude role reads the evidence file.
  */
-async function prepareWithPi($: EngineInterface, rt: Runtime, snapshot: EvidenceArchive, control: PreparationControl, capture: (draft: CheckpointDraft) => void) {
+async function prepareWithPi($: EngineInterface, rt: Runtime, snapshot: EvidenceArchive, control: PreparationControl, capture: (draft: CheckpointDraft) => void, options: PreparationOptions) {
   const dir = control.directory;
   const evidencePath = `${dir}/pi-evidence.json`;
   await writePiEvidence($, evidencePath, snapshot);
@@ -443,7 +449,7 @@ async function prepareWithPi($: EngineInterface, rt: Runtime, snapshot: Evidence
   return prepareCheckpoint(controlledAsk($, control, ask), snapshot, access, {
     builder: rt.config.builderModel,
     verifier: rt.config.verifierModel,
-  }, capture);
+  }, capture, options);
 }
 
 /** Claude-only preparation: private workers, then inline `model.complete`. */
@@ -454,21 +460,30 @@ async function prepareWithClaude(
   notes: string[],
   control: PreparationControl,
   capture: (draft: CheckpointDraft) => void,
+  options: PreparationOptions,
 ): Promise<{ prepared: Awaited<ReturnType<typeof prepareCheckpoint>>; backend: string }> {
   const models = { builder: rt.config.builderModel, verifier: rt.config.verifierModel };
   // Side workers read the paged evidence file; when workers are
-  // unavailable the whole pipeline retries on inline evidence.
+  // unavailable inline evidence is used. A validated draft is retained
+  // when only its verifier needs another transport.
   control.remaining(await $.clock.now());
   const access = await evidenceAccess($, rt, snapshot, control);
+  let keptDraft: CheckpointDraft | undefined;
+  const captureAndKeep = (built: CheckpointDraft) => { keptDraft = built; capture(built); };
   try {
-    return { prepared: await prepareCheckpoint(controlledAsk($, control, askViaClaudeWorker($, rt.config, control)), snapshot, access, models, capture), backend: "claude-worker" };
+    return { prepared: await prepareCheckpoint(controlledAsk($, control, askViaClaudeWorker($, rt.config, control)), snapshot, access, models, captureAndKeep, options), backend: "claude-worker" };
   } catch (error) {
-    if (error instanceof PreparationCancelled) throw error;
+    if (error instanceof PreparationCancelled || isTerminalPreparationError(error)) throw error;
     notes.push(`worker:${oneLine(error)}`);
     rt.lastFallback = notes.join(" then ");
   }
+  if (keptDraft) {
+    return { prepared: await verifyDraft(controlledAsk($, control, askViaComplete($)), snapshot, inlineEvidence(snapshot), models.verifier, keptDraft, options), backend: "claude-draft+complete-verify" };
+  }
+  const remaining = control.remaining(await $.clock.now());
+  if (remaining < rt.config.prepareTimeoutSeconds * 250) throw new Error(`insufficient preparation time for a full redo (${Math.round(remaining / 1000)}s left)`);
   return {
-    prepared: await prepareCheckpoint(controlledAsk($, control, askViaComplete($)), snapshot, inlineEvidence(snapshot), models, capture),
+    prepared: await prepareCheckpoint(controlledAsk($, control, askViaComplete($)), snapshot, inlineEvidence(snapshot), models, capture, options),
     backend: "claude-complete",
   };
 }
@@ -484,18 +499,19 @@ async function verifyWithClaude(
   notes: string[],
   control: PreparationControl,
   draft: CheckpointDraft,
+  options: PreparationOptions,
 ): Promise<{ prepared: Awaited<ReturnType<typeof prepareCheckpoint>>; backend: string }> {
   control.remaining(await $.clock.now());
   const access = await evidenceAccess($, rt, snapshot, control);
   try {
-    return { prepared: await verifyDraft(controlledAsk($, control, askViaClaudeWorker($, rt.config, control)), snapshot, access, rt.config.verifierModel, draft), backend: "claude-verify" };
+    return { prepared: await verifyDraft(controlledAsk($, control, askViaClaudeWorker($, rt.config, control)), snapshot, access, rt.config.verifierModel, draft, options), backend: "claude-verify" };
   } catch (error) {
-    if (error instanceof PreparationCancelled) throw error;
+    if (error instanceof PreparationCancelled || isTerminalPreparationError(error)) throw error;
     notes.push(`worker:${oneLine(error)}`);
     rt.lastFallback = notes.join(" then ");
   }
   return {
-    prepared: await verifyDraft(controlledAsk($, control, askViaComplete($)), snapshot, inlineEvidence(snapshot), rt.config.verifierModel, draft),
+    prepared: await verifyDraft(controlledAsk($, control, askViaComplete($)), snapshot, inlineEvidence(snapshot), rt.config.verifierModel, draft, options),
     backend: "claude-verify-complete",
   };
 }
@@ -523,6 +539,10 @@ async function runPreparation(
   if (generation === undefined) return;
   const started = performance.now();
   const notes: string[] = [];
+  const metrics = emptyPreparationMetrics();
+  const pipelineOptions: PreparationOptions = { verificationMode: rt.config.verificationMode, metrics };
+  let snapshotMs = 0;
+  let readiness: string | null = null;
   const directory = `${dataDir($, rt)}/prepare-${rt.runtimeId}-${generation}`;
   const control = new PreparationControl(generation, directory,
     sharedDeadline ?? (await $.clock.now()) + rt.config.prepareTimeoutSeconds * 1000, "pending-history");
@@ -539,10 +559,12 @@ async function runPreparation(
     const liveIds = [...rt.messageRowIds];
     const live = rt.transcript.messages(liveIds);
     if (!live || live.length < 2) throw new Error("history-incomplete: need at least 2 reconciled messages");
+    const snapshotStarted = performance.now();
     const snapshot = rows.snapshot(rows.size - 1, new Set(liveIds));
     control.coverageEndEntryId = liveIds.at(-1)!;
     const epoch = rt.historyEpoch;
     const evidenceHash = await contentDigest(snapshot.fullText());
+    snapshotMs = performance.now() - snapshotStarted;
     await trace($, rt, "prepare-start", { generation, directory, rows: snapshot.size, coverage: control.coverageEndEntryId, epoch, evidenceDigest: evidenceHash, deadline: control.deadline });
     let prepared: Awaited<ReturnType<typeof prepareCheckpoint>> | undefined;
     let backend = "";
@@ -558,10 +580,10 @@ async function runPreparation(
         notes.push(`pi-unavailable:${rt.piStatus.slice("failed:".length)}`);
       } else {
         try {
-          prepared = await control.race(prepareWithPi($, rt, snapshot, control, capture));
+          prepared = await control.race(prepareWithPi($, rt, snapshot, control, capture, pipelineOptions));
           backend = rt.config.builderBackend === rt.config.verifierBackend ? "pi" : "mixed";
         } catch (error) {
-          if (error instanceof PreparationCancelled) throw error;
+          if (error instanceof PreparationCancelled || isTerminalPreparationError(error)) throw error;
           if (error instanceof PiWorkerUnavailable) rt.piStatus = `failed:${oneLine(error)}`;
           notes.push(`pi:${oneLine(error)}`);
         }
@@ -570,7 +592,7 @@ async function runPreparation(
     }
     if (!prepared && draft) {
       // Only the verifier is redone, on Claude, against the kept draft.
-      ({ prepared, backend } = await control.race(verifyWithClaude($, rt, snapshot, notes, control, draft)));
+      ({ prepared, backend } = await control.race(verifyWithClaude($, rt, snapshot, notes, control, draft, pipelineOptions)));
       backend = `pi-draft+${backend}`;
     } else if (!prepared) {
       // A full redo needs a meaningful share of the deadline left; one
@@ -579,7 +601,7 @@ async function runPreparation(
       if (usesPi(rt.config) && remainingMs < rt.config.prepareTimeoutSeconds * 250) {
         throw new Error(`insufficient preparation time for a full redo (${Math.max(0, Math.round(remainingMs / 1000))}s left)`);
       }
-      ({ prepared, backend } = await control.race(prepareWithClaude($, rt, snapshot, notes, control, capture)));
+      ({ prepared, backend } = await control.race(prepareWithClaude($, rt, snapshot, notes, control, capture, pipelineOptions)));
     }
     control.remaining(await $.clock.now());
     rt.lastPrepare = `${backend} ${Math.round(performance.now() - started)}ms`;
@@ -587,6 +609,7 @@ async function runPreparation(
       checkpointId: `shadow-${generation}-${prepared.coverageEndEntryId}`,
       rendered: prepared.rendered,
       coverageEndEntryId: prepared.coverageEndEntryId,
+      validation: prepared.validation,
       proof: {
         sessionId: rt.sessionId, epoch, snapshotId: `${rt.runtimeId}-${generation}`,
         coveredCount: liveIds.indexOf(prepared.coverageEndEntryId) + 1,
@@ -608,11 +631,12 @@ async function runPreparation(
       }
     } else if (rt.state.publish(generation, checkpoint)) {
       control.finished = true;
+      readiness = prepared.validation.independent === "skipped" ? "validated" : "verified";
       rows.setPreviousCheckpoint(checkpoint.rendered, checkpoint.coverageEndEntryId);
       rt.eligibility = "unchecked";
-      $.ui.status("checkpoint verified; live coverage will be checked at compaction");
+      $.ui.status(`checkpoint ${readiness}; live coverage will be checked at compaction`);
       await $.fs.write(`${directory}/checkpoint.json`, JSON.stringify(checkpoint)).catch(() => undefined);
-      await trace($, rt, "prepare-verified", { generation, coverage: checkpoint.coverageEndEntryId, backend, durationMs: Math.round(performance.now() - started) });
+      await trace($, rt, readiness === "verified" ? "prepare-verified" : "prepare-validated", { generation, coverage: checkpoint.coverageEndEntryId, backend, readiness, validation: prepared.validation, metrics, snapshotMs, durationMs: Math.round(performance.now() - started) });
     }
   } catch (error) {
     if (error instanceof PreparationCancelled) await stopPreparation($, rt, control.reason ?? oneLine(error));
@@ -626,7 +650,7 @@ async function runPreparation(
   } finally {
     control.finished = true;
     if (rt.preparation === control) rt.preparation = undefined;
-    await $.fs.write(`${directory}/outcome.json`, JSON.stringify({ generation, durationMs: Math.round(performance.now() - started), fallback: notes, cancelled: control.reason }))
+    await $.fs.write(`${directory}/outcome.json`, JSON.stringify({ generation, durationMs: Math.round(performance.now() - started), snapshotMs, readiness, metrics, verificationMode: rt.config.verificationMode, fallback: notes, cancelled: control.reason }))
       .catch(() => undefined);
   }
 }
@@ -814,6 +838,8 @@ function statusText(rt: Runtime): string {
     `prepare=${rt.config.prepareThresholdTokens} tokens recentRounds=${rt.config.recentTurns}`,
     `holdCompaction=${rt.config.holdCompaction ? "until-settled" : "off"}`,
     `prepareTimeout=${rt.config.prepareTimeoutSeconds}s`,
+    `verificationMode=${rt.config.verificationMode}`,
+    `validation=${published?.validation.deterministic ?? "none"} independent=${published?.validation.independent ?? "none"} risk=${published?.validation.risk.level ?? "unknown"}`,
     `diagnostics=${dataDirText(rt)}/events`,
     `autoCompactWindow=${rt.autoCompactWindow ?? "unseen"}`,
     `idleCompact=${rt.idleCompact ?? "unseen"}`,
@@ -846,7 +872,7 @@ export const register: Register = (on, options) => {
     await ensureSession($, rt);
     await reconcileHistory($, rt).catch(() => undefined);
     await $.command
-      .register({ name: "shadow-compact", description: "Prepare the verified Shadow checkpoint now" })
+      .register({ name: "shadow-compact", description: "Prepare the checked Shadow checkpoint now" })
       .catch(() => undefined);
     await $.command
       .register({ name: "compact-native", description: "Run Claude Code native compaction once, bypassing Shadow" })
@@ -855,7 +881,7 @@ export const register: Register = (on, options) => {
       .register({ name: "shadow-status", description: "Show Shadow Compact state" })
       .catch(() => undefined);
     await $.command
-      .register({ name: "shadow-export", description: "Print the verified checkpoint for manual copy-paste" })
+      .register({ name: "shadow-export", description: "Print the ready checkpoint for manual copy-paste" })
       .catch(() => undefined);
     const result = await next(e);
     await configureAutoCompactWindow($, rt);
@@ -1062,7 +1088,7 @@ export const register: Register = (on, options) => {
     await reconcileHistory($, rt).catch(() => undefined);
     const published = rt.state.published;
     if (published && rt.state.installedCheckpointId !== published.checkpointId) {
-      return { text: "shadow-compact: checkpoint verified; /compact will check live coverage before installing." };
+      return { text: `shadow-compact: checkpoint ${published.validation.independent === "skipped" ? "validated" : "verified"}; /compact will check live coverage before installing.` };
     }
     const blocker = preparationBlocker(rt);
     if (blocker) {
@@ -1070,7 +1096,7 @@ export const register: Register = (on, options) => {
     }
     void runPreparation($, rt, true);
     return {
-      text: `shadow-compact: background builder/verifier preparation started (archive rows=${rt.archive?.size ?? 0}); live coverage will be checked at compaction.`,
+      text: `shadow-compact: background checkpoint preparation started (verificationMode=${rt.config.verificationMode}, archive rows=${rt.archive?.size ?? 0}); live coverage will be checked at compaction.`,
     };
   });
 
@@ -1078,7 +1104,7 @@ export const register: Register = (on, options) => {
     await ensureSession($, rt);
     const published = rt.state.published;
     if (!published) {
-      return { text: "shadow-compact: no verified checkpoint to export yet." };
+      return { text: "shadow-compact: no ready checkpoint to export yet." };
     }
     return { text: published.rendered };
   });

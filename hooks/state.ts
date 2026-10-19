@@ -9,11 +9,14 @@
  * compaction, so preparation never spins (or retries a failure) while
  * context stays above the threshold.
  */
+import type { PreparedCheckpoint } from "./prepare.js";
+
 export interface PublishedCheckpoint {
   checkpointId: string;
   rendered: string;
   /** Archive uuid of the last transcript message the checkpoint represents. */
   coverageEndEntryId: string;
+  validation: PreparedCheckpoint["validation"];
   proof: {
     sessionId: string;
     epoch: number;
@@ -52,11 +55,12 @@ export class ShadowState {
   get refreshArmed(): boolean {
     return this.#refreshArmed;
   }
-  get phase(): "idle" | "preparing" | "verified" | "verified-preparing" | "installing" | "installed" {
+  get phase(): "idle" | "preparing" | "validated" | "validated-preparing" | "verified" | "verified-preparing" | "installing" | "installed" {
     if (this.#attemptedCheckpointId) return "installing";
     const ready = this.#published && this.#published.checkpointId !== this.#installedCheckpointId;
-    if (this.preparing) return ready ? "verified-preparing" : "preparing";
-    if (ready) return "verified";
+    const independentlyVerified = this.#published?.validation.independent !== "skipped";
+    if (this.preparing) return ready ? (independentlyVerified ? "verified-preparing" : "validated-preparing") : "preparing";
+    if (ready) return independentlyVerified ? "verified" : "validated";
     return this.#installedCheckpointId ? "installed" : "idle";
   }
 
@@ -72,6 +76,9 @@ export class ShadowState {
   /** Publishes a completed preparation, replacing the serving checkpoint. */
   publish(generation: number, result: PublishedCheckpoint): boolean {
     if (this.#preparing !== generation) return false;
+    if (result.validation.deterministic !== "passed" ||
+      (result.validation.independent === "skipped" &&
+        (result.validation.mode !== "adaptive" || result.validation.risk.level !== "low"))) return false;
     this.#preparing = undefined;
     this.#published = result;
     return true;

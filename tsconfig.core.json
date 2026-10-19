@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "lib": ["es2023", "dom"] },
+  "exclude": [],
+  "include": [
+    "tests/support/core-host.d.ts",
+    "hooks/checkpoint.ts",
+    "hooks/checkpoint-validation.ts",
+    "hooks/checkpoint-risk.ts",
+    "hooks/evidence.ts",
+    "hooks/prepare.ts",
+    "hooks/config.ts",
+    "hooks/state.ts",
+    "hooks/preparation-control.ts"
+  ]
+}

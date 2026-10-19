@@ -30,6 +30,8 @@ export type AgentEffort = (typeof AGENT_EFFORTS)[number];
 export const DEFAULT_AGENT_EFFORT: AgentEffort = "high";
 
 export type ManualCompactMode = "shadow" | "native";
+/** Adaptive remains opt-in until replay and live quality gates are met. */
+export type VerificationMode = "always" | "adaptive";
 
 /** Who answers a checkpoint role. `pi` is opt-in only; `claude` is the default. */
 export type CheckpointBackend = "claude" | "pi";
@@ -54,6 +56,7 @@ export interface ShadowConfig {
   prepareTimeoutSeconds: number;
   builderModel: string;
   verifierModel: string;
+  verificationMode: VerificationMode;
   builderEffort: AgentEffort;
   verifierEffort: AgentEffort;
   manualCompactMode: ManualCompactMode;
@@ -116,6 +119,7 @@ export function resolveConfig(options: PluginOptions): ShadowConfig {
     prepareTimeoutSeconds: Math.min(600, positiveInt(options.prepareTimeoutSeconds, DEFAULT_PREPARE_TIMEOUT_SECONDS)),
     builderModel: model(options.builderModel),
     verifierModel: model(options.verifierModel),
+    verificationMode: options.verificationMode === "adaptive" ? "adaptive" : "always",
     builderEffort: effort(options.builderEffort),
     verifierEffort: effort(options.verifierEffort),
     manualCompactMode: options.manualCompactMode === "native" ? "native" : "shadow",

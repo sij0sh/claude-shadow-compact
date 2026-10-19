@@ -8,7 +8,8 @@ import {
 import { decideAutoCompactWindow, decideIdleCompaction, describeModel, describeRole, isAtOrAbove, resolveConfig, usesPi, type WindowFacts } from "../hooks/config.js";
 import { EvidenceArchive } from "../hooks/evidence.js";
 import { redactSecretValue, sanitizeForContext } from "../hooks/normalize.js";
-import { BUILDER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT, prepareCheckpoint, parseSubmission } from "../hooks/prepare.js";
+import { BUILDER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT, prepareCheckpoint, parseSubmission, emptyPreparationMetrics, type AskFn } from "../hooks/prepare.js";
+import { classifyCheckpointRisk } from "../hooks/checkpoint-risk.js";
 import { checkPi } from "../hooks/pi-backend.js";
 import { PI_EVIDENCE_ACCESS, type PiEvidenceFile, type PiRunRequest, type PiRunResult } from "../hooks/pi-protocol.js";
 import { completionText } from "../hooks/claude-backend.js";
@@ -218,6 +219,7 @@ describe("state machine", () => {
     checkpointId: id,
     rendered: "# Continuation Checkpoint",
     coverageEndEntryId: "r1",
+    validation: { deterministic: "passed", independent: "accepted", mode: "always", risk: { level: "low", reasons: [] } },
     proof: { sessionId: "test", epoch: 1, snapshotId: "test", coveredCount: 1, prefixDigest: "test", evidenceDigest: "test" },
   });
 
@@ -254,6 +256,24 @@ describe("state machine", () => {
     const state = new ShadowState();
     expect(state.fail(state.startPreparing()!)).toBe(true);
     expect(state.refreshArmed).toBe(false);
+  });
+
+  test("single-agent readiness cannot publish under always mode or with high risk", () => {
+    const state = new ShadowState();
+    const generation = state.startPreparing()!;
+    const candidate: PublishedCheckpoint = { ...published("adaptive"), validation: {
+      deterministic: "passed", independent: "skipped", mode: "always", risk: { level: "low", reasons: [] },
+    } };
+    expect(state.publish(generation, candidate)).toBe(false);
+    candidate.validation.mode = "adaptive";
+    candidate.validation.risk.level = "high";
+    expect(state.publish(generation, candidate)).toBe(false);
+    candidate.validation.risk.level = "low";
+    expect(state.publish(generation, candidate)).toBe(true);
+    expect(state.phase).toBe("validated");
+    state.rearm();
+    state.startPreparing();
+    expect(state.phase).toBe("validated-preparing");
   });
 });
 
@@ -341,7 +361,176 @@ describe("prepare pipeline", () => {
   });
 });
 
+describe("adaptive checkpoint routing", () => {
+  const lowArchive = () => archiveWith([
+    ["r1", "user", "Port shadow compact and wire the compact hook"],
+    ["r2", "assistant", "Working on the compact hook with private agents"],
+  ]);
+  const models = { builder: "haiku", verifier: "haiku" };
+  const submission = (checkpoint = checkpointJson("E0001"), coverage = "r2") => JSON.stringify({ checkpoint, coverageEndEntryId: coverage });
+
+  test("adaptive low-risk generation needs one agent invocation and reports validation honestly", async () => {
+    const metrics = emptyPreparationMetrics();
+    const roles: string[] = [];
+    const ask: AskFn = async request => { roles.push(request.role); return submission(); };
+    const ready = await prepareCheckpoint(ask, lowArchive(), "inline", models, undefined, { verificationMode: "adaptive", metrics });
+    expect(roles).toEqual(["builder"]);
+    expect(ready.validation).toMatchObject({ deterministic: "passed", independent: "skipped", mode: "adaptive", risk: { level: "low" } });
+    expect(metrics).toMatchObject({ builderCalls: 1, verifierCalls: 0, correctionCount: 0, route: "single-agent" });
+  });
+
+  test("always mode keeps the independent verifier even for low-risk drafts", async () => {
+    const roles: string[] = [];
+    const ready = await prepareCheckpoint(async request => {
+      roles.push(request.role);
+      return request.role === "builder" ? submission() : '{"verdict":"accept"}';
+    }, lowArchive(), "inline", models);
+    expect(roles).toEqual(["builder", "verifier"]);
+    expect(ready.validation).toMatchObject({ independent: "accepted", mode: "always", risk: { level: "low" } });
+  });
+
+  // Synthetic replay cases for the audit's failure classes, not recordings from the audit.
+  const riskySources = [
+    ["No, use the other compact API instead", "source-correction"],
+    ["Only a subset was displayed; omitted links: 17", "source-quantity"],
+    ["The user approved a proposal", "source-acceptance"],
+    ["The previous variant was rejected", "source-rejected-approach"],
+    ["An unresolved error prevents continuation", "source-error"],
+    ["The assistant says the implementation is completed", "source-verification"],
+  ];
+  for (const [source, code] of riskySources) {
+    test(`independent verification is required for ${code}`, async () => {
+      const archive = archiveWith([["r1", "user", source!], ["r2", "assistant", "Working on the compact hook"]]);
+      const roles: string[] = [];
+      const ready = await prepareCheckpoint(async request => {
+        roles.push(request.role);
+        return request.role === "builder" ? submission() : '{"verdict":"accept"}';
+      }, archive, "inline", models, undefined, { verificationMode: "adaptive" });
+      expect(roles).toEqual(["builder", "verifier"]);
+      expect(ready.validation.risk.reasons.map(reason => reason.code)).toContain(code);
+    });
+  }
+
+  test("success, quantities, verified status, and continuation claims are high risk even with existing refs", () => {
+    const variants = [
+      { completedWork: [{ text: "All tests passed", evidenceRefs: ["E0001"] }] },
+      { currentState: [{ text: "There are 99 omitted links", evidenceRefs: ["E0001"] }] },
+      { verificationState: [{ text: "Compact behavior verified", status: "verified", evidenceRefs: ["E0001"] }] },
+      { continuationState: { currentGoal: "Ship the compact hook", currentApproach: "Everything is fixed", immediateNextStep: "Deploy the compact hook" } },
+      { currentState: [{ text: "Build succeeded but deployment is unverified", evidenceRefs: ["E0001"] }] },
+    ];
+    for (const variant of variants) {
+      const archive = lowArchive();
+      const draft = parseSubmission(submission({ ...checkpointJson("E0001"), ...variant }), archive);
+      expect(classifyCheckpointRisk(draft, archive).level).toBe("high");
+    }
+  });
+
+  test("omitted user context and previous-checkpoint-only claims cannot bypass the verifier", () => {
+    const archive = lowArchive();
+    archive.addAppend("r3", "prompt", { type: "user", role: "user", content: [{ type: "text", text: "Also keep the export hook" }] }, "composer");
+    const draft = parseSubmission(submission(checkpointJson("E0001"), "r3"), archive);
+    expect(classifyCheckpointRisk(draft, archive).reasons.map(reason => reason.code)).toContain("uncited-user-context");
+    archive.setPreviousCheckpoint("Prior continuation state", "r2");
+    const prior = parseSubmission(submission(checkpointJson("E0000"), "r3"), archive);
+    expect(classifyCheckpointRisk(prior, archive).reasons.map(reason => reason.code)).toContain("previous-checkpoint-only");
+  });
+
+  test("truncation metadata forces verification and survives snapshot serialization", () => {
+    const archive = lowArchive();
+    archive.addAppend("r3", "response", { type: "assistant", content: [{ type: "text", text: "context ".repeat(600) }] });
+    const snapshot = archive.snapshot(2);
+    const draft = parseSubmission(submission(checkpointJson("E0001"), "r3"), snapshot);
+    expect(snapshot.rows[2]?.textTruncated).toBe(true);
+    expect(snapshot.rows[2]?.originalTextChars).toBe(4800);
+    expect(snapshot.fullText()).toContain('"textTruncated":true');
+    expect(classifyCheckpointRisk(draft, snapshot).reasons.map(reason => reason.code)).toContain("source-truncated");
+  });
+
+  test("risk is bounded by coverage; newer evidence remains in the exact suffix", () => {
+    const archive = lowArchive();
+    archive.addAppend("r3", "prompt", { type: "user", role: "user", content: [{ type: "text", text: "No, that failed with error 42" }] });
+    const draft = parseSubmission(submission(), archive);
+    expect(classifyCheckpointRisk(draft, archive).level).toBe("low");
+  });
+
+  test("one bounded correction can recover low-risk output without adding a verifier", async () => {
+    const metrics = emptyPreparationMetrics();
+    let calls = 0;
+    await prepareCheckpoint(async request => {
+      calls += 1;
+      if (calls === 1) return "invalid answer";
+      expect(request.prompt).toContain("Your previous answer was rejected");
+      return submission();
+    }, lowArchive(), "inline", models, undefined, { verificationMode: "adaptive", metrics });
+    expect(calls).toBe(2);
+    expect(metrics).toMatchObject({ builderCalls: 2, correctionCount: 1, verifierCalls: 0 });
+  });
+
+  test("repeated malformed output fails after one correction and never invokes a verifier", async () => {
+    const metrics = emptyPreparationMetrics();
+    await expect(prepareCheckpoint(async () => "bad answer", lowArchive(), "inline", models, undefined,
+      { verificationMode: "adaptive", metrics })).rejects.toThrow("builder failed validation");
+    expect(metrics).toMatchObject({ builderCalls: 2, verifierCalls: 0, correctionCount: 1 });
+  });
+
+  test("audit-shaped inaccuracies are routed to a full repair that retains counts, rejections and errors", async () => {
+    const archive = archiveWith([
+      ["r1", "user", "Review the proposal; acceptance has not been given"],
+      ["r2", "assistant", "Displayed a subset; omitted links: 17. Variant blue was rejected. Error: missing source."],
+    ]);
+    const repaired = {
+      ...checkpointJson("E0001"),
+      currentState: [{ text: "Displayed a subset; omitted links: 17", evidenceRefs: ["E0002"] }],
+      decisions: [{ text: "Variant blue was rejected; acceptance is pending", evidenceRefs: ["E0001", "E0002"] }],
+      openIssues: [{ text: "Error: missing source remains unresolved", evidenceRefs: ["E0002"] }],
+    };
+    const ready = await prepareCheckpoint(async request => request.role === "builder"
+      ? submission({ ...checkpointJson("E0001"), completedWork: [{ text: "All links accepted", evidenceRefs: ["E0001"] }] })
+      : JSON.stringify({ verdict: "repair", checkpoint: repaired, coverageEndEntryId: "r2" }),
+    archive, "inline", models, undefined, { verificationMode: "adaptive" });
+    expect(ready.validation.independent).toBe("repaired");
+    expect(ready.rendered).toContain("omitted links: 17");
+    expect(ready.rendered).toContain("Variant blue was rejected");
+    expect(ready.rendered).toContain("missing source remains unresolved");
+    expect(ready.rendered).not.toContain("All links accepted");
+  });
+
+  test("coverage integrity checks reject regression, forward citations and missing previous evidence", () => {
+    const archive = lowArchive();
+    expect(() => parseSubmission(submission(checkpointJson("E0002"), "r1"), archive)).toThrow("beyond coverageEndEntryId");
+    archive.setPreviousCheckpoint("Previous continuation checkpoint", "r2");
+    expect(() => parseSubmission(submission(checkpointJson("E0001"), "r1"), archive)).toThrow("regresses");
+    archive.setPreviousCheckpoint("Previous continuation checkpoint", "missing-row");
+    expect(() => parseSubmission(submission(), archive)).toThrow("absent from the evidence snapshot");
+  });
+
+  test("render size is checked before optional verification", async () => {
+    const metrics = emptyPreparationMetrics();
+    const oversized = { ...checkpointJson("E0001"), currentState: Array.from({ length: 10 }, () => ({ text: "context ".repeat(950), evidenceRefs: ["E0001"] })) };
+    await expect(prepareCheckpoint(async () => submission(oversized), lowArchive(), "inline", models, undefined, { metrics })).rejects.toThrow("Rendered checkpoint exceeds");
+    expect(metrics.verifierCalls).toBe(0);
+  });
+
+  test("a turn spanning the previous boundary is required and the index contains locations, not duplicate text", () => {
+    const archive = lowArchive();
+    archive.setPreviousCheckpoint("Prior checkpoint state", "r1");
+    expect(archive.manifest().requiredTurnIds).toContain("turn-1");
+    expect(archive.manifest().inspectionRanges).toEqual([{ start: 0, count: 2 }]);
+    expect(archive.evidenceIndex()[1]).toMatchObject({ evidenceId: "E0002", entryId: "r2", position: 1, line: 2, turnId: "turn-1" });
+    expect(JSON.stringify(archive.evidenceIndex())).not.toContain("Working on the compact hook");
+    archive.addAppend("r3", "response", { type: "assistant", content: [] });
+    expect(archive.evidenceIndex().length).toBe(3);
+    expect(archive.manifest().rowCount).toBe(3);
+  });
+});
+
 describe("config", () => {
+  test("adaptive verification is opt-in and unknown settings keep independent verification", () => {
+    expect(resolveConfig({}).verificationMode).toBe("always");
+    expect(resolveConfig({ verificationMode: "adaptive" }).verificationMode).toBe("adaptive");
+    expect(resolveConfig({ verificationMode: "never" }).verificationMode).toBe("always");
+  });
   test("preparation has one bounded positive deadline", () => {
     expect(resolveConfig({}).prepareTimeoutSeconds).toBe(360);
     expect(resolveConfig({ prepareTimeoutSeconds: 999 }).prepareTimeoutSeconds).toBe(600);
@@ -795,6 +984,122 @@ async function readyHost(coverage = "a2") {
   await h.measure(160_000);
   return h;
 }
+
+const adaptiveCovering: Reply = request => request.system === BUILDER_SYSTEM_PROMPT
+  ? JSON.stringify({ checkpoint: { ...checkpointJson("E0001"), constraints: [{ text: "The second ask remains in scope", evidenceRefs: ["E0003"] }] }, coverageEndEntryId: "a2" })
+  : JSON.stringify({ verdict: "accept", reason: "grounded" });
+
+describe("adaptive host integration", () => {
+  test("a validated checkpoint installs with the existing prefix proof and exact uncovered tail", async () => {
+    const h = host({ verificationMode: "adaptive", recentTurns: 1 }, undefined, { workerReply: adaptiveCovering });
+    await fill(h);
+    expect(h.workerCalls).toBe(1);
+    expect(await h.status()).toContain("phase=validated");
+    expect(await h.status()).toContain("independent=skipped risk=low");
+    const outcome = JSON.parse([...h.files.entries()].find(([path]) => path.endsWith("/outcome.json"))![1]);
+    expect(outcome.metrics).toMatchObject({ builderCalls: 1, verifierCalls: 0, route: "single-agent" });
+    const { result, coreCalls } = await h.compact(transcript());
+    expect(coreCalls).toBe(0);
+    expect(result.messages?.slice(1)).toEqual(transcript().slice(4));
+  });
+
+  test("adaptive preparation removes one full worker wait on eligible evidence", async () => {
+    const adaptive = host({ verificationMode: "adaptive", recentTurns: 1 }, undefined, { workerReply: adaptiveCovering, workerDelaySleeps: 3 });
+    await fill(adaptive);
+    expect((await adaptive.compact(transcript())).coreCalls).toBe(0);
+    expect(adaptive.workerCalls).toBe(1);
+    const baseline = host({ recentTurns: 1 }, undefined, { workerReply: adaptiveCovering, workerDelaySleeps: 3 });
+    await fill(baseline);
+    expect((await baseline.compact(transcript())).coreCalls).toBe(0);
+    expect(baseline.workerCalls).toBe(2);
+    expect(baseline.sleeps).toBeGreaterThanOrEqual(adaptive.sleeps + 3);
+  });
+
+  test("a failed Claude verifier reuses its builder draft for inline verification", async () => {
+    const inlineRoles: string[] = [];
+    const h = host({ recentTurns: 1 }, request => {
+      inlineRoles.push(request.system === VERIFIER_SYSTEM_PROMPT ? "verifier" : "builder");
+      return '{"verdict":"accept"}';
+    }, { workerReply: request => {
+      if (request.system === VERIFIER_SYSTEM_PROMPT) throw new Error("transport disconnected");
+      return adaptiveCovering(request);
+    } });
+    await fill(h);
+    expect(h.claudeRuns.map(run => run.role)).toEqual(["builder", "verifier"]);
+    expect(inlineRoles).toEqual(["verifier"]);
+    expect(await h.status()).toContain("phase=verified");
+    const outcome = JSON.parse([...h.files.entries()].find(([path]) => path.endsWith("/outcome.json"))![1]);
+    expect(outcome.metrics).toMatchObject({ builderCalls: 1, verifierCalls: 2 });
+  });
+
+  test("a rejected checkpoint goes to native without restarting on inline completion", async () => {
+    let inlineCalls = 0;
+    const h = host({ recentTurns: 1 }, () => { inlineCalls += 1; return '{"verdict":"accept"}'; }, { workerReply: request =>
+      request.system === VERIFIER_SYSTEM_PROMPT ? '{"verdict":"unusable","reason":"unsupported claims"}' : adaptiveCovering(request) });
+    await fill(h);
+    expect(await h.status()).toContain("checkpoint=none");
+    expect(inlineCalls).toBe(0);
+    expect((await h.compact(transcript())).coreCalls).toBe(1);
+  });
+
+  test("adaptive preparation shares the deadline and rejects late low-risk answers", async () => {
+    const h = host({ verificationMode: "adaptive", recentTurns: 1, prepareTimeoutSeconds: 2 }, undefined,
+      { workerReply: adaptiveCovering, workerDelaySleeps: 1000 });
+    await fill(h);
+    await h.advance(2000);
+    await h.deliverLate();
+    expect(h.workerCalls).toBe(1);
+    expect(await h.status()).toContain("checkpoint=none");
+    expect(await h.status()).toContain("preparation deadline reached");
+    const outcome = JSON.parse([...h.files.entries()].find(([path]) => path.endsWith("/outcome.json"))![1]);
+    expect(outcome.readiness).toBe(null);
+  });
+
+  test("independent readiness is required for high-risk adaptive drafts", async () => {
+    const h = host({ verificationMode: "adaptive", recentTurns: 1 }, undefined, { workerReply: covering("a2") });
+    await fill(h);
+    // The builder omitted the second person's prompt; an existing citation is insufficient.
+    expect(h.claudeRuns.map(run => run.role)).toEqual(["builder", "verifier"]);
+    expect(await h.status()).toContain("independent=accepted risk=high");
+  });
+
+  test("adaptive low-risk Pi generation skips the verifier without changing worker transport", async () => {
+    const h = host({ ...PI_BOTH, verificationMode: "adaptive", recentTurns: 1 }, undefined, { piWorker: request => ({
+      nonce: request.nonce, ok: true, answer: adaptiveCovering(request), usage,
+      toolRounds: 3, durationMs: 10,
+    }) });
+    await fill(h);
+    expect(h.piRuns.map(run => run.role)).toEqual(["builder"]);
+    expect(h.workerCalls).toBe(0);
+    expect(await h.status()).toContain("phase=validated");
+    expect((await h.compact(transcript())).coreCalls).toBe(0);
+  });
+
+  test("adaptive readiness still refuses a changed covered prefix", async () => {
+    const h = host({ verificationMode: "adaptive", holdCompaction: false, recentTurns: 1 }, undefined, { workerReply: adaptiveCovering });
+    await fill(h);
+    expect(await h.status()).toContain("phase=validated");
+    const changed = transcript();
+    changed[0] = { ...changed[0]!, text: longText("changed task") };
+    expect((await h.compact(changed)).coreCalls).toBe(1);
+  });
+
+  test("a backend change cannot reset the generator correction budget", async () => {
+    let workerCalls = 0;
+    let inlineCalls = 0;
+    const h = host({ recentTurns: 1 }, () => { inlineCalls += 1; return "still malformed"; }, { workerReply: () => {
+      workerCalls += 1;
+      if (workerCalls === 1) return "malformed";
+      throw new Error("correction transport failed");
+    } });
+    await fill(h);
+    expect(workerCalls).toBe(2);
+    expect(inlineCalls).toBe(1);
+    expect(await h.status()).toContain("checkpoint=none");
+    const outcome = JSON.parse([...h.files.entries()].find(([path]) => path.endsWith("/outcome.json"))![1]);
+    expect(outcome.metrics.correctionCount).toBe(1);
+  });
+});
 
 describe("token threshold", () => {
   test("checkpoint preparation starts at the token boundary without percentage usage", async () => {
@@ -1322,7 +1627,7 @@ describe("pi backend", () => {
     expect(coreCalls).toBe(0);
   });
 
-  test("an unusable Pi verdict also falls back to Claude", async () => {
+  test("an unusable Pi verdict fails closed without asking another backend", async () => {
     const unusable: PiWorker = (request) =>
       request.role === "builder"
         ? piCovering("a2")(request)
@@ -1330,8 +1635,9 @@ describe("pi backend", () => {
     const h = host({ ...PI_BOTH, recentTurns: 1 }, covering("a2"), { piWorker: unusable });
     await fill(h);
     const status = await h.status();
-    expect(status).toContain("checkpoint=shadow-");
-    expect(status).toContain("lastFallback=pi:Verifier rejected the checkpoint as unusable: ungrounded");
+    expect(status).toContain("checkpoint=none");
+    expect(status).toContain("Verifier rejected the checkpoint as unusable: ungrounded");
+    expect(h.workerCalls).toBe(0);
   });
 
   test("a stale result file from another run is never trusted", async () => {
@@ -1546,7 +1852,7 @@ describe("engine integration", () => {
     expect(result.text).toContain("verifier=claude:haiku");
     expect(result.text).toContain("lastFallback=none");
     expect(result.text).toContain("lastCompact=unseen");
-    expect(result.text).toContain("v0.4.9");
+    expect(result.text).toContain("v0.4.10");
   });
 
   test("compact with no checkpoint defers without inventing messages", async ($, on) => {

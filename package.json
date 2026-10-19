@@ -1,6 +1,6 @@
 {
   "name": "claude-shadow-compact",
-  "version": "0.4.9",
+  "version": "0.4.10",
   "private": true,
   "type": "module",
   "description": "Shadow Compact ported to a Claude Code mod: verified checkpoints with exact recent-tail preservation.",
@@ -8,8 +8,10 @@
   "scripts": {
     "build": "node scripts/build-worker.mjs",
     "typecheck": "tsc --noEmit && tsc --noEmit -p worker",
+    "typecheck:core": "tsc --noEmit -p tsconfig.core.json",
     "validate": "claude plugin validate .",
     "test": "claude plugin test .",
+    "test:hooks": "node scripts/test-hooks.mjs",
     "test:worker": "node scripts/test-worker.mjs",
     "check": "npm run typecheck && npm run validate && npm test && npm run test:worker"
   },
