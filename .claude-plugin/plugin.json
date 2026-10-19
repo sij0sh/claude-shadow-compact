@@ -1,7 +1,7 @@
 {
   "name": "shadow-compact",
-  "version": "0.4.8",
-  "description": "Verified-checkpoint compaction for Claude Code: a private builder and independent verifier prepare an evidence-grounded checkpoint in the background, and Claude Code's own /compact or auto-compaction installs it through session.compact with the exact recent tail preserved by handle.",
+  "version": "0.4.9",
+  "description": "Verified-checkpoint compaction for Claude Code: isolated builder/verifier workers prepare evidence-grounded checkpoints, reconcile complete history after reload, and preserve every uncovered message plus the exact recent tail.",
   "author": {
     "name": "pi-shadow-compact port"
   },
@@ -51,7 +51,7 @@
     "builderModel": {
       "type": "string",
       "title": "Builder model",
-      "description": "Model alias or id for the private checkpoint-builder agent; haiku keeps cost low, inherit uses the session model.",
+      "description": "Model alias or id for the isolated checkpoint-builder worker; haiku keeps cost low, inherit uses the session model.",
       "default": "haiku",
       "options": [
         "inherit",
@@ -63,7 +63,7 @@
     "verifierModel": {
       "type": "string",
       "title": "Verifier model",
-      "description": "Model alias or id for the private checkpoint-verifier agent; haiku keeps cost low, inherit uses the session model.",
+      "description": "Model alias or id for the isolated checkpoint-verifier worker; haiku keeps cost low, inherit uses the session model.",
       "default": "haiku",
       "options": [
         "inherit",
@@ -75,7 +75,7 @@
     "builderEffort": {
       "type": "string",
       "title": "Builder effort",
-      "description": "Reasoning effort for the private checkpoint-builder Claude agent.",
+      "description": "Reasoning effort for the isolated checkpoint-builder Claude worker.",
       "default": "high",
       "options": [
         "low",
@@ -88,7 +88,7 @@
     "verifierEffort": {
       "type": "string",
       "title": "Verifier effort",
-      "description": "Reasoning effort for the private checkpoint-verifier Claude agent.",
+      "description": "Reasoning effort for the isolated checkpoint-verifier Claude worker.",
       "default": "high",
       "options": [
         "low",
@@ -101,7 +101,7 @@
     "builderBackend": {
       "type": "string",
       "title": "Builder backend",
-      "description": "claude runs the builder as a private Claude agent (default). pi runs it through Shadow's bundled Pi SDK worker with the provider and model below; this sends the sanitized evidence archive to that external provider. If a Pi preparation fails, Shadow redoes it with the Claude models.",
+      "description": "claude runs the builder as an isolated Claude CLI worker (default). pi runs it through Shadow's bundled Pi SDK worker with the provider and model below; this sends the sanitized evidence archive to that external provider. If a Pi preparation fails, Shadow redoes it with the Claude models.",
       "default": "claude",
       "options": [
         "claude",
@@ -111,7 +111,7 @@
     "verifierBackend": {
       "type": "string",
       "title": "Verifier backend",
-      "description": "claude runs the verifier as a private Claude agent (default). pi runs it through Shadow's bundled Pi SDK worker with the provider and model below; this sends the sanitized evidence archive to that external provider. If a Pi preparation fails, Shadow redoes it with the Claude models.",
+      "description": "claude runs the verifier as an isolated Claude CLI worker (default). pi runs it through Shadow's bundled Pi SDK worker with the provider and model below; this sends the sanitized evidence archive to that external provider. If a Pi preparation fails, Shadow redoes it with the Claude models.",
       "default": "claude",
       "options": [
         "claude",
@@ -174,8 +174,8 @@
     },
     "piNodePath": {
       "type": "string",
-      "title": "Node for the Pi worker",
-      "description": "Node.js (20+) executable that runs the Pi worker; used only when a backend is pi.",
+      "title": "Node for checkpoint workers",
+      "description": "Node.js executable that runs the bundled checkpoint workers (Claude and Pi).",
       "default": "node"
     },
     "manualCompactMode": {
@@ -193,6 +193,12 @@
       "title": "Preparation deadline (seconds)",
       "description": "One deadline shared by builder, verifier, retries and backend fallbacks. A held compaction falls back to native only when this deadline passes without a checkpoint. Positive integer, at most 600.",
       "default": 360
+    },
+    "claudePath": {
+      "type": "string",
+      "title": "Claude executable",
+      "description": "Claude Code executable used by isolated --safe-mode checkpoint workers. Uses existing Claude authentication; never runs as a parent-session subagent.",
+      "default": "claude"
     }
   }
 }

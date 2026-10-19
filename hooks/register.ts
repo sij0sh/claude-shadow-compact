@@ -3,7 +3,7 @@
  * lifecycle is replaced by mod hooks:
  * - `session.append` mirrors every main-loop row into the evidence archive
  * - `session.measure` starts background preparation at the prepare threshold
- * - private builder/verifier agents (hidden via `agent.offer`) produce a
+ * - isolated builder/verifier workers produce a
  *   verified checkpoint; strict-JSON answers are validated in `prepare.ts`
  * - `session.compact` installs checkpoint + exact handle tail; when the
  *   checkpoint is still preparing (or none was started) it holds the
@@ -74,10 +74,9 @@ import { PI_EVIDENCE_ACCESS } from "./pi-protocol.js";
 import { ShadowState, type PublishedCheckpoint } from "./state.js";
 import { buildCandidate, isSkipped } from "./working-context.js";
 import { LiveTranscript, isTranscriptRow } from "./transcript.js";
+import { contentDigest, prefixDigest, messageFromAppend, messageIdentity } from "./transcript.js";
+import { askViaClaudeWorker, completionText } from "./claude-backend.js";
 import { PreparationCancelled, PreparationControl } from "./preparation-control.js";
-
-const BUILDER_TYPE = "shadow-compact:checkpoint-builder";
-const VERIFIER_TYPE = "shadow-compact:checkpoint-verifier";
 
 /** How often a held compaction checks on its preparation. */
 const COMPACT_POLL_SECONDS = 1;
@@ -87,7 +86,7 @@ const COMPACT_BUDGET_RESERVE_MS = 2_000;
 const HOLD_GRACE_SECONDS = 30;
 
 /** Running plugin version shown in status; bump with the manifest. */
-const PLUGIN_VERSION = "0.4.8";
+const PLUGIN_VERSION = "0.4.9";
 
 /** Inline evidence cap for the model.complete fallback. */
 const INLINE_EVIDENCE_CHARS = 120_000;
@@ -108,8 +107,15 @@ interface Runtime {
   preparation: PreparationControl | undefined;
   runtimeId: string;
   traceSequence: number;
-  bootstrapped: boolean;
-  pendingAnswers: Map<string, (answer: string) => void>;
+  initializing: Promise<void> | undefined;
+  reconciliation: Promise<void> | undefined;
+  historyStatus: string;
+  historyEpoch: number;
+  revision: number;
+  pendingAppends: number;
+  lifecycle: number;
+  historyReadGeneration: number;
+  eligibility: string;
   /** A compaction this mod saw is waiting for its summary row's append. */
   awaitingCompactionRow: boolean;
   /** Last preparation fallback/failure for status; never prompt text. */
@@ -150,8 +156,15 @@ function createRuntime(config: ShadowConfig): Runtime {
     preparation: undefined,
     runtimeId: crypto.randomUUID(),
     traceSequence: 0,
-    bootstrapped: false,
-    pendingAnswers: new Map(),
+    initializing: undefined,
+    reconciliation: undefined,
+    historyStatus: "pending",
+    historyEpoch: 0,
+    revision: 0,
+    pendingAppends: 0,
+    lifecycle: 0,
+    historyReadGeneration: 0,
+    eligibility: "no-checkpoint",
     awaitingCompactionRow: false,
     lastFallback: null,
     lastCompact: null,
@@ -168,21 +181,95 @@ function createRuntime(config: ShadowConfig): Runtime {
 }
 
 async function ensureSession($: EngineInterface, rt: Runtime): Promise<EvidenceArchive> {
-  if (!rt.archive) {
-    rt.cwd = await $.session.cwd().catch(() => rt.cwd);
-    rt.sessionId = await $.session.id().catch(() => rt.sessionId);
-    rt.archive = new EvidenceArchive(rt.cwd);
+  if (!rt.initializing) rt.initializing = initializeSession($, rt);
+  const task = rt.initializing;
+  try { await task; } catch (error) { if (rt.initializing === task) rt.initializing = undefined; throw error; }
+  return rt.archive!;
+}
+
+async function initializeSession($: EngineInterface, rt: Runtime): Promise<void> {
+  const lifecycle = rt.lifecycle;
+  const cwd = await $.session.cwd().catch(() => rt.cwd);
+  const id = await $.session.id().catch(() => rt.sessionId);
+  if (lifecycle !== rt.lifecycle) throw new Error("session changed during initialization");
+  rt.cwd = cwd;
+  rt.sessionId = id;
+  rt.archive = new EvidenceArchive(cwd);
+}
+
+/** All changes are synchronous until the new canonical index is committed.
+ * Persist superseded archives separately; never insert an old prefix after new rows. */
+async function adoptHistory($: EngineInterface, rt: Runtime, messages: readonly SessionMessage[], source: string): Promise<void> {
+  if (source === "compact") rt.historyReadGeneration += 1;
+  const previous = rt.archive!;
+  const ids = rt.transcript.bind(messages, rt.messageRowIds, rt.historyEpoch + 1);
+  const indexes = ids.map(id => previous.indexOf(id));
+  const missing = indexes.some(index => index < 0);
+  const outOfOrder = indexes.some((index, i) => i > 0 && index <= indexes[i - 1]!);
+  const firstMissing = indexes.indexOf(-1);
+  const missingTail = firstMissing >= 0 && (firstMissing > 0 || previous.size === 0) && indexes.slice(firstMissing).every(index => index < 0) &&
+    indexes.slice(0, firstMissing).every((index, i, prefix) => i === 0 || index > prefix[i - 1]!);
+  let superseded: string | undefined;
+  const contentChanged = ids.some((id, index) => {
+    const observed = rt.transcript.messages([id])?.[0];
+    return observed && messageIdentity(observed) !== messageIdentity(messages[index]!);
+  });
+  // A compacted canonical prefix intentionally places a new checkpoint before
+  // older retained rows. Keep the original evidence archive for later grounding.
+  const retained = rt.transcript.matchesPrefix(messages);
+  const rebuilt = contentChanged || (missing && !missingTail) || (outOfOrder && !retained);
+  if (rebuilt) {
+    superseded = previous.size ? previous.fullText() : undefined;
+    const archive = new EvidenceArchive(rt.cwd);
+    messages.forEach((message, index) => archive.addSessionMessage(ids[index]!, message, "reconciled"));
+    rt.archive = archive;
+    rt.historyEpoch += 1;
+    rt.state.discardPublished();
+    rt.eligibility = "no-checkpoint";
+  } else if (missingTail) {
+    messages.slice(firstMissing).forEach((message, index) => previous.addSessionMessage(ids[firstMissing + index]!, message, "reconciled"));
   }
-  if (!rt.bootstrapped) {
-    rt.bootstrapped = true;
-    const messages = await $.session.messages().catch(() => [] as SessionMessage[]);
-    if (rt.archive.size === 0 && messages.length > 0) {
-      rt.archive.bootstrap(messages);
-      rt.messageRowIds = rt.archive.rows.map((row) => row.id);
-      rt.transcript.remember(messages, rt.messageRowIds);
+  rt.messageRowIds = ids;
+  rt.transcript.remember(messages, ids);
+  rt.historyStatus = messages.length ? `reconciled:${source}` : "pending:empty";
+  if (superseded) await $.fs.write(`${dataDir($, rt)}/history-before-${rt.historyEpoch}.jsonl`, superseded);
+  await trace($, rt, "history-reconciled", { source, messages: messages.length, epoch: rt.historyEpoch, rebuilt });
+}
+
+async function readHistory($: EngineInterface, rt: Runtime): Promise<void> {
+  const lifecycle = rt.lifecycle;
+  const readGeneration = rt.historyReadGeneration;
+  rt.historyStatus = "reading";
+  try {
+    // An append racing the host read causes a fresh read, not a lost or
+    // duplicated suffix. No append can interleave the final synchronous commit.
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const revision = rt.revision;
+      const messages = await $.session.messages();
+      if (lifecycle !== rt.lifecycle) throw new Error("session changed during reconciliation");
+      if (readGeneration !== rt.historyReadGeneration) throw new Error("history read superseded by compaction");
+      if (revision !== rt.revision || rt.pendingAppends) {
+        if (!(await hostPause($, rt))) throw new Error("history read could not pause for pending appends");
+        continue;
+      }
+      if (messages.length >= 4096) throw new Error("history-read-limited:4096");
+      if (!messages.length && rt.messageRowIds.length) throw new Error("history-read-empty");
+      await adoptHistory($, rt, messages, "canonical");
+      return;
     }
+    throw new Error("history-read-raced-appends");
+  } catch (error) {
+    if (lifecycle !== rt.lifecycle || readGeneration !== rt.historyReadGeneration) throw error;
+    rt.historyStatus = `retryable:${oneLine(error)}`;
+    await trace($, rt, "history-read-failed", { reason: oneLine(error) });
+    throw error;
   }
-  return rt.archive;
+}
+
+async function reconcileHistory($: EngineInterface, rt: Runtime): Promise<void> {
+  if (!rt.reconciliation) rt.reconciliation = readHistory($, rt);
+  const task = rt.reconciliation;
+  try { await task; } finally { if (rt.reconciliation === task) rt.reconciliation = undefined; }
 }
 
 /** A compaction row arrived: acknowledge an owned install or invalidate an
@@ -212,9 +299,6 @@ async function stopPreparation($: EngineInterface, rt: Runtime, reason: string):
   control.cancel(reason);
   // The worker polls this file and aborts its current provider request.
   await $.fs.write(`${control.directory}/cancel`, reason).catch(() => undefined);
-  for (const agentId of control.agents) {
-    await $.tool.call({ tool: "TaskStop", task_id: agentId }).catch(() => undefined);
-  }
   await trace($, rt, "prepare-cancel", { generation: control.generation, reason });
 }
 
@@ -273,6 +357,9 @@ async function compactNatively(
     return id;
   });
   rt.transcript.remember(result.messages, rt.messageRowIds);
+  rt.historyReadGeneration += 1;
+  rt.revision += 1;
+  rt.historyStatus = "reconciled:native";
   // The pre-compaction token figures describe history that is gone.
   rt.tokenEstimate = null;
   rt.lastTokens = null;
@@ -334,45 +421,8 @@ function inlineEvidence(rows: EvidenceArchive): string {
   return `Session evidence (sanitized JSONL rows; cite evidenceId, name coverage by entryId):\n${text}${previousText}`;
 }
 
-function askViaAgent($: EngineInterface, rt: Runtime, kind: "builder" | "verifier", control: PreparationControl): AskFn {
-  return async (request) => {
-    const spawned = await $.agent.spawn({
-      subagentType: kind === "builder" ? BUILDER_TYPE : VERIFIER_TYPE,
-      prompt: request.prompt,
-      description: kind === "builder" ? "Build shadow checkpoint" : "Verify shadow checkpoint",
-      ...(request.model !== "inherit" ? { model: request.model } : {}),
-    });
-    if (spawned.deny || !spawned.agentId) {
-      throw new Error(`Agent spawn refused: ${spawned.deny ?? "no agent id"}`);
-    }
-    const agentId = spawned.agentId;
-    control.agents.add(agentId);
-    if (control.reason) {
-      await $.tool.call({ tool: "TaskStop", task_id: agentId }).catch(() => undefined);
-      throw new PreparationCancelled(control.reason);
-    }
-    const answer = new Promise<string>((resolve) => {
-      rt.pendingAnswers.set(agentId, resolve);
-    });
-    try {
-      return await control.race(answer);
-    } finally {
-      rt.pendingAnswers.delete(agentId);
-      // Cancellation owns stopping the agent; normal completion releases it.
-      if (!control.reason) control.agents.delete(agentId);
-    }
-  };
-}
-
-/** One AskFn routing each role to its private agent type. */
-function askViaAgents($: EngineInterface, rt: Runtime, control: PreparationControl): AskFn {
-  const builder = askViaAgent($, rt, "builder", control);
-  const verifier = askViaAgent($, rt, "verifier", control);
-  return (request) => (request.role === "builder" ? builder(request) : verifier(request));
-}
-
 /**
- * One preparation with Pi on its configured roles and Claude agents on
+ * One preparation with Pi on its configured roles and Claude workers on
  * the rest. Each Pi role reads the snapshot through the worker's tools;
  * a Claude role reads the evidence file.
  */
@@ -383,9 +433,9 @@ async function prepareWithPi($: EngineInterface, rt: Runtime, snapshot: Evidence
   const pi = askViaPi($, rt.config, { evidencePath, dataDir: dir, control }, rt.piStats);
   const claudeRoles = roleBackend(rt.config, "builder") === "claude" || roleBackend(rt.config, "verifier") === "claude";
   const claudeAccess = claudeRoles ? await evidenceAccess($, rt, snapshot, control) : "";
-  const agents = askViaAgents($, rt, control);
+  const claude = askViaClaudeWorker($, rt.config, control);
   const ask: AskFn = (request) =>
-    roleBackend(rt.config, request.role) === "pi" ? pi(request) : agents(request);
+    roleBackend(rt.config, request.role) === "pi" ? pi(request) : claude(request);
   const access = {
     builder: roleBackend(rt.config, "builder") === "pi" ? PI_EVIDENCE_ACCESS : claudeAccess,
     verifier: roleBackend(rt.config, "verifier") === "pi" ? PI_EVIDENCE_ACCESS : claudeAccess,
@@ -396,7 +446,7 @@ async function prepareWithPi($: EngineInterface, rt: Runtime, snapshot: Evidence
   }, capture);
 }
 
-/** Claude-only preparation: private agents, then inline `model.complete`. */
+/** Claude-only preparation: private workers, then inline `model.complete`. */
 async function prepareWithClaude(
   $: EngineInterface,
   rt: Runtime,
@@ -406,15 +456,15 @@ async function prepareWithClaude(
   capture: (draft: CheckpointDraft) => void,
 ): Promise<{ prepared: Awaited<ReturnType<typeof prepareCheckpoint>>; backend: string }> {
   const models = { builder: rt.config.builderModel, verifier: rt.config.verifierModel };
-  // Side agents read the paged evidence file; when agents are
+  // Side workers read the paged evidence file; when workers are
   // unavailable the whole pipeline retries on inline evidence.
   control.remaining(await $.clock.now());
   const access = await evidenceAccess($, rt, snapshot, control);
   try {
-    return { prepared: await prepareCheckpoint(controlledAsk($, control, askViaAgents($, rt, control)), snapshot, access, models, capture), backend: "claude-agents" };
+    return { prepared: await prepareCheckpoint(controlledAsk($, control, askViaClaudeWorker($, rt.config, control)), snapshot, access, models, capture), backend: "claude-worker" };
   } catch (error) {
     if (error instanceof PreparationCancelled) throw error;
-    notes.push(`agents:${oneLine(error)}`);
+    notes.push(`worker:${oneLine(error)}`);
     rt.lastFallback = notes.join(" then ");
   }
   return {
@@ -438,10 +488,10 @@ async function verifyWithClaude(
   control.remaining(await $.clock.now());
   const access = await evidenceAccess($, rt, snapshot, control);
   try {
-    return { prepared: await verifyDraft(controlledAsk($, control, askViaAgents($, rt, control)), snapshot, access, rt.config.verifierModel, draft), backend: "claude-verify" };
+    return { prepared: await verifyDraft(controlledAsk($, control, askViaClaudeWorker($, rt.config, control)), snapshot, access, rt.config.verifierModel, draft), backend: "claude-verify" };
   } catch (error) {
     if (error instanceof PreparationCancelled) throw error;
-    notes.push(`agents:${oneLine(error)}`);
+    notes.push(`worker:${oneLine(error)}`);
     rt.lastFallback = notes.join(" then ");
   }
   return {
@@ -452,13 +502,10 @@ async function verifyWithClaude(
 
 /** The prompt already carries the inline snapshot evidence as its access text. */
 function askViaComplete($: EngineInterface): AskFn {
-  return async (request) =>
-    $.model.complete({
-      model: request.model === "inherit" ? "haiku" : request.model,
-      system: request.system,
-      prompt: request.prompt,
-      maxTokens: 16_000,
-    });
+  return async request => completionText(await $.model.complete({
+    model: request.model === "inherit" ? await $.session.model() : request.model,
+    system: request.system, prompt: request.prompt, maxTokens: 16_000,
+  }));
 }
 
 function oneLine(error: unknown): string {
@@ -466,28 +513,37 @@ function oneLine(error: unknown): string {
   return reason.slice(0, 160).replace(/\s+/g, " ");
 }
 
-async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean): Promise<void> {
-  const rows = rt.archive;
-  if (!rows || rt.state.preparing) return;
+async function runPreparation(
+  $: EngineInterface, rt: Runtime, manual: boolean,
+  compactSnapshot?: readonly SessionMessage[], sharedDeadline?: number,
+): Promise<void> {
+  if (!rt.archive || rt.state.preparing) return;
   if (!manual && !rt.state.refreshArmed) return;
-  if (rows.size < 2) return;
   const generation = rt.state.startPreparing();
   if (generation === undefined) return;
-  // Rows appended mid-preparation (agent hand-backs, new turns) stay out.
-  const snapshot = rows.snapshot(rows.size - 1);
   const started = performance.now();
   const notes: string[] = [];
-  const coverage = snapshot.rows.findLast(row => rt.transcript.knownIds.has(row.id))?.id;
-  if (!coverage) { rt.state.fail(generation); return; }
   const directory = `${dataDir($, rt)}/prepare-${rt.runtimeId}-${generation}`;
   const control = new PreparationControl(generation, directory,
-    (await $.clock.now()) + rt.config.prepareTimeoutSeconds * 1000, coverage);
+    sharedDeadline ?? (await $.clock.now()) + rt.config.prepareTimeoutSeconds * 1000, "pending-history");
   rt.preparation = control;
   try {
-    $.clock.after(rt.config.prepareTimeoutSeconds * 1000, () => {
+    $.clock.after(Math.max(1, control.deadline - (await $.clock.now())), () => {
       if (rt.preparation === control && !control.finished) void stopPreparation($, rt, "preparation deadline reached");
     });
-    await trace($, rt, "prepare-start", { generation, directory, rows: snapshot.size, coverage, deadline: control.deadline });
+    if (compactSnapshot) await control.race(adoptHistory($, rt, compactSnapshot, "compact"));
+    else await control.race(reconcileHistory($, rt));
+    control.remaining(await $.clock.now());
+    rt.state.disarmRefresh();
+    const rows = rt.archive!;
+    const liveIds = [...rt.messageRowIds];
+    const live = rt.transcript.messages(liveIds);
+    if (!live || live.length < 2) throw new Error("history-incomplete: need at least 2 reconciled messages");
+    const snapshot = rows.snapshot(rows.size - 1, new Set(liveIds));
+    control.coverageEndEntryId = liveIds.at(-1)!;
+    const epoch = rt.historyEpoch;
+    const evidenceHash = await contentDigest(snapshot.fullText());
+    await trace($, rt, "prepare-start", { generation, directory, rows: snapshot.size, coverage: control.coverageEndEntryId, epoch, evidenceDigest: evidenceHash, deadline: control.deadline });
     let prepared: Awaited<ReturnType<typeof prepareCheckpoint>> | undefined;
     let backend = "";
     // A draft any backend built, kept so a verifier-only failure never
@@ -518,7 +574,7 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
       backend = `pi-draft+${backend}`;
     } else if (!prepared) {
       // A full redo needs a meaningful share of the deadline left; one
-      // started with seconds to spare only burns agents before failing.
+      // started with seconds to spare only burns workers before failing.
       const remainingMs = control.deadline - (await $.clock.now());
       if (usesPi(rt.config) && remainingMs < rt.config.prepareTimeoutSeconds * 250) {
         throw new Error(`insufficient preparation time for a full redo (${Math.max(0, Math.round(remainingMs / 1000))}s left)`);
@@ -531,10 +587,20 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
       checkpointId: `shadow-${generation}-${prepared.coverageEndEntryId}`,
       rendered: prepared.rendered,
       coverageEndEntryId: prepared.coverageEndEntryId,
+      proof: {
+        sessionId: rt.sessionId, epoch, snapshotId: `${rt.runtimeId}-${generation}`,
+        coveredCount: liveIds.indexOf(prepared.coverageEndEntryId) + 1,
+        prefixDigest: await prefixDigest(live, liveIds.indexOf(prepared.coverageEndEntryId) + 1),
+        evidenceDigest: evidenceHash,
+      },
     };
     // A compaction that ran meanwhile may have removed the covered row:
     // such a checkpoint could never install, so it is never published.
-    if (!rt.messageRowIds.includes(checkpoint.coverageEndEntryId)) {
+    const current = rt.transcript.messages(rt.messageRowIds);
+    const stale = !checkpoint.proof.coveredCount || epoch !== rt.historyEpoch || !current ||
+      await prefixDigest(current, checkpoint.proof.coveredCount) !== checkpoint.proof.prefixDigest || current.length < checkpoint.proof.coveredCount;
+    control.remaining(await $.clock.now());
+    if (stale) {
       if (rt.state.discardStale(generation)) {
         notes.push(`stale:coverage ${checkpoint.coverageEndEntryId} compacted away`);
         rt.lastFallback = notes.join(" then ");
@@ -543,11 +609,10 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
     } else if (rt.state.publish(generation, checkpoint)) {
       control.finished = true;
       rows.setPreviousCheckpoint(checkpoint.rendered, checkpoint.coverageEndEntryId);
-      $.ui.log(
-        `shadow-compact: verified checkpoint ready (covers ${prepared.coverageEndEntryId}); it installs at the next /compact or auto-compaction`,
-      );
+      rt.eligibility = "unchecked";
+      $.ui.status("checkpoint verified; live coverage will be checked at compaction");
       await $.fs.write(`${directory}/checkpoint.json`, JSON.stringify(checkpoint)).catch(() => undefined);
-      await trace($, rt, "prepare-ready", { generation, coverage: checkpoint.coverageEndEntryId, backend, durationMs: Math.round(performance.now() - started) });
+      await trace($, rt, "prepare-verified", { generation, coverage: checkpoint.coverageEndEntryId, backend, durationMs: Math.round(performance.now() - started) });
     }
   } catch (error) {
     if (error instanceof PreparationCancelled) await stopPreparation($, rt, control.reason ?? oneLine(error));
@@ -575,24 +640,25 @@ type InstallPlan =
  * transcript. Coverage is proven only by the covered row's uuid in the
  * live index; a checkpoint whose row is gone is discarded.
  */
-function planInstall(rt: Runtime, messages: readonly SessionMessage[]): InstallPlan {
+async function planInstall(rt: Runtime, messages: readonly SessionMessage[]): Promise<InstallPlan> {
   const published = rt.state.published;
   if (!published) return { reason: "no-checkpoint" };
   // Rebuild from this compact input, never from the append stream's shape.
   rt.messageRowIds = rt.transcript.resolve(messages);
-  const coveredIndex = rt.messageRowIds.indexOf(published.coverageEndEntryId);
-  if (coveredIndex < 0) {
-    rt.state.discardPublished();
-    return { reason: "coverage-unproven" };
+  const proof = published.proof;
+  if (proof.sessionId !== rt.sessionId || proof.epoch !== rt.historyEpoch || proof.coveredCount < 1 ||
+    messages.length < proof.coveredCount || await prefixDigest(messages, proof.coveredCount) !== proof.prefixDigest) {
+    rt.eligibility = "unproven:prefix-mismatch";
+    return { reason: "prefix-mismatch" };
   }
-  if (rt.messageRowIds.lastIndexOf(published.coverageEndEntryId) !== coveredIndex) return { reason: "coverage-ambiguous" };
+  const coveredIndex = proof.coveredCount - 1;
+  const handles = messages.flatMap(message => message.handle ? [message.handle] : []);
+  if (new Set(handles).size !== handles.length) return { reason: "coverage-ambiguous" };
   const built = buildCandidate(messages, coveredIndex, rt.config.recentTurns, published.rendered);
   if (isSkipped(built) || !built.messages) {
     return { reason: isSkipped(built) ? built.skipped : "no-candidate" };
   }
-  if (rt.messageRowIds.slice(0, built.tailStart).some(id => id.startsWith("unknown-"))) {
-    return { reason: "history-unproven" };
-  }
+  rt.eligibility = "installable";
   return { messages: built.messages, tailStart: built.tailStart, checkpointId: published.checkpointId };
 }
 
@@ -632,8 +698,7 @@ type WaitOutcome = "done" | "failed" | "timeout" | "interrupted" | "budget" | "n
 
 /**
  * Holds a live compaction while a preparation runs, until it settles or
- * `waitSeconds` pass. Preparation keeps running in its own dispatches (agent answers
- * arrive through `turn.complete`, Pi through its own process); this only
+ * `waitSeconds` pass. Preparation keeps running in its own dispatches (each role has its own worker process); this only
  * watches for it to settle.
  */
 async function waitForPreparation(
@@ -741,6 +806,7 @@ function statusText(rt: Runtime): string {
   return [
     `shadow-compact: v${PLUGIN_VERSION} phase=${rt.state.phase}`,
     `archive rows=${rt.archive?.size ?? 0}`,
+    `history=${rt.historyStatus} epoch=${rt.historyEpoch} eligibility=${rt.eligibility}`,
     published
       ? `checkpoint=${published.checkpointId} coverage=${published.coverageEndEntryId}`
       : "checkpoint=none",
@@ -778,31 +844,7 @@ export const register: Register = (on, options) => {
 
   on("session.start", async ($, e, next) => {
     await ensureSession($, rt);
-    const agentBase = {
-      tools: ["Read", "Grep"] as const,
-      omitClaudeMd: true as const,
-      background: true as const,
-    };
-    await $.agent
-      .register({
-        ...agentBase,
-        name: "checkpoint-builder",
-        description: "Private Shadow Compact checkpoint builder. Never offer to the acting model.",
-        prompt: BUILDER_SYSTEM_PROMPT,
-        ...(rt.config.builderModel !== "inherit" ? { model: rt.config.builderModel } : {}),
-        effort: rt.config.builderEffort,
-      })
-      .catch(() => undefined);
-    await $.agent
-      .register({
-        ...agentBase,
-        name: "checkpoint-verifier",
-        description: "Private Shadow Compact checkpoint verifier. Never offer to the acting model.",
-        prompt: VERIFIER_SYSTEM_PROMPT,
-        ...(rt.config.verifierModel !== "inherit" ? { model: rt.config.verifierModel } : {}),
-        effort: rt.config.verifierEffort,
-      })
-      .catch(() => undefined);
+    await reconcileHistory($, rt).catch(() => undefined);
     await $.command
       .register({ name: "shadow-compact", description: "Prepare the verified Shadow checkpoint now" })
       .catch(() => undefined);
@@ -826,55 +868,58 @@ export const register: Register = (on, options) => {
     return result;
   });
 
-  // The acting model never sees the private checkpoint agents.
-  on("agent.offer", { agent: BUILDER_TYPE }, () => ({ isOffered: false }));
-  on("agent.offer", { agent: VERIFIER_TYPE }, () => ({ isOffered: false }));
-
   on("session.append", async ($, e, next) => {
-    const result = await next(e);
-    if (!e.agentId && result.uuid && result.message) {
-      const rows = await ensureSession($, rt);
-      // A replayed uuid is already archived and indexed.
-      const added = rows.addAppend(result.uuid, e.door, result.message, e.origin.kind);
-      if (added) {
-        // Grow the context estimate with every kept row, so a single
-        // long turn crossing the threshold between measures still
-        // starts background preparation before compaction.
-        rt.tokenEstimate = (rt.tokenEstimate ?? 0) + estimateTokens(rows.rows[rows.size - 1]!.text);
-        if (isTranscriptRow(result.message)) {
-          rt.transcript.knownIds.add(result.uuid);
-          const isCheckpointRow =
-            rt.awaitingCompactionRow && rows.rows[rows.size - 1]!.text.startsWith(CHECKPOINT_HEADING);
-          if (e.door === "compaction" || isCheckpointRow) {
-            if (noteCompactionRow(rt, result.uuid)) {
-              // History was replaced; the pre-compaction estimate is void.
-              rt.tokenEstimate = null;
-              await stopPreparation($, rt, "stale:unobserved compaction replaced history");
+    if (e.agentId) return next(e);
+    const lifecycle = rt.lifecycle;
+    rt.revision += 1;
+    rt.pendingAppends += 1;
+    try {
+      const result = await next(e);
+      if (lifecycle !== rt.lifecycle) return result;
+      if (result.uuid && result.message) {
+        await ensureSession($, rt);
+        if (lifecycle !== rt.lifecycle) return result;
+        const rows = rt.archive!;
+        // A replayed uuid is already archived and indexed.
+        const added = rows.addAppend(result.uuid, e.door, result.message, e.origin.kind);
+        if (added) {
+          // Grow the context estimate with every kept row, so a single
+          // long turn crossing the threshold between measures still
+          // starts background preparation before compaction.
+          rt.tokenEstimate = (rt.tokenEstimate ?? 0) + estimateTokens(rows.rows[rows.size - 1]!.text);
+          if (isTranscriptRow(result.message)) {
+            rt.transcript.observe(result.uuid, messageFromAppend(result.message));
+            const isCheckpointRow =
+              rt.awaitingCompactionRow && rows.rows[rows.size - 1]!.text.startsWith(CHECKPOINT_HEADING);
+            if (e.door === "compaction" || isCheckpointRow) {
+              if (noteCompactionRow(rt, result.uuid)) {
+                // History was replaced; the pre-compaction estimate is void.
+                rt.tokenEstimate = null;
+                await stopPreparation($, rt, "stale:unobserved compaction replaced history");
+              }
             }
+            else rt.messageRowIds.push(result.uuid);
           }
-          else rt.messageRowIds.push(result.uuid);
-        }
-        const estimate = rt.tokenEstimate;
-        if (
-          !rt.state.preparing &&
-          estimate !== null &&
-          estimate >= rt.config.prepareThresholdTokens
-        ) {
-          if (rt.idleCheckpoint) {
-            rt.idleCheckpoint = false;
-            rt.state.rearm();
+          const estimate = rt.tokenEstimate;
+          if (
+            !rt.state.preparing &&
+            estimate !== null &&
+            estimate >= rt.config.prepareThresholdTokens
+          ) {
+            if (rt.idleCheckpoint) {
+              rt.idleCheckpoint = false;
+              rt.state.rearm();
+            }
+            void runPreparation($, rt, false);
           }
-          void runPreparation($, rt, false);
         }
       }
-    }
-    return result;
+      return result;
+    } finally { if (lifecycle === rt.lifecycle) { rt.pendingAppends -= 1; rt.revision += 1; } }
   });
 
   on("turn.complete", async ($, e, next) => {
     if (e.agentId) {
-      rt.pendingAnswers.get(e.agentId)?.(e.answer);
-      rt.pendingAnswers.delete(e.agentId);
       return next(e);
     }
     // A finished main turn may be the last before idle compaction:
@@ -930,9 +975,6 @@ export const register: Register = (on, options) => {
       unknownHandles: rt.messageRowIds.filter(id => id.startsWith("unknown-")).length,
       checkpoint: rt.state.published?.checkpointId ?? null, preparing: rt.state.preparing,
     });
-    if (rt.preparation && !rt.messageRowIds.includes(rt.preparation.coverageEndEntryId)) {
-      await stopPreparation($, rt, `stale:coverage ${rt.preparation.coverageEndEntryId} no longer live`);
-    }
     if (rt.state.attemptedCheckpointId) {
       rt.state.rejectInstall();
       rt.lastFallback = "install-unconfirmed";
@@ -947,63 +989,80 @@ export const register: Register = (on, options) => {
       return compactNatively($, rt, e.messages, () => next(e));
     };
     if (rt.config.manualCompactMode === "native" && e.trigger === "manual") return native("manual-mode");
-    let plan = planInstall(rt, e.messages);
-    // A transcript whose handles mostly resolve to nothing (e.g. the
-    // runtime restarted mid-session) cannot be checkpointed from the
-    // few archived rows: no just-in-time attempt, no wait.
-    const unknownCount = rt.messageRowIds.filter(id => id.startsWith("unknown-")).length;
-    if ("reason" in plan && rt.messageRowIds.length > 0 && unknownCount * 2 > rt.messageRowIds.length) {
-      plan = { reason: "history-unproven" };
-    }
-    // Checkpoint-first: a checkpoint still preparing is not a failed one.
-    // Hold this compaction for it (or for one just-in-time attempt when
-    // none is running) until it settles. Only a failure hands the
-    // compaction to native; the preparation deadline is that failure
-    // for an attempt that is merely slow.
-    if ("reason" in plan && plan.reason !== "history-unproven" && plan.reason !== "coverage-ambiguous" && rt.config.holdCompaction) {
-      firstReason = plan.reason;
-      if (!rt.state.preparing) void runPreparation($, rt, false);
-      if (rt.state.preparing) {
-        const started = await $.clock.now();
-        // The deadline timer cancels the preparation, which settles it;
-        // the grace only guards a cancellation that never lands.
-        const deadline = rt.preparation?.deadline ?? started + rt.config.prepareTimeoutSeconds * 1000;
-        const waitSeconds = Math.ceil((deadline - started) / 1000) + HOLD_GRACE_SECONDS;
-        await trace($, rt, "compact-wait-start", { trigger: e.trigger, reason: firstReason, seconds: waitSeconds });
-        const outcome = await waitForPreparation($, rt, next, waitSeconds);
-        waited = ` waited=${Math.round(((await $.clock.now()) - started) / 1000)}s:${outcome}`;
-        await trace($, rt, "compact-wait-end", { outcome, waited });
-        if (outcome === "interrupted") {
-          rt.lastCompact = `trigger=${e.trigger} interrupted${waited}`;
-          return { skip: "Shadow Compact: compaction interrupted while its checkpoint prepared" };
-        }
-        plan = planInstall(rt, e.messages);
+    let plan = await planInstall(rt, e.messages);
+    const started = await $.clock.now();
+    const deadline = rt.preparation?.deadline ?? started + rt.config.prepareTimeoutSeconds * 1000;
+    let repaired = false;
+    // One repair may replace an obsolete suffix-only preparation. Both waits
+    // and that replacement share the original compaction/preparation deadline.
+    for (let pass = 0; pass < 2 && "reason" in plan && rt.config.holdCompaction; pass += 1) {
+      if (plan.reason === "coverage-ambiguous") break;
+      const unknown = rt.messageRowIds.some(id => id.startsWith("unknown-"));
+      const needsRepair = plan.reason === "prefix-mismatch" || unknown || !rt.historyStatus.startsWith("reconciled:");
+      firstReason ??= needsRepair ? "history-unproven" : plan.reason;
+      if (needsRepair && !repaired) {
+        repaired = true;
+        const old = rt.preparation;
+        await stopPreparation($, rt, "stale:reconciling complete compact history");
+        if (old) rt.state.discardStale(old.generation);
+        rt.state.discardPublished();
+        rt.state.rearm();
+        rt.eligibility = "reconciling-history";
+        await trace($, rt, "compact-reconcile", { messages: e.messages.length, deadline });
+        void runPreparation($, rt, true, e.messages, deadline);
+      } else if (!rt.state.preparing && !needsRepair) {
+        void runPreparation($, rt, false, e.messages, deadline);
       }
+      if (!rt.state.preparing) break;
+      const waitSeconds = Math.max(0, Math.ceil((deadline - (await $.clock.now())) / 1000)) + HOLD_GRACE_SECONDS;
+      await trace($, rt, "compact-wait-start", { trigger: e.trigger, reason: firstReason, seconds: waitSeconds });
+      const outcome = await waitForPreparation($, rt, next, waitSeconds);
+      waited = ` waited=${Math.round(((await $.clock.now()) - started) / 1000)}s:${outcome}`;
+      await trace($, rt, "compact-wait-end", { outcome, waited });
+      if (outcome === "interrupted") {
+        await stopPreparation($, rt, "compaction interrupted");
+        rt.lastCompact = `trigger=${e.trigger} interrupted${waited}`;
+        return { skip: "Shadow Compact: compaction interrupted while its checkpoint prepared" };
+      }
+      plan = await planInstall(rt, e.messages);
+      if (outcome !== "done") break;
     }
     if ("reason" in plan) return native(plan.reason);
+    await trace($, rt, "compact-eligible", { checkpoint: plan.checkpointId, tailStart: plan.tailStart, tailMessages: plan.messages.length - 1 });
     rt.state.attemptInstall();
     rt.awaitingCompactionRow = true;
     const checkpointRow = `checkpoint-${crypto.randomUUID()}`;
     rt.archive?.addSessionMessage(checkpointRow, plan.messages[0]!);
-    rt.messageRowIds = [checkpointRow, ...rt.messageRowIds.slice(plan.tailStart)];
+    const inputIds = rt.transcript.bind(e.messages, rt.messageRowIds, rt.historyEpoch);
+    rt.messageRowIds = [checkpointRow, ...inputIds.slice(plan.tailStart)];
     rt.transcript.remember(plan.messages, rt.messageRowIds);
+    rt.historyReadGeneration += 1;
+    rt.revision += 1;
     rt.lastCompact = `trigger=${e.trigger} shadow:${plan.checkpointId} tailStart=${plan.tailStart}${waited}`;
     $.ui.log(`shadow-compact: ${rt.lastCompact}`, { to: "debug" });
     await trace($, rt, "compact-shadow", { decision: rt.lastCompact, messages: plan.messages.length });
     return { messages: plan.messages };
+  }).catch(async ($, e, next) => {
+    if (String(next.error.kind) === "re-entry" || next.called) return undefined;
+    rt.lastCompact = `trigger=${e.trigger} native:hook-${next.error.kind}`;
+    $.ui.log(`shadow-compact: ${rt.lastCompact}`);
+    await trace($, rt, "compact-native", { decision: rt.lastCompact });
+    return compactNatively($, rt, e.messages, () => next(e));
   });
 
   on("command.run", { command: "shadow-status" }, async ($, _e, _next) => {
     await ensureSession($, rt);
+    if (!rt.historyStatus.startsWith("reconciled:")) await reconcileHistory($, rt).catch(() => undefined);
     await confirmInstall($, rt);
     return { text: statusText(rt) };
   });
 
   on("command.run", { command: "shadow-compact" }, async ($, _e, _next) => {
     await ensureSession($, rt);
+    await reconcileHistory($, rt).catch(() => undefined);
     const published = rt.state.published;
     if (published && rt.state.installedCheckpointId !== published.checkpointId) {
-      return { text: "shadow-compact: verified checkpoint ready; run /compact to install it." };
+      return { text: "shadow-compact: checkpoint verified; /compact will check live coverage before installing." };
     }
     const blocker = preparationBlocker(rt);
     if (blocker) {
@@ -1011,7 +1070,7 @@ export const register: Register = (on, options) => {
     }
     void runPreparation($, rt, true);
     return {
-      text: `shadow-compact: background builder/verifier preparation started (archive rows=${rt.archive?.size ?? 0}); it installs at the next /compact or auto-compaction.`,
+      text: `shadow-compact: background builder/verifier preparation started (archive rows=${rt.archive?.size ?? 0}); live coverage will be checked at compaction.`,
     };
   });
 
@@ -1042,7 +1101,14 @@ export const register: Register = (on, options) => {
     rt.archive = undefined;
     rt.messageRowIds = [];
     rt.transcript = new LiveTranscript();
-    rt.bootstrapped = false;
+    rt.initializing = undefined;
+    rt.reconciliation = undefined;
+    rt.historyStatus = "pending";
+    rt.historyEpoch = 0;
+    rt.revision = 0;
+    rt.pendingAppends = 0;
+    rt.lifecycle += 1;
+    rt.eligibility = "no-checkpoint";
     rt.awaitingCompactionRow = false;
     rt.lastFallback = null;
     rt.lastCompact = null;

@@ -14,6 +14,14 @@ export interface PublishedCheckpoint {
   rendered: string;
   /** Archive uuid of the last transcript message the checkpoint represents. */
   coverageEndEntryId: string;
+  proof: {
+    sessionId: string;
+    epoch: number;
+    snapshotId: string;
+    coveredCount: number;
+    prefixDigest: string;
+    evidenceDigest: string;
+  };
 }
 
 export class ShadowState {
@@ -44,11 +52,11 @@ export class ShadowState {
   get refreshArmed(): boolean {
     return this.#refreshArmed;
   }
-  get phase(): "idle" | "preparing" | "ready" | "ready-preparing" | "installing" | "installed" {
+  get phase(): "idle" | "preparing" | "verified" | "verified-preparing" | "installing" | "installed" {
     if (this.#attemptedCheckpointId) return "installing";
     const ready = this.#published && this.#published.checkpointId !== this.#installedCheckpointId;
-    if (this.preparing) return ready ? "ready-preparing" : "preparing";
-    if (ready) return "ready";
+    if (this.preparing) return ready ? "verified-preparing" : "preparing";
+    if (ready) return "verified";
     return this.#installedCheckpointId ? "installed" : "idle";
   }
 
@@ -113,6 +121,8 @@ export class ShadowState {
     this.#refreshArmed = true;
     return true;
   }
+
+  disarmRefresh(): void { this.#refreshArmed = false; }
 
   discardPublished(): boolean {
     if (!this.#published) return false;

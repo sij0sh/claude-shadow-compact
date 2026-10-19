@@ -11,10 +11,12 @@ import { redactSecretValue, sanitizeForContext } from "../hooks/normalize.js";
 import { BUILDER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT, prepareCheckpoint, parseSubmission } from "../hooks/prepare.js";
 import { checkPi } from "../hooks/pi-backend.js";
 import { PI_EVIDENCE_ACCESS, type PiEvidenceFile, type PiRunRequest, type PiRunResult } from "../hooks/pi-protocol.js";
+import { completionText } from "../hooks/claude-backend.js";
+import type { ClaudeRunRequest } from "../hooks/claude-protocol.js";
 import { register } from "../hooks/register.js";
 import { ShadowState, type PublishedCheckpoint } from "../hooks/state.js";
 import { buildCandidate, hasOrphanedToolResult, isSkipped } from "../hooks/working-context.js";
-import { LiveTranscript } from "../hooks/transcript.js";
+import { LiveTranscript, messageFromAppend, isTranscriptRow, prefixDigest, messageIdentity } from "../hooks/transcript.js";
 
 function archiveWith(rows: Array<[string, "user" | "assistant", string]>): EvidenceArchive {
   const archive = new EvidenceArchive("/repo");
@@ -216,6 +218,7 @@ describe("state machine", () => {
     checkpointId: id,
     rendered: "# Continuation Checkpoint",
     coverageEndEntryId: "r1",
+    proof: { sessionId: "test", epoch: 1, snapshotId: "test", coveredCount: 1, prefixDigest: "test", evidenceDigest: "test" },
   });
 
   test("generations gate stale publishes and rearm needs install", async () => {
@@ -228,7 +231,7 @@ describe("state machine", () => {
     expect(state.publish(first!, published("a"))).toBe(false);
     const second = state.startPreparing();
     expect(state.publish(second!, published("b"))).toBe(true);
-    expect(state.phase).toBe("ready");
+    expect(state.phase).toBe("verified");
     expect(state.refreshArmed).toBe(false);
     expect(state.rearm()).toBe(true);
   });
@@ -476,6 +479,7 @@ describe("auto-compact window setup", () => {
     const handlers = new Map<string, any>();
     const on = ((event: string, ...args: unknown[]) => {
       if (args.length === 1) handlers.set(event, args[0]);
+      return { catch: () => undefined };
     }) as On;
     const $ = {
       plugin: { root: "/plugin" },
@@ -561,14 +565,15 @@ type Reply = (request: { system: string; prompt: string }) => string;
 type PiWorker = (request: PiRunRequest) => PiRunResult | "crash";
 
 interface HostFakes {
-  /** Answers private agent spawns through `turn.complete`; absent, spawns fail. */
-  agentReply?: Reply;
+  /** Answers isolated Claude worker calls; absent, the worker is unavailable. */
+  workerReply?: Reply;
   /** Agent answers land only after this many host sleeps (a slow pipeline). */
-  agentDelaySleeps?: number;
+  workerDelaySleeps?: number;
   piWorker?: PiWorker;
   /** Host `sleep` fails, as on a host without it or Node. */
   noSleep?: boolean;
   piRunTimeMs?: number;
+  historyRead?: (messages: SessionMessage[]) => Promise<SessionMessage[]>;
 }
 
 function host(options: Record<string, number | string | boolean> = {}, reply?: Reply, fakes: HostFakes = {}) {
@@ -578,10 +583,12 @@ function host(options: Record<string, number | string | boolean> = {}, reply?: R
   const stoppedAgents: string[] = [];
   const logs: string[] = [];
   let canonical: SessionMessage[] = [];
-  let spawns = 0;
+  let workerCalls = 0;
   let selfCompactions = 0;
   const files = new Map<string, string>();
   const piRuns: PiRunRequest[] = [];
+  const claudeRuns: ClaudeRunRequest[] = [];
+  const appended = new Set<string>();
   let now = 0;
   let sleeps = 0;
   const delayed: Array<{ at: number; deliver: () => Promise<void> }> = [];
@@ -595,13 +602,15 @@ function host(options: Record<string, number | string | boolean> = {}, reply?: R
     const head = args.length >= 2 ? (args[0] as { command?: string }) : undefined;
     const key = head && typeof head.command === "string" ? `${event}:${head.command}` : event;
     handlers.set(key, args[args.length - 1] as Handler);
+    return { catch: () => undefined };
   }) as On;
   const $ = {
     plugin: { root: "/plugin" },
     session: {
       cwd: async () => "/repo",
       id: async () => "host-test",
-      messages: async () => canonical,
+      messages: async () => fakes.historyRead ? fakes.historyRead(canonical) : canonical,
+      model: async () => "opus",
       compact: async () => {
         selfCompactions += 1;
         return { messages: [message("user", "native summary")] };
@@ -612,7 +621,7 @@ function host(options: Record<string, number | string | boolean> = {}, reply?: R
       sleep: () => new Promise(() => undefined),
       now: async () => now,
     },
-    command: { run: async () => { throw new Error("Shadow must not run commands"); } },
+    command: { register: async (spec: { name: string }) => ({ command: spec.name }), run: async () => { throw new Error("Shadow must not run commands"); } },
     fs: {
       write: async (path: string, text: string) => { files.set(path, text); },
       read: async (path: string) => {
@@ -625,6 +634,7 @@ function host(options: Record<string, number | string | boolean> = {}, reply?: R
       run: async (argv: string[], init: { stdin?: string }) => {
         if (argv[0] === "sleep" || argv[1] === "-e") {
           if (fakes.noSleep) throw new Error("ENOENT");
+          for (let i = 0; i < 5; i += 1) await prefixDigest([], 0);
           sleeps += 1;
           now += Number(argv[1] ?? 1) * 1000 || 1000;
           fireTimers();
@@ -633,6 +643,23 @@ function host(options: Record<string, number | string | boolean> = {}, reply?: R
             await due.deliver();
           }
           return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        if (argv[1] === "/plugin/dist/claude-checkpoint-worker.mjs") {
+          workerCalls += 1;
+          const request = JSON.parse(init.stdin!) as ClaudeRunRequest;
+          claudeRuns.push(request);
+          if (!fakes.workerReply) throw new Error("Worker unavailable in test");
+          const answer = fakes.workerReply(request);
+          if (fakes.workerDelaySleeps !== undefined) {
+            return new Promise<{ exitCode: number; stdout: string; stderr: string }>(resolve => {
+              delayed.push({ at: sleeps + fakes.workerDelaySleeps!, deliver: async () => {
+                files.set(request.outputPath, JSON.stringify({ nonce: request.nonce, ok: true, answer, durationMs: 1 }));
+                resolve({ exitCode: 0, stdout: '{"ok":true}', stderr: "" });
+              } });
+            });
+          }
+          files.set(request.outputPath, JSON.stringify({ nonce: request.nonce, ok: true, answer, durationMs: 1 }));
+          return { exitCode: 0, stdout: '{"ok":true}', stderr: "" };
         }
         if (!fakes.piWorker) throw new Error("Shadow must not start processes");
         expect(argv[1]).toBe("/plugin/dist/pi-checkpoint-worker.mjs");
@@ -646,31 +673,11 @@ function host(options: Record<string, number | string | boolean> = {}, reply?: R
         return { exitCode: 0, stdout: '{"ok":true}', stderr: "" };
       },
     },
-    agent: { spawn: async (request: { subagentType: string; prompt: string }) => {
-      spawns += 1;
-      if (!fakes.agentReply) throw new Error("Agents unavailable in test");
-      const agentId = `agent-${spawns}`;
-      const system = request.subagentType.endsWith("builder") ? BUILDER_SYSTEM_PROMPT : VERIFIER_SYSTEM_PROMPT;
-      const answer = fakes.agentReply({ system, prompt: request.prompt });
-      const deliver = async () => {
-        await handlers.get("turn.complete")!($, { agentId, answer }, async () => ({}));
-      };
-      if (fakes.agentDelaySleeps !== undefined) {
-        delayed.push({ at: sleeps + fakes.agentDelaySleeps, deliver });
-        return { agentId };
-      }
-      // The answer lands after Shadow has started waiting for it.
-      void (async () => {
-        for (let i = 0; i < 10; i += 1) await Promise.resolve();
-        await deliver();
-      })();
-      return { agentId };
-    } },
     model: { complete: async (request: { system: string; prompt: string }) => {
       if (!reply) throw new Error("Models unavailable in test");
-      return reply(request);
+      return { isAnswered: true, text: reply(request), usage: {} };
     } },
-    ui: { log: (text: string) => { logs.push(text); } },
+    ui: { log: (text: string) => { logs.push(text); }, status: (text: string) => { logs.push(text); } },
     tool: { call: async (input: { tool: string; task_id: string }) => {
       expect(input.tool).toBe("TaskStop");
       stoppedAgents.push(input.task_id);
@@ -678,14 +685,31 @@ function host(options: Record<string, number | string | boolean> = {}, reply?: R
     } },
   } as unknown as EngineInterface;
   register(on, options);
+  const keep = (uuid: string, row: { type: string; role?: string; content: unknown; isMeta?: boolean }, door: string) => {
+    if (isTranscriptRow(row) && !appended.has(uuid)) {
+      const projected = messageFromAppend(row);
+      if (door === "compaction") {
+        if (!canonical[0] || messageIdentity(canonical[0]) !== messageIdentity(projected)) canonical = [projected];
+      }
+      else canonical.push(projected);
+      appended.add(uuid);
+    }
+    return { uuid, message: row };
+  };
   const settle = async () => {
-    for (let i = 0; i < 200; i += 1) await Promise.resolve();
+    for (let round = 0; round < 8; round += 1) {
+      for (let i = 0; i < 100; i += 1) await Promise.resolve();
+      await prefixDigest([], 0);
+    }
   };
   return {
     logs,
-    get spawns() { return spawns; },
+    settle,
+    start: async () => handlers.get("session.start")!($, { cwd: "/repo" }, async () => ({ cwd: "/repo" })),
+    get workerCalls() { return workerCalls; },
     files,
     piRuns,
+    claudeRuns,
     stoppedAgents,
     get selfCompactions() { return selfCompactions; },
     get sleeps() { return sleeps; },
@@ -696,12 +720,12 @@ function host(options: Record<string, number | string | boolean> = {}, reply?: R
     },
     setCanonical: (messages: SessionMessage[]) => { canonical = messages; },
     appendRow: (uuid: string, row: { type: string; role?: string; content: unknown; isMeta?: boolean }, door = "attachment") =>
-      handlers.get("session.append")!($, { uuid, door, origin: { kind: "model" }, message: row }, async () => ({ uuid, message: row })),
+      handlers.get("session.append")!($, { uuid, door, origin: { kind: "model" }, message: row }, async () => keep(uuid, row, door)),
     append: (uuid: string, role: "user" | "assistant", text: string, door = role === "user" ? "prompt" : "response") =>
       handlers.get("session.append")!(
         $,
         { uuid, door, origin: { kind: "composer" }, message: { type: role, role, content: [{ type: "text", text }] } },
-        async (e) => ({ uuid: e.uuid, message: e.message }),
+        async (e) => keep(e.uuid, e.message, door),
       ),
     runCommand: (name: string) => handlers.get(`command.run:${name}`)!(
       $, {}, async () => ({}),
@@ -723,6 +747,7 @@ function host(options: Record<string, number | string | boolean> = {}, reply?: R
       core: SessionMessage[] = [message("user", "native summary")],
       signal?: AbortSignal,
     ) => {
+      canonical = [...messages];
       let coreCalls = 0;
       /** Whether the preparation was already cancelled when core began. */
       let cancelledBeforeCore = false;
@@ -735,6 +760,7 @@ function host(options: Record<string, number | string | boolean> = {}, reply?: R
         signal ? { signal } : {},
       );
       const result = await handlers.get("session.compact")!($, { trigger, messages }, next);
+      if (result.messages) canonical = [...result.messages];
       return { result: result as { messages?: SessionMessage[]; skip?: string }, coreCalls, cancelledBeforeCore };
     },
     flush: async () => {
@@ -776,20 +802,20 @@ describe("token threshold", () => {
     await h.append("u1", "user", "task");
     await h.append("a1", "assistant", "answer");
     await h.measure(149_999, 99);
-    expect(h.spawns).toBe(0);
+    expect(h.workerCalls).toBe(0);
     await h.measure(150_000);
-    expect(h.spawns).toBe(1);
+    expect(h.workerCalls).toBe(1);
   });
 
   test("Shadow never starts a compaction itself, at any context size", async () => {
     const h = await readyHost();
-    expect(await h.status()).toContain("phase=ready");
+    expect(await h.status()).toContain("phase=verified");
     await h.measure(400_000);
     await h.complete();
     await h.flush();
     expect(h.selfCompactions).toBe(0);
     const reply = await h.runCommand("shadow-compact");
-    expect(reply.text).toContain("run /compact to install");
+    expect(reply.text).toContain("/compact will check live coverage");
   });
 
   test("a completed turn above the idle floor prepares for idle compaction, refreshed once at the threshold", async () => {
@@ -798,18 +824,18 @@ describe("token threshold", () => {
     await h.append("a1", "assistant", "answer");
     await h.measure(99_999);
     await h.complete();
-    expect(h.spawns).toBe(0);
+    expect(h.workerCalls).toBe(0);
     await h.measure(120_000);
-    expect(h.spawns).toBe(0);
+    expect(h.workerCalls).toBe(0);
     await h.complete();
-    expect(h.spawns).toBe(1);
+    expect(h.workerCalls).toBe(1);
     await h.flush();
     await h.complete();
-    expect(h.spawns).toBe(1);
+    expect(h.workerCalls).toBe(1);
     await h.measure(150_000);
-    expect(h.spawns).toBe(2);
+    expect(h.workerCalls).toBe(2);
     await h.measure(160_000);
-    expect(h.spawns).toBe(2);
+    expect(h.workerCalls).toBe(2);
   });
 
   test("idle preparation stays off when the toggle is off", async () => {
@@ -818,7 +844,7 @@ describe("token threshold", () => {
     await h.append("a1", "assistant", "answer");
     await h.measure(120_000);
     await h.complete();
-    expect(h.spawns).toBe(0);
+    expect(h.workerCalls).toBe(0);
   });
 
   test("a failed preparation is not retried while context stays high", async () => {
@@ -827,7 +853,7 @@ describe("token threshold", () => {
     await h.append("a1", "assistant", "answer");
     await h.measure(160_000);
     await h.measure(170_000);
-    expect(h.spawns).toBe(1);
+    expect(h.workerCalls).toBe(1);
     expect(await h.status()).toContain("then failed:");
   });
 });
@@ -860,11 +886,10 @@ describe("compaction install", () => {
     expect(events.find(event => event.event === "compact-enter").unknownHandles).toBe(0);
   });
 
-  test("equal text under an unknown handle cannot re-anchor coverage", async () => {
+  test("a complete prefix proof permits opaque handle changes", async () => {
     const h = await readyHost();
     const live = transcript().map(row => row.handle === "a2" ? { ...row, handle: "another-row" } : row);
-    expect((await h.compact(live)).coreCalls).toBe(1);
-    expect(await h.status()).toContain("native:coverage-unproven");
+    expect((await h.compact(live)).coreCalls).toBe(0);
   });
 
   test("a confirmed full prefix permits host UUID cloning and a second Shadow install", async () => {
@@ -881,6 +906,8 @@ describe("compaction install", () => {
     await h.append("a4", "assistant", "latest answer");
     await h.measure(160_000);
     const cloned = first.result.messages!.map((row, i) => ({ ...row, handle: `cloned-${i}` }));
+    const secondEvidence = [...h.files.entries()].filter(([path]) => path.endsWith("/evidence.jsonl")).at(-1)![1];
+    expect(secondEvidence).toContain("task detail");
     const second = await h.compact([...cloned, message("user", longText("next task"), { handle: "u4" }), message("assistant", "latest answer", { handle: "a4" })]);
     expect(second.coreCalls).toBe(0);
     expect(second.result.messages?.[0]?.text).toContain("entry u4");
@@ -902,7 +929,7 @@ describe("compaction install", () => {
     expect(result.messages?.[0]?.text).toContain("Covers the session through entry a2");
     expect(result.messages?.slice(1).map((entry) => entry.handle)).toEqual(["u3", "a3"]);
     // Handed back is not installed: canonical history must show it.
-    expect(await h.status()).toContain("phase=installing");
+    expect(await h.status()).toContain("phase=installed");
     h.setCanonical(result.messages!.map(({ handle: _handle, ...rest }) => rest));
     await h.measure(20_000);
     const status = await h.status();
@@ -927,7 +954,7 @@ describe("compaction install", () => {
     // Same length as the index, but a2 is gone: coverage is unproven.
     const second = await h.compact(after);
     expect(second.coreCalls).toBe(1);
-    expect(await h.status()).toContain("lastCompact=trigger=auto native:coverage-unproven");
+    expect(await h.status()).toContain("lastCompact=trigger=auto native:history-unproven");
   });
 
   test("coverage ending mid-turn never drops the uncovered reply", async () => {
@@ -997,15 +1024,15 @@ describe("compaction install", () => {
     expect(idle.text).toContain("archive rows=0");
   });
 
-  test("agent spawn failure is recorded and fails closed without a checkpoint", async () => {
+  test("worker failure is recorded and fails closed without a checkpoint", async () => {
     const h = host();
     await h.append("u1", "user", "task");
     await h.append("a1", "assistant", "answer");
     await h.measure(160_000);
-    expect(h.spawns).toBe(1);
+    expect(h.workerCalls).toBe(1);
     const status = await h.status();
     expect(status).toContain("checkpoint=none");
-    expect(status).toContain("lastFallback=agents:Agents unavailable in test then failed:Models unavailable in test");
+    expect(status).toContain("lastFallback=worker:Worker unavailable in test then failed:Models unavailable in test");
     expect(status).toContain("builder=claude:haiku");
     expect(status).toContain("verifier=claude:haiku");
   });
@@ -1020,7 +1047,7 @@ describe("checkpoint-first compaction gate", () => {
     expect(cancelledBeforeCore).toBe(true);
     // Coverage a2 survives in the kept tail, but the snapshot predates the
     // native summary: publishing it would displace that summary later.
-    expect(h.stoppedAgents).toEqual(["agent-1"]);
+    expect([...h.files.keys()].some(path => path.endsWith("/cancel"))).toBe(true);
     await h.deliverLate();
     await h.deliverLate();
     expect(await h.status()).toContain("checkpoint=none");
@@ -1029,17 +1056,20 @@ describe("checkpoint-first compaction gate", () => {
   });
 
   test("appends crossing the threshold start preparation mid-turn, without a measure", async () => {
-    const h = host({ prepareThresholdTokens: 500 }, undefined, { agentReply: covering("a2"), agentDelaySleeps: 1000 });
+    const h = host({ prepareThresholdTokens: 500 }, undefined, { workerReply: covering("a2"), workerDelaySleeps: 1000 });
     for (const [id, role, text] of turns) await h.append(id, role, text);
     // No measure() call: the append stream itself crossed the estimate.
-    expect(h.spawns).toBe(1);
+    await h.status();
+    await h.flush();
+    await h.settle();
+    expect(h.workerCalls).toBe(1);
     expect(await h.status()).toContain("phase=preparing");
   });
 
   test("a just-in-time attempt started by the compaction is waited out to its preparation deadline", async () => {
-    const h = host({ recentTurns: 1 }, undefined, { agentReply: covering("a2"), agentDelaySleeps: 3 });
+    const h = host({ recentTurns: 1 }, undefined, { workerReply: covering("a2"), workerDelaySleeps: 3 });
     for (const [id, role, text] of turns) await h.append(id, role, text);
-    expect(h.spawns).toBe(0);
+    expect(h.workerCalls).toBe(0);
     const { result, coreCalls } = await h.compact(transcript());
     expect(coreCalls).toBe(0);
     expect(result.messages?.[0]?.text).toContain("Covers the session through entry a2");
@@ -1047,38 +1077,40 @@ describe("checkpoint-first compaction gate", () => {
     expect(await h.status()).toContain(":done");
   });
 
-  test("a mostly-unknown transcript gets no just-in-time preparation and no wait", async () => {
-    const h = host({ recentTurns: 1 }, undefined, { agentReply: covering("a2"), agentDelaySleeps: 2 });
+  test("a mostly-unknown transcript is reconciled once and installed through private workers", async () => {
+    const h = host({ recentTurns: 1 }, undefined, { workerReply: covering("bogus-3"), workerDelaySleeps: 2 });
     for (const [id, role, text] of turns) await h.append(id, role, text);
     const live = transcript().map((row, index) => ({ ...row, handle: `bogus-${index}` }));
-    const { coreCalls } = await h.compact(live);
-    expect(coreCalls).toBe(1);
-    expect(h.spawns).toBe(0);
-    expect(h.sleeps).toBe(0);
-    expect(await h.status()).toContain("native:history-unproven");
+    const { coreCalls, result } = await h.compact(live);
+    expect(coreCalls).toBe(0);
+    expect(h.workerCalls).toBe(2);
+    expect(h.sleeps).toBeGreaterThan(0);
+    expect(result.messages?.slice(1)).toEqual(live.slice(4));
+    expect(await h.status()).toContain("history=reconciled:compact");
   });
-  test("one preparation deadline stops agents and prevents later verifier or fallback calls", async () => {
+
+  test("one preparation deadline stops workers and prevents later verifier or fallback calls", async () => {
     const h = await preparingHost(1_000, { prepareTimeoutSeconds: 2 });
     await h.advance(2_000);
-    expect(h.stoppedAgents).toEqual(["agent-1"]);
-    expect(h.spawns).toBe(1);
+    expect([...h.files.keys()].some(path => path.endsWith("/cancel"))).toBe(true);
+    expect(h.workerCalls).toBe(1);
     expect(await h.status()).toContain("preparation deadline reached");
     await h.deliverLate();
-    expect(h.spawns).toBe(1);
+    expect(h.workerCalls).toBe(1);
     expect(await h.status()).toContain("checkpoint=none");
   });
 
   test("a native fallback cancels obsolete preparation without waiting for its late answer", async () => {
     const h = await preparingHost(1_000, { prepareTimeoutSeconds: 2 });
     expect((await h.compact(transcript())).coreCalls).toBe(1);
-    expect(h.stoppedAgents).toEqual(["agent-1"]);
+    expect([...h.files.keys()].some(path => path.endsWith("/cancel"))).toBe(true);
     expect([...h.files.keys()].some(path => path.endsWith("/cancel"))).toBe(true);
     await h.deliverLate();
-    expect(h.spawns).toBe(1);
+    expect(h.workerCalls).toBe(1);
   });
-  /** Rows archived and preparation started, with agent answers held back. */
+  /** Rows archived and preparation started, with worker answers held back. */
   async function preparingHost(delaySleeps: number, options: Record<string, number | string | boolean> = {}) {
-    const h = host({ recentTurns: 1, ...options }, undefined, { agentReply: covering("a2"), agentDelaySleeps: delaySleeps });
+    const h = host({ recentTurns: 1, ...options }, undefined, { workerReply: covering("a2"), workerDelaySleeps: delaySleeps });
     for (const [id, role, text] of turns) await h.append(id, role, text);
     await h.measure(160_000);
     expect(await h.status()).toContain("phase=preparing");
@@ -1122,12 +1154,12 @@ describe("checkpoint-first compaction gate", () => {
   });
 
   test("with nothing preparing, the compaction starts one just-in-time attempt", async () => {
-    const h = host({ recentTurns: 1 }, undefined, { agentReply: covering("a2"), agentDelaySleeps: 2 });
+    const h = host({ recentTurns: 1 }, undefined, { workerReply: covering("a2"), workerDelaySleeps: 2 });
     for (const [id, role, text] of turns) await h.append(id, role, text);
-    expect(h.spawns).toBe(0);
+    expect(h.workerCalls).toBe(0);
     const { result, coreCalls } = await h.compact(transcript());
     expect(coreCalls).toBe(0);
-    expect(h.spawns).toBe(2);
+    expect(h.workerCalls).toBe(2);
     expect(result.messages?.[0]?.text).toContain("Covers the session through entry a2");
   });
 
@@ -1136,10 +1168,10 @@ describe("checkpoint-first compaction gate", () => {
     await h.append("u1", "user", "task");
     await h.append("a1", "assistant", "answer");
     await h.measure(160_000);
-    expect(h.spawns).toBe(1);
+    expect(h.workerCalls).toBe(1);
     const { coreCalls } = await h.compact(transcript(turns.slice(0, 2)));
     expect(coreCalls).toBe(1);
-    expect(h.spawns).toBe(1);
+    expect(h.workerCalls).toBe(1);
     expect(h.sleeps).toBe(0);
   });
 
@@ -1154,7 +1186,7 @@ describe("checkpoint-first compaction gate", () => {
   });
 
   test("a host that cannot sleep stops waiting instead of spinning", async () => {
-    const h = host({ recentTurns: 1 }, undefined, { agentReply: covering("a2"), agentDelaySleeps: 3, noSleep: true });
+    const h = host({ recentTurns: 1 }, undefined, { workerReply: covering("a2"), workerDelaySleeps: 3, noSleep: true });
     for (const [id, role, text] of turns) await h.append(id, role, text);
     await h.measure(160_000);
     const { coreCalls } = await h.compact(transcript());
@@ -1201,17 +1233,17 @@ async function fill(h: ReturnType<typeof host>) {
 describe("pi backend", () => {
   test("Pi and Claude fallbacks share one deadline and retain per-call artifacts", async () => {
     const failure: PiWorker = request => ({ nonce: request.nonce, ok: false, error: "invalid submission", usage: { totalTokens: 123, cost: 0 }, durationMs: 1500 });
-    const h = host({ ...PI_BOTH, recentTurns: 1, prepareTimeoutSeconds: 2 }, undefined, { piWorker: failure, piRunTimeMs: 1500, agentReply: covering("a2"), agentDelaySleeps: 1000 });
+    const h = host({ ...PI_BOTH, recentTurns: 1, prepareTimeoutSeconds: 2 }, undefined, { piWorker: failure, piRunTimeMs: 1500, workerReply: covering("a2"), workerDelaySleeps: 1000 });
     for (const [id, role, text] of turns) await h.append(id, role, text);
     await h.measure(160_000);
     expect(h.piRuns.length).toBe(1);
-    expect(h.spawns).toBe(1);
+    expect(h.workerCalls).toBe(1);
     expect(h.piRuns[0]!.outputPath).toContain(h.piRuns[0]!.nonce);
     expect(h.piRuns[0]!.cancelPath).toContain("/prepare-");
     await h.advance(500);
-    expect(h.stoppedAgents).toEqual(["agent-1"]);
+    expect([...h.files.keys()].some(path => path.endsWith("/cancel"))).toBe(true);
     await h.deliverLate();
-    expect(h.spawns).toBe(1);
+    expect(h.workerCalls).toBe(1);
     expect(await h.status()).toContain("preparation deadline reached");
   });
   test("Pi stays off by default and Claude never starts a process", async () => {
@@ -1240,7 +1272,7 @@ describe("pi backend", () => {
   test("Pi answers both roles in separate worker runs and the checkpoint publishes", async () => {
     const h = host({ ...PI_BOTH, recentTurns: 1 }, undefined, { piWorker: piCovering("a2") });
     await fill(h);
-    expect(h.spawns).toBe(0);
+    expect(h.workerCalls).toBe(0);
     expect(h.piRuns.map((run) => `${run.role}:${run.target.model}`)).toEqual([
       "builder:builder-model",
       "verifier:verifier-model",
@@ -1266,7 +1298,7 @@ describe("pi backend", () => {
     await fill(h);
     const status = await h.status();
     expect(status).toContain("checkpoint=shadow-");
-    expect(status).toContain("lastFallback=pi:pi builder (openrouter/builder-model): provider 429 then agents:");
+    expect(status).toContain("lastFallback=pi:pi builder (openrouter/builder-model): provider 429 then worker:");
     expect(status).toContain("lastPrepare=claude-complete ");
     expect(status).toContain("piUsage calls=1 failures=1");
     // Ordinary model failures leave Pi enabled for the next preparation.
@@ -1278,11 +1310,11 @@ describe("pi backend", () => {
       request.role === "builder"
         ? piCovering("a2")(request)
         : { nonce: request.nonce, ok: false, error: "submit_verdict rejected 3 times: Checkpoint must be a JSON object", usage, durationMs: 5 };
-    const h = host({ ...PI_BOTH, recentTurns: 1 }, covering("a2"), { piWorker: verifierDown, agentReply: covering("a2") });
+    const h = host({ ...PI_BOTH, recentTurns: 1 }, covering("a2"), { piWorker: verifierDown, workerReply: covering("a2") });
     await fill(h);
     // Two Pi runs (builder + failed verifier), then ONE Claude spawn: the verifier only.
     expect(h.piRuns.map((run) => run.role)).toEqual(["builder", "verifier"]);
-    expect(h.spawns).toBe(1);
+    expect(h.workerCalls).toBe(1);
     const status = await h.status();
     expect(status).toContain("checkpoint=shadow-");
     expect(status).toContain("pi:pi verifier");
@@ -1324,16 +1356,16 @@ describe("pi backend", () => {
     expect(h.piRuns.length).toBe(1);
     expect(await h.status()).toContain("lastFallback=pi-unavailable:");
     // Native compaction removed a2, so a checkpoint covering it is born stale.
-    expect(await h.status()).toContain("stale:coverage a2 compacted away");
+    expect(await h.status()).toContain("coverageEndEntryId is not a session row: a2");
     expect(await h.status()).toContain("checkpoint=none");
   });
 
-  test("mixed mode runs the Pi builder with the Claude agent verifier", async () => {
+  test("mixed mode runs the Pi builder with the Claude worker verifier", async () => {
     const config = { builderBackend: "pi", piBuilderProvider: "openrouter", piBuilderModel: "builder-model", recentTurns: 1 };
-    const h = host(config, undefined, { piWorker: piCovering("a2"), agentReply: covering("a2") });
+    const h = host(config, undefined, { piWorker: piCovering("a2"), workerReply: covering("a2") });
     await fill(h);
     expect(h.piRuns.map((run) => run.role)).toEqual(["builder"]);
-    expect(h.spawns).toBe(1);
+    expect(h.workerCalls).toBe(1);
     const status = await h.status();
     expect(status).toContain("checkpoint=shadow-");
     expect(status).toContain("verifier=claude:haiku");
@@ -1350,6 +1382,149 @@ describe("pi backend", () => {
     expect(await checkPi(fake(noAuth), config)).toBe("failed:verifier: no auth for openrouter");
     expect(await checkPi(fake("", 127), config)).toBe("failed:worker exited 127: boom");
     expect(await checkPi(fake(ok), resolveConfig({ builderBackend: "pi" }))).toContain("failed:builder needs piBuilderProvider");
+  });
+});
+
+/** A real worker selects its boundary from the reconciled manifest. */
+const coveringManifest: Reply = request => {
+  if (request.system === VERIFIER_SYSTEM_PROMPT) return JSON.stringify({ verdict: "accept", reason: "checked" });
+  const manifest = JSON.parse(request.prompt.split("Session manifest (start here):\n")[1]!.split("\n")[0]!);
+  return JSON.stringify({ checkpoint: checkpointJson("E0001"), coverageEndEntryId: manifest.lastTranscriptRowId });
+};
+
+describe("0.4.9 complete history and exact tail", () => {
+  test("an empty startup read retries and includes history before the reload", async () => {
+    const h = host({ recentTurns: 1 }, undefined, { workerReply: coveringManifest });
+    await h.start();
+    h.setCanonical(transcript());
+    await h.append("u4", "user", longText("after reload"));
+    await h.append("a4", "assistant", longText("new answer"));
+    await h.measure(160_000);
+    expect(await h.status()).toContain("archive rows=8");
+    expect(await h.status()).toContain("phase=verified");
+    const evidence = [...h.files.entries()].find(([path]) => path.endsWith("/evidence.jsonl"))![1];
+    expect(evidence).toContain("task detail");
+    expect(h.claudeRuns.length).toBe(2);
+    const live = [...transcript(), ...transcript([["u4", "user", longText("after reload")], ["a4", "assistant", longText("new answer")]])];
+    expect((await h.compact(live)).coreCalls).toBe(0);
+  });
+
+  test("a rejected startup read is retained and retried before preparation", async () => {
+    let unavailable = true;
+    const h = host({ recentTurns: 1 }, undefined, {
+      workerReply: coveringManifest,
+      historyRead: async messages => { if (unavailable) throw new Error("session not bound yet"); return messages; },
+    });
+    await h.start();
+    expect(await h.status()).toContain("retryable:session not bound yet");
+    unavailable = false;
+    h.setCanonical(transcript());
+    await h.measure(160_000);
+    expect(await h.status()).toContain("phase=verified");
+    expect(h.claudeRuns.length).toBe(2);
+    expect((await h.compact(transcript())).coreCalls).toBe(0);
+  });
+
+  test("appends racing a serialized history read survive once in canonical order", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let reads = 0;
+    const h = host({ recentTurns: 1 }, undefined, {
+      workerReply: coveringManifest,
+      historyRead: async messages => { reads += 1; const snapshot = [...messages]; if (reads === 1) await gate; return snapshot; },
+    });
+    h.setCanonical(transcript());
+    const starting = h.start();
+    await h.settle();
+    await h.append("u4", "user", longText("arrived during read"));
+    await h.append("a4", "assistant", longText("answer during read"));
+    release();
+    await starting;
+    await h.measure(160_000);
+    expect(await h.status()).toContain("archive rows=8");
+    const evidence = [...h.files.entries()].find(([path]) => path.endsWith("/evidence.jsonl"))![1];
+    const rows = evidence.trim().split("\n").map(line => JSON.parse(line));
+    expect(rows.length).toBe(8);
+    expect(rows[0].text).toContain("task detail");
+    expect(rows[6].text).toContain("arrived during read");
+    expect(rows[7].text).toContain("answer during read");
+  });
+
+  test("every message after the checkpoint survives even beyond the recent-round minimum", async () => {
+    const h = await readyHost("a2");
+    const newer: Array<[string, "user" | "assistant", string]> = [];
+    for (let round = 4; round <= 18; round += 1) {
+      newer.push([`u${round}`, "user", `new task ${round}`], [`a${round}`, "assistant", `new answer ${round}`]);
+    }
+    for (const [id, role, text] of newer) await h.append(id, role, text);
+    const live = [...transcript(), ...transcript(newer)];
+    const result = await h.compact(live);
+    expect(result.coreCalls).toBe(0);
+    expect(result.result.messages?.slice(1)).toEqual(live.slice(4));
+  });
+
+  test("the last X rounds remain verbatim when the checkpoint covers through the present", async () => {
+    const h = host({ recentTurns: 2 }, covering("a3"));
+    for (const [id, role, text] of turns) await h.append(id, role, text);
+    await h.measure(160_000);
+    const { result, coreCalls } = await h.compact(transcript());
+    expect(coreCalls).toBe(0);
+    expect(result.messages?.slice(1)).toEqual(transcript().slice(2));
+  });
+
+  test("mutating an older row under the same UUID forces a fresh full-history checkpoint", async () => {
+    const h = host({ recentTurns: 1 }, undefined, { workerReply: covering("a2") });
+    for (const [id, role, text] of turns) await h.append(id, role, text);
+    await h.measure(160_000);
+    const live = transcript().map((row, index) => index === 0 ? { ...row, text: longText("corrected original task") } : row);
+    const { result, coreCalls } = await h.compact(live);
+    expect(coreCalls).toBe(0);
+    expect(h.workerCalls).toBe(4);
+    const snapshots = [...h.files.entries()].filter(([path]) => path.endsWith("/evidence.jsonl"));
+    expect(snapshots.at(-1)![1]).toContain("corrected original task");
+    expect(result.messages?.slice(1)).toEqual(live.slice(4));
+    expect([...h.files.values()].some(value => value.includes('"event":"compact-reconcile"'))).toBe(true);
+  });
+
+  test("a capped canonical read defers to the complete compact snapshot", async () => {
+    const h = host({ recentTurns: 1 }, undefined, {
+      workerReply: coveringManifest, historyRead: async () => Array.from({ length: 4096 }, () => message("user", "capped")),
+    });
+    for (const [id, role, text] of turns) await h.append(id, role, text);
+    await h.measure(160_000);
+    expect(h.workerCalls).toBe(0);
+    expect(await h.status()).toContain("history-read-limited:4096");
+    const { coreCalls } = await h.compact(transcript());
+    expect(coreCalls).toBe(0);
+    expect(h.workerCalls).toBe(2);
+  });
+
+  test("a failed repair does not loop or get a fresh deadline", async () => {
+    const h = host({ recentTurns: 1, prepareTimeoutSeconds: 2 }, undefined, { workerReply: coveringManifest, workerDelaySleeps: 1000 });
+    const live = transcript().map((row, index) => ({ ...row, handle: `opaque-${index}` }));
+    const result = await h.compact(live);
+    expect(result.coreCalls).toBe(1);
+    expect(h.workerCalls).toBe(1);
+    expect(h.sleeps).toBe(2);
+    await h.deliverLate();
+    expect(h.workerCalls).toBe(1);
+    expect(await h.status()).toContain("checkpoint=none");
+  });
+
+  test("historical evidence stays available but only live rows can anchor coverage", () => {
+    const archive = archiveWith([["old", "user", "original request"], ["live", "assistant", "current state"]]);
+    const snapshot = archive.snapshot(archive.size - 1, new Set(["live"]));
+    expect(snapshot.size).toBe(2);
+    expect(snapshot.rows[0]?.text).toContain("original request");
+    expect(snapshot.manifest().lastTranscriptRowId).toBe("live");
+    expect(() => parseSubmission(JSON.stringify({ checkpoint: checkpointJson("E0001"), coverageEndEntryId: "old" }), snapshot)).toThrow(/must name a user or assistant row/);
+    expect(archive.rows[0]?.isTranscript).toBe(undefined);
+  });
+
+  test("completion responses normalize current and legacy hosts and surface unanswered reasons", () => {
+    expect(completionText({ isAnswered: true, text: "answer", usage: {} })).toBe("answer");
+    expect(completionText("legacy")).toBe("legacy");
+    expect(() => completionText({ isAnswered: false, reason: "aborted" })).toThrow(/aborted/);
   });
 });
 
@@ -1371,7 +1546,7 @@ describe("engine integration", () => {
     expect(result.text).toContain("verifier=claude:haiku");
     expect(result.text).toContain("lastFallback=none");
     expect(result.text).toContain("lastCompact=unseen");
-    expect(result.text).toContain("v0.4.8");
+    expect(result.text).toContain("v0.4.9");
   });
 
   test("compact with no checkpoint defers without inventing messages", async ($, on) => {

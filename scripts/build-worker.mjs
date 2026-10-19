@@ -18,3 +18,10 @@ await build({
   },
   logLevel: "warning",
 });
+
+await build({
+  entryPoints: ["worker/claude-worker-main.ts"],
+  outfile: "dist/claude-checkpoint-worker.mjs",
+  bundle: true, platform: "node", format: "esm", target: "node22",
+  minify: true, legalComments: "none", logLevel: "warning",
+});

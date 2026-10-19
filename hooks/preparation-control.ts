@@ -2,7 +2,6 @@
 export class PreparationCancelled extends Error {}
 
 export class PreparationControl {
-  readonly agents = new Set<string>();
   readonly cancelled: Promise<never>;
   reason: string | null = null;
   finished = false;

@@ -36,7 +36,7 @@ export interface EvidenceRow {
   isError: boolean;
   /** `session.append` origin kind; absent for bootstrap rows. */
   originKind?: string;
-  /** False for rendered attachments, notices and meta user rows. */
+  /** False for attachments/notices/meta, or archived rows outside this snapshot's live coverage. */
   isTranscript?: boolean;
 }
 
@@ -199,9 +199,11 @@ export class EvidenceArchive {
    * Preparation reads only this, so the evidence file, manifest, and ref
    * validation agree even while the live archive keeps growing.
    */
-  snapshot(lastIndex: number): EvidenceArchive {
+  snapshot(lastIndex: number, coverageIds?: ReadonlySet<string>): EvidenceArchive {
     const copy = new EvidenceArchive(this.cwd);
-    for (const row of this.rows.slice(0, lastIndex + 1)) copy.add(row);
+    for (const row of this.rows.slice(0, lastIndex + 1)) {
+      copy.add(coverageIds && !coverageIds.has(row.id) ? { ...row, isTranscript: false } : row);
+    }
     copy.setPreviousCheckpoint(this.#previousCheckpointSummary, this.#previousCoverageEndEntryId);
     return copy;
   }

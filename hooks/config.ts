@@ -64,6 +64,7 @@ export interface ShadowConfig {
   piVerifier: PiTarget | null;
   /** Node executable that runs the bundled Pi worker. */
   piNodePath: string;
+  claudePath: string;
 }
 
 function positiveInt(value: unknown, fallback: number): number {
@@ -123,6 +124,7 @@ export function resolveConfig(options: PluginOptions): ShadowConfig {
     piBuilder: piTarget(options.piBuilderProvider, options.piBuilderModel, options.piBuilderThinking),
     piVerifier: piTarget(options.piVerifierProvider, options.piVerifierModel, options.piVerifierThinking),
     piNodePath: text(options.piNodePath) || DEFAULT_NODE_PATH,
+    claudePath: text(options.claudePath) || "claude",
   };
 }
 

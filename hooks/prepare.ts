@@ -25,7 +25,7 @@ export interface AskRequest {
   model: string;
 }
 
-/** One side-model answer. Register wires each role to a private agent
+/** One side-model answer. Register wires each role to a private worker
  * spawn or the Pi worker, falling back to `$.model.complete` when agents
  * are unavailable. */
 export type AskFn = (request: AskRequest) => Promise<string>;
