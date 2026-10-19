@@ -11,11 +11,10 @@ test("the shipped worker honors cancellation and writes a nonce-tagged atomic re
     const cancelPath = join(directory, "cancel");
     const outputPath = join(directory, "result.json");
     await writeFile(cancelPath, "obsolete coverage");
-    const child = spawnSync(process.execPath, [resolve("dist/pi-checkpoint-worker.mjs")], {
+    const child = spawnSync(process.execPath, [resolve("dist/claude-checkpoint-worker.mjs")], {
       input: JSON.stringify({
-        op: "run", nonce: "bundle-test", role: "builder",
-        target: { provider: "unused", model: "unused", thinking: "off" },
-        system: "", prompt: "", evidencePath: join(directory, "intentionally-missing.json"),
+        nonce: "bundle-test", role: "builder", claudePath: "/intentionally/missing/claude",
+        model: "haiku", effort: "high", system: "", prompt: "",
         outputPath, cancelPath, deadlineMs: 5_000,
       }),
       encoding: "utf8", timeout: 10_000,
@@ -24,8 +23,7 @@ test("the shipped worker honors cancellation and writes a nonce-tagged atomic re
     const result = JSON.parse(await readFile(outputPath, "utf8"));
     assert.equal(result.nonce, "bundle-test");
     assert.equal(result.ok, false);
-    assert.match(result.error, /aborted/);
-    assert.equal(result.usage.totalTokens, 0);
+    assert.match(result.error, /abort/i);
     assert.equal(JSON.parse(child.stdout).ok, false);
   } finally {
     await rm(directory, { recursive: true, force: true });

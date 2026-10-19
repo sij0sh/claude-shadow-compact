@@ -6,8 +6,6 @@ export class PreparationControl {
   reason: string | null = null;
   finished = false;
   stopping = false;
-  /** Immutable snapshot access text, written once even when a backend falls back. */
-  evidenceAccess: string | undefined;
   private reject!: (error: Error) => void;
 
   constructor(

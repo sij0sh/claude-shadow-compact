@@ -1,214 +1,29 @@
 {
   "name": "shadow-compact",
-  "version": "0.4.10",
-  "description": "Verified-checkpoint compaction for Claude Code: isolated builder/verifier workers prepare evidence-grounded checkpoints, reconcile complete history after reload, and preserve every uncovered message plus the exact recent tail.",
-  "author": {
-    "name": "pi-shadow-compact port"
-  },
+  "displayName": "Shadow Compact",
+  "version": "0.4.11",
+  "description": "Automatic verified Claude checkpoints with exact recent-tail preservation.",
+  "license": "MIT",
   "userConfig": {
+    "checkpointModel": {
+      "type": "string",
+      "title": "Checkpoint model",
+      "description": "Claude model or alias used by both the builder and independent verifier. Use inherit for the session model.",
+      "default": "haiku"
+    },
+    "checkpointEffort": {
+      "type": "string",
+      "title": "Thinking effort",
+      "description": "Reasoning effort for both checkpoint roles, subject to model support and host policy.",
+      "options": ["low", "medium", "high", "xhigh", "max"],
+      "default": "high"
+    },
     "prepareThresholdTokens": {
       "type": "number",
       "title": "Checkpoint threshold (tokens)",
-      "description": "Absolute context token count at which background checkpoint preparation starts. Must be a positive integer below the auto-compact window so the checkpoint is ready before Claude Code compacts.",
-      "default": 150000
-    },
-    "configureAutoCompactWindow": {
-      "type": "boolean",
-      "title": "Set Claude's auto-compact window",
-      "description": "On a model's first session, set Claude Code's auto-compact window (as /autocompact does, saved per model) unless a window is already chosen in settings or CLAUDE_CODE_AUTO_COMPACT_WINDOW.",
-      "default": true
-    },
-    "autoCompactWindowTokens": {
-      "type": "number",
-      "title": "Auto-compact window (tokens)",
-      "description": "Window Shadow sets for Claude Code auto-compaction. The engine reserves headroom below it (observed around 157\u2013162k for a 190k window); keep it above the checkpoint threshold.",
-      "default": 190000
-    },
-    "configureIdleCompaction": {
-      "type": "boolean",
-      "title": "Lower Claude's idle-compaction floor",
-      "description": "Set CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS for the session (unless already set, or idleCompaction is false) and prepare a checkpoint when a turn completes above it, so Claude Code's idle compaction installs Shadow's checkpoint.",
-      "default": true
-    },
-    "idleCompactMinTokens": {
-      "type": "number",
-      "title": "Idle-compaction floor (tokens)",
-      "description": "Minimum context for Claude Code's idle compaction, which fires shortly before the one-hour prompt cache expires. Claude Code's default is 200000 and it refuses less than 100000.",
-      "default": 100000
-    },
-    "recentTurns": {
-      "type": "number",
-      "title": "Recent rounds kept verbatim",
-      "description": "Minimum number of recent rounds preserved exactly (by engine handle) after the checkpoint. A round is a prompt with its reply, or one assistant response with its tool results, so long single-prompt agentic turns can still compact.",
-      "default": 10
-    },
-    "holdCompaction": {
-      "type": "boolean",
-      "title": "Hold compaction for the checkpoint",
-      "description": "When Claude Code compacts while a checkpoint is still preparing (or none has been tried), Shadow holds the compaction until that preparation finishes or fails. Slowness alone never falls back to native; the preparation deadline is the failure signal. Off runs native compaction at once.",
-      "default": true
-    },
-    "builderModel": {
-      "type": "string",
-      "title": "Builder model",
-      "description": "Model alias or id for the isolated checkpoint-builder worker; haiku keeps cost low, inherit uses the session model.",
-      "default": "haiku",
-      "options": [
-        "inherit",
-        "haiku",
-        "sonnet",
-        "opus"
-      ]
-    },
-    "verifierModel": {
-      "type": "string",
-      "title": "Verifier model",
-      "description": "Model alias or id for the isolated checkpoint-verifier worker; haiku keeps cost low, inherit uses the session model.",
-      "default": "haiku",
-      "options": [
-        "inherit",
-        "haiku",
-        "sonnet",
-        "opus"
-      ]
-    },
-    "verificationMode": {
-      "type": "string",
-      "title": "Verification mode",
-      "description": "always independently verifies every draft; adaptive skips verification only for eligible low-risk drafts after deterministic checks and self-review.",
-      "default": "always",
-      "options": [
-        "always",
-        "adaptive"
-      ]
-    },
-    "builderEffort": {
-      "type": "string",
-      "title": "Builder effort",
-      "description": "Reasoning effort for the isolated checkpoint-builder Claude worker.",
-      "default": "high",
-      "options": [
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max"
-      ]
-    },
-    "verifierEffort": {
-      "type": "string",
-      "title": "Verifier effort",
-      "description": "Reasoning effort for the isolated checkpoint-verifier Claude worker.",
-      "default": "high",
-      "options": [
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max"
-      ]
-    },
-    "builderBackend": {
-      "type": "string",
-      "title": "Builder backend",
-      "description": "claude runs the builder as an isolated Claude CLI worker (default). pi runs it through Shadow's bundled Pi SDK worker with the provider and model below; this sends the sanitized evidence archive to that external provider. If a Pi preparation fails, Shadow redoes it with the Claude models.",
-      "default": "claude",
-      "options": [
-        "claude",
-        "pi"
-      ]
-    },
-    "verifierBackend": {
-      "type": "string",
-      "title": "Verifier backend",
-      "description": "claude runs the verifier as an isolated Claude CLI worker (default). pi runs it through Shadow's bundled Pi SDK worker with the provider and model below; this sends the sanitized evidence archive to that external provider. If a Pi preparation fails, Shadow redoes it with the Claude models.",
-      "default": "claude",
-      "options": [
-        "claude",
-        "pi"
-      ]
-    },
-    "piBuilderProvider": {
-      "type": "string",
-      "title": "Pi builder provider",
-      "description": "Pi provider id for the builder when its backend is pi (e.g. openrouter, openai, anthropic). Credentials come from Pi itself: run pi and /login.",
-      "default": ""
-    },
-    "piBuilderModel": {
-      "type": "string",
-      "title": "Pi builder model",
-      "description": "Model id in Pi's catalog for the builder when its backend is pi.",
-      "default": ""
-    },
-    "piBuilderThinking": {
-      "type": "string",
-      "title": "Pi builder thinking",
-      "description": "Pi thinking level for the builder when its backend is pi; clamped to what the model supports, off for none.",
-      "default": "low",
-      "options": [
-        "off",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max"
-      ]
-    },
-    "piVerifierProvider": {
-      "type": "string",
-      "title": "Pi verifier provider",
-      "description": "Pi provider id for the verifier when its backend is pi (e.g. openrouter, openai, anthropic). Credentials come from Pi itself: run pi and /login.",
-      "default": ""
-    },
-    "piVerifierModel": {
-      "type": "string",
-      "title": "Pi verifier model",
-      "description": "Model id in Pi's catalog for the verifier when its backend is pi.",
-      "default": ""
-    },
-    "piVerifierThinking": {
-      "type": "string",
-      "title": "Pi verifier thinking",
-      "description": "Pi thinking level for the verifier when its backend is pi; clamped to what the model supports, off for none.",
-      "default": "low",
-      "options": [
-        "off",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max"
-      ]
-    },
-    "piNodePath": {
-      "type": "string",
-      "title": "Node for checkpoint workers",
-      "description": "Node.js executable that runs the bundled checkpoint workers (Claude and Pi).",
-      "default": "node"
-    },
-    "manualCompactMode": {
-      "type": "string",
-      "title": "Manual /compact mode",
-      "description": "shadow answers /compact with the verified checkpoint when one covers the transcript; native always defers to Claude Code compaction.",
-      "default": "shadow",
-      "options": [
-        "shadow",
-        "native"
-      ]
-    },
-    "prepareTimeoutSeconds": {
-      "type": "number",
-      "title": "Preparation deadline (seconds)",
-      "description": "One deadline shared by builder, verifier, retries and backend fallbacks. A held compaction falls back to native only when this deadline passes without a checkpoint. Positive integer, at most 600.",
-      "default": 360
-    },
-    "claudePath": {
-      "type": "string",
-      "title": "Claude executable",
-      "description": "Claude Code executable used by isolated --safe-mode checkpoint workers. Uses existing Claude authentication; never runs as a parent-session subagent.",
-      "default": "claude"
+      "description": "Start a background checkpoint at this context size. Idle preparation starts automatically at 100,000 tokens.",
+      "default": 160000,
+      "min": 1
     }
   }
 }

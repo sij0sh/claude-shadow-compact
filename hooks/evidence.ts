@@ -4,7 +4,7 @@
  * archive mirrors main-loop rows in append order, sanitizes their text,
  * and serves the builder/verifier through a manifest + paged file.
  * Evidence ids (`E0001`, ...) are stable per archive position; `E0000`
- * names the previous checkpoint, exactly as in the Pi version.
+ * names the previous checkpoint.
  */
 import { estimateTokens, redactSecretValue, sanitizeForContext } from "./normalize.js";
 
@@ -67,6 +67,23 @@ export interface EvidenceTurn {
 const CORRECTION_SIGNALS =
   /\b(no\b|wrong|incorrect|instead|actually|not that|fix\b|should\b|must\b|never\b|always\b|don't\b|do not\b|require[sd]?|prefer|prohibit)/i;
 const MAX_ROW_TEXT_CHARS = 4_000;
+
+/** Keep output headers and final errors/results, with explicit clipping provenance. */
+function projectRowText(text: string): string {
+  if (text.length <= MAX_ROW_TEXT_CHARS) return text;
+  // The omitted count includes only source characters, not the marker itself.
+  let omitted = text.length - MAX_ROW_TEXT_CHARS;
+  let marker = "";
+  for (let pass = 0; pass < 3; pass += 1) {
+    marker = `\n[... ${omitted} characters omitted ...]\n`;
+    omitted = text.length - MAX_ROW_TEXT_CHARS + marker.length;
+  }
+  marker = `\n[... ${omitted} characters omitted ...]\n`;
+  const kept = MAX_ROW_TEXT_CHARS - marker.length;
+  const head = Math.ceil(kept / 2);
+  return text.slice(0, head) + marker + text.slice(-(kept - head));
+}
+
 
 export type EvidenceSignal = "correction" | "error" | "quantity" | "rejected-approach" | "acceptance" | "verification" | "truncated";
 
@@ -153,7 +170,7 @@ export function rowFromAppend(
     evidenceId: evidenceIdForIndex(index),
     ...(role ? { role } : {}),
     door,
-    text: sanitized.slice(0, MAX_ROW_TEXT_CHARS),
+    text: projectRowText(sanitized),
     textTruncated: sanitized.length > MAX_ROW_TEXT_CHARS,
     originalTextChars: sanitized.length,
     toolNames,

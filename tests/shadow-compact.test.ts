@@ -5,13 +5,10 @@ import {
   validateCheckpointObject,
   type Checkpoint,
 } from "../hooks/checkpoint.js";
-import { decideAutoCompactWindow, decideIdleCompaction, describeModel, describeRole, isAtOrAbove, resolveConfig, usesPi, type WindowFacts } from "../hooks/config.js";
+import { decideAutoCompactWindow, decideIdleCompaction, isAtOrAbove, resolveConfig, PREPARE_TIMEOUT_SECONDS, RECENT_ROUNDS, type WindowFacts } from "../hooks/config.js";
 import { EvidenceArchive } from "../hooks/evidence.js";
 import { redactSecretValue, sanitizeForContext } from "../hooks/normalize.js";
 import { BUILDER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT, prepareCheckpoint, parseSubmission, emptyPreparationMetrics, type AskFn } from "../hooks/prepare.js";
-import { classifyCheckpointRisk } from "../hooks/checkpoint-risk.js";
-import { checkPi } from "../hooks/pi-backend.js";
-import { PI_EVIDENCE_ACCESS, type PiEvidenceFile, type PiRunRequest, type PiRunResult } from "../hooks/pi-protocol.js";
 import { completionText } from "../hooks/claude-backend.js";
 import type { ClaudeRunRequest } from "../hooks/claude-protocol.js";
 import { register } from "../hooks/register.js";
@@ -219,7 +216,7 @@ describe("state machine", () => {
     checkpointId: id,
     rendered: "# Continuation Checkpoint",
     coverageEndEntryId: "r1",
-    validation: { deterministic: "passed", independent: "accepted", mode: "always", risk: { level: "low", reasons: [] } },
+    validation: { deterministic: "passed", independent: "accepted" },
     proof: { sessionId: "test", epoch: 1, snapshotId: "test", coveredCount: 1, prefixDigest: "test", evidenceDigest: "test" },
   });
 
@@ -233,7 +230,7 @@ describe("state machine", () => {
     expect(state.publish(first!, published("a"))).toBe(false);
     const second = state.startPreparing();
     expect(state.publish(second!, published("b"))).toBe(true);
-    expect(state.phase).toBe("verified");
+    expect(state.phase).toBe("ready");
     expect(state.refreshArmed).toBe(false);
     expect(state.rearm()).toBe(true);
   });
@@ -258,22 +255,17 @@ describe("state machine", () => {
     expect(state.refreshArmed).toBe(false);
   });
 
-  test("single-agent readiness cannot publish under always mode or with high risk", () => {
+  test("a draft cannot publish without independent verification", () => {
     const state = new ShadowState();
     const generation = state.startPreparing()!;
-    const candidate: PublishedCheckpoint = { ...published("adaptive"), validation: {
-      deterministic: "passed", independent: "skipped", mode: "always", risk: { level: "low", reasons: [] },
-    } };
+    const candidate = { ...published("unverified"), validation: { deterministic: "passed", independent: "skipped" } } as unknown as PublishedCheckpoint;
     expect(state.publish(generation, candidate)).toBe(false);
-    candidate.validation.mode = "adaptive";
-    candidate.validation.risk.level = "high";
-    expect(state.publish(generation, candidate)).toBe(false);
-    candidate.validation.risk.level = "low";
-    expect(state.publish(generation, candidate)).toBe(true);
-    expect(state.phase).toBe("validated");
+    expect(state.preparing).toBe(true);
+    expect(state.publish(generation, published("verified"))).toBe(true);
+    expect(state.phase).toBe("ready");
     state.rearm();
     state.startPreparing();
-    expect(state.phase).toBe("validated-preparing");
+    expect(state.phase).toBe("refreshing");
   });
 });
 
@@ -291,10 +283,7 @@ describe("prepare pipeline", () => {
       }
       return JSON.stringify({ verdict: "accept", reason: "grounded" });
     };
-    const prepared = await prepareCheckpoint(ask, archive, "evidence inline", {
-      builder: "inherit",
-      verifier: "inherit",
-    });
+    const prepared = await prepareCheckpoint(ask, archive, "evidence inline", "inherit");
     expect(prepared.coverageEndEntryId).toBe("r2");
     expect(prepared.rendered).toContain("Port shadow compact");
   });
@@ -308,7 +297,7 @@ describe("prepare pipeline", () => {
       return JSON.stringify({ verdict: "unusable", reason: "no evidence" });
     };
     await expect(
-      prepareCheckpoint(ask, archive, "evidence inline", { builder: "inherit", verifier: "inherit" }),
+      prepareCheckpoint(ask, archive, "evidence inline", "inherit"),
     ).rejects.toThrow(/unusable/);
   });
 
@@ -323,10 +312,7 @@ describe("prepare pipeline", () => {
       }
       return JSON.stringify({ verdict: "accept", reason: "ok" });
     };
-    const prepared = await prepareCheckpoint(ask, archive, "evidence inline", {
-      builder: "inherit",
-      verifier: "inherit",
-    });
+    const prepared = await prepareCheckpoint(ask, archive, "evidence inline", "inherit");
     expect(builderCalls).toBe(2);
     expect(prepared.coverageEndEntryId).toBe("r2");
   });
@@ -348,10 +334,7 @@ describe("prepare pipeline", () => {
       }
       return JSON.stringify({ verdict: "accept", reason: "ok" });
     };
-    const prepared = await prepareCheckpoint(ask, snapshot, "evidence inline", {
-      builder: "inherit",
-      verifier: "inherit",
-    });
+    const prepared = await prepareCheckpoint(ask, snapshot, "evidence inline", "inherit");
     expect(live.size).toBe(4);
     expect(verifierPrompts[0]).toContain('"rowCount":2');
     expect(verifierPrompts[0]).toContain('"lastRowId":"r2"');
@@ -361,141 +344,9 @@ describe("prepare pipeline", () => {
   });
 });
 
-describe("adaptive checkpoint routing", () => {
-  const lowArchive = () => archiveWith([
-    ["r1", "user", "Port shadow compact and wire the compact hook"],
-    ["r2", "assistant", "Working on the compact hook with private agents"],
-  ]);
-  const models = { builder: "haiku", verifier: "haiku" };
+describe("checkpoint integrity", () => {
+  const lowArchive = () => archiveWith([["r1", "user", "Port shadow compact"], ["r2", "assistant", "Working on the compact hook"]]);
   const submission = (checkpoint = checkpointJson("E0001"), coverage = "r2") => JSON.stringify({ checkpoint, coverageEndEntryId: coverage });
-
-  test("adaptive low-risk generation needs one agent invocation and reports validation honestly", async () => {
-    const metrics = emptyPreparationMetrics();
-    const roles: string[] = [];
-    const ask: AskFn = async request => { roles.push(request.role); return submission(); };
-    const ready = await prepareCheckpoint(ask, lowArchive(), "inline", models, undefined, { verificationMode: "adaptive", metrics });
-    expect(roles).toEqual(["builder"]);
-    expect(ready.validation).toMatchObject({ deterministic: "passed", independent: "skipped", mode: "adaptive", risk: { level: "low" } });
-    expect(metrics).toMatchObject({ builderCalls: 1, verifierCalls: 0, correctionCount: 0, route: "single-agent" });
-  });
-
-  test("always mode keeps the independent verifier even for low-risk drafts", async () => {
-    const roles: string[] = [];
-    const ready = await prepareCheckpoint(async request => {
-      roles.push(request.role);
-      return request.role === "builder" ? submission() : '{"verdict":"accept"}';
-    }, lowArchive(), "inline", models);
-    expect(roles).toEqual(["builder", "verifier"]);
-    expect(ready.validation).toMatchObject({ independent: "accepted", mode: "always", risk: { level: "low" } });
-  });
-
-  // Synthetic replay cases for the audit's failure classes, not recordings from the audit.
-  const riskySources = [
-    ["No, use the other compact API instead", "source-correction"],
-    ["Only a subset was displayed; omitted links: 17", "source-quantity"],
-    ["The user approved a proposal", "source-acceptance"],
-    ["The previous variant was rejected", "source-rejected-approach"],
-    ["An unresolved error prevents continuation", "source-error"],
-    ["The assistant says the implementation is completed", "source-verification"],
-  ];
-  for (const [source, code] of riskySources) {
-    test(`independent verification is required for ${code}`, async () => {
-      const archive = archiveWith([["r1", "user", source!], ["r2", "assistant", "Working on the compact hook"]]);
-      const roles: string[] = [];
-      const ready = await prepareCheckpoint(async request => {
-        roles.push(request.role);
-        return request.role === "builder" ? submission() : '{"verdict":"accept"}';
-      }, archive, "inline", models, undefined, { verificationMode: "adaptive" });
-      expect(roles).toEqual(["builder", "verifier"]);
-      expect(ready.validation.risk.reasons.map(reason => reason.code)).toContain(code);
-    });
-  }
-
-  test("success, quantities, verified status, and continuation claims are high risk even with existing refs", () => {
-    const variants = [
-      { completedWork: [{ text: "All tests passed", evidenceRefs: ["E0001"] }] },
-      { currentState: [{ text: "There are 99 omitted links", evidenceRefs: ["E0001"] }] },
-      { verificationState: [{ text: "Compact behavior verified", status: "verified", evidenceRefs: ["E0001"] }] },
-      { continuationState: { currentGoal: "Ship the compact hook", currentApproach: "Everything is fixed", immediateNextStep: "Deploy the compact hook" } },
-      { currentState: [{ text: "Build succeeded but deployment is unverified", evidenceRefs: ["E0001"] }] },
-    ];
-    for (const variant of variants) {
-      const archive = lowArchive();
-      const draft = parseSubmission(submission({ ...checkpointJson("E0001"), ...variant }), archive);
-      expect(classifyCheckpointRisk(draft, archive).level).toBe("high");
-    }
-  });
-
-  test("omitted user context and previous-checkpoint-only claims cannot bypass the verifier", () => {
-    const archive = lowArchive();
-    archive.addAppend("r3", "prompt", { type: "user", role: "user", content: [{ type: "text", text: "Also keep the export hook" }] }, "composer");
-    const draft = parseSubmission(submission(checkpointJson("E0001"), "r3"), archive);
-    expect(classifyCheckpointRisk(draft, archive).reasons.map(reason => reason.code)).toContain("uncited-user-context");
-    archive.setPreviousCheckpoint("Prior continuation state", "r2");
-    const prior = parseSubmission(submission(checkpointJson("E0000"), "r3"), archive);
-    expect(classifyCheckpointRisk(prior, archive).reasons.map(reason => reason.code)).toContain("previous-checkpoint-only");
-  });
-
-  test("truncation metadata forces verification and survives snapshot serialization", () => {
-    const archive = lowArchive();
-    archive.addAppend("r3", "response", { type: "assistant", content: [{ type: "text", text: "context ".repeat(600) }] });
-    const snapshot = archive.snapshot(2);
-    const draft = parseSubmission(submission(checkpointJson("E0001"), "r3"), snapshot);
-    expect(snapshot.rows[2]?.textTruncated).toBe(true);
-    expect(snapshot.rows[2]?.originalTextChars).toBe(4800);
-    expect(snapshot.fullText()).toContain('"textTruncated":true');
-    expect(classifyCheckpointRisk(draft, snapshot).reasons.map(reason => reason.code)).toContain("source-truncated");
-  });
-
-  test("risk is bounded by coverage; newer evidence remains in the exact suffix", () => {
-    const archive = lowArchive();
-    archive.addAppend("r3", "prompt", { type: "user", role: "user", content: [{ type: "text", text: "No, that failed with error 42" }] });
-    const draft = parseSubmission(submission(), archive);
-    expect(classifyCheckpointRisk(draft, archive).level).toBe("low");
-  });
-
-  test("one bounded correction can recover low-risk output without adding a verifier", async () => {
-    const metrics = emptyPreparationMetrics();
-    let calls = 0;
-    await prepareCheckpoint(async request => {
-      calls += 1;
-      if (calls === 1) return "invalid answer";
-      expect(request.prompt).toContain("Your previous answer was rejected");
-      return submission();
-    }, lowArchive(), "inline", models, undefined, { verificationMode: "adaptive", metrics });
-    expect(calls).toBe(2);
-    expect(metrics).toMatchObject({ builderCalls: 2, correctionCount: 1, verifierCalls: 0 });
-  });
-
-  test("repeated malformed output fails after one correction and never invokes a verifier", async () => {
-    const metrics = emptyPreparationMetrics();
-    await expect(prepareCheckpoint(async () => "bad answer", lowArchive(), "inline", models, undefined,
-      { verificationMode: "adaptive", metrics })).rejects.toThrow("builder failed validation");
-    expect(metrics).toMatchObject({ builderCalls: 2, verifierCalls: 0, correctionCount: 1 });
-  });
-
-  test("audit-shaped inaccuracies are routed to a full repair that retains counts, rejections and errors", async () => {
-    const archive = archiveWith([
-      ["r1", "user", "Review the proposal; acceptance has not been given"],
-      ["r2", "assistant", "Displayed a subset; omitted links: 17. Variant blue was rejected. Error: missing source."],
-    ]);
-    const repaired = {
-      ...checkpointJson("E0001"),
-      currentState: [{ text: "Displayed a subset; omitted links: 17", evidenceRefs: ["E0002"] }],
-      decisions: [{ text: "Variant blue was rejected; acceptance is pending", evidenceRefs: ["E0001", "E0002"] }],
-      openIssues: [{ text: "Error: missing source remains unresolved", evidenceRefs: ["E0002"] }],
-    };
-    const ready = await prepareCheckpoint(async request => request.role === "builder"
-      ? submission({ ...checkpointJson("E0001"), completedWork: [{ text: "All links accepted", evidenceRefs: ["E0001"] }] })
-      : JSON.stringify({ verdict: "repair", checkpoint: repaired, coverageEndEntryId: "r2" }),
-    archive, "inline", models, undefined, { verificationMode: "adaptive" });
-    expect(ready.validation.independent).toBe("repaired");
-    expect(ready.rendered).toContain("omitted links: 17");
-    expect(ready.rendered).toContain("Variant blue was rejected");
-    expect(ready.rendered).toContain("missing source remains unresolved");
-    expect(ready.rendered).not.toContain("All links accepted");
-  });
-
   test("coverage integrity checks reject regression, forward citations and missing previous evidence", () => {
     const archive = lowArchive();
     expect(() => parseSubmission(submission(checkpointJson("E0002"), "r1"), archive)).toThrow("beyond coverageEndEntryId");
@@ -505,10 +356,10 @@ describe("adaptive checkpoint routing", () => {
     expect(() => parseSubmission(submission(), archive)).toThrow("absent from the evidence snapshot");
   });
 
-  test("render size is checked before optional verification", async () => {
+  test("render size is checked before independent verification", async () => {
     const metrics = emptyPreparationMetrics();
     const oversized = { ...checkpointJson("E0001"), currentState: Array.from({ length: 10 }, () => ({ text: "context ".repeat(950), evidenceRefs: ["E0001"] })) };
-    await expect(prepareCheckpoint(async () => submission(oversized), lowArchive(), "inline", models, undefined, { metrics })).rejects.toThrow("Rendered checkpoint exceeds");
+    await expect(prepareCheckpoint(async () => submission(oversized), lowArchive(), "inline", "haiku", undefined, { metrics })).rejects.toThrow("Rendered checkpoint exceeds");
     expect(metrics.verifierCalls).toBe(0);
   });
 
@@ -525,243 +376,17 @@ describe("adaptive checkpoint routing", () => {
   });
 });
 
-describe("config", () => {
-  test("adaptive verification is opt-in and unknown settings keep independent verification", () => {
-    expect(resolveConfig({}).verificationMode).toBe("always");
-    expect(resolveConfig({ verificationMode: "adaptive" }).verificationMode).toBe("adaptive");
-    expect(resolveConfig({ verificationMode: "never" }).verificationMode).toBe("always");
-  });
-  test("preparation has one bounded positive deadline", () => {
-    expect(resolveConfig({}).prepareTimeoutSeconds).toBe(360);
-    expect(resolveConfig({ prepareTimeoutSeconds: 999 }).prepareTimeoutSeconds).toBe(600);
-    expect(resolveConfig({ prepareTimeoutSeconds: 0 }).prepareTimeoutSeconds).toBe(360);
-  });
-  test("placeholder text fails validation in items, verification and continuation", () => {
-    const refs = new Set(["E0001"]);
-    const stub = (patch: Record<string, unknown>) => () => validateCheckpointObject({ ...checkpointJson("E0001"), ...patch }, refs);
-    expect(stub({ objective: [{ text: "test", evidenceRefs: ["E0001"] }] })).toThrow("placeholder text");
-    expect(stub({ objective: [{ text: "TODO.", evidenceRefs: ["E0001"] }] })).toThrow("placeholder text");
-    expect(stub({ verificationState: [{ text: "x", status: "unverified", evidenceRefs: ["E0001"] }] })).toThrow("placeholder text");
-    expect(stub({ continuationState: { currentGoal: "y", currentApproach: "x", immediateNextStep: "z" } })).toThrow("placeholder text");
-    // The exact stub a Pi builder submitted in a live session.
-    expect(stub({
-      objective: [{ text: "test", evidenceRefs: ["E0001"] }],
-      nextActions: undefined,
-      verificationState: undefined,
-      continuationState: { currentApproach: "x", currentGoal: "y", immediateNextStep: "z" },
-    })).toThrow("placeholder text");
-    expect(stub({ modifiedFiles: [{ text: "src/a.ts", evidenceRefs: ["E0001"] }] })).not.toThrow();
-  });
-  test("checkpoint agents default to high effort", () => {
-    expect(resolveConfig({}).builderEffort).toBe("high");
-    expect(resolveConfig({}).verifierEffort).toBe("high");
-    expect(resolveConfig({ verifierEffort: "max", builderEffort: "bogus" })).toMatchObject({ builderEffort: "high", verifierEffort: "max" });
-  });
-  test("token default and custom threshold hold", async () => {
-    expect(resolveConfig({}).prepareThresholdTokens).toBe(150_000);
-    expect(resolveConfig({ prepareThresholdTokens: 180_000 }).prepareThresholdTokens).toBe(180_000);
-  });
-
-  test("builder and verifier default to haiku", async () => {
-    const config = resolveConfig({});
-    expect(config.builderModel).toBe("haiku");
-    expect(config.verifierModel).toBe("haiku");
-    const custom = resolveConfig({ builderModel: "sonnet", verifierModel: " inherit " });
-    expect(custom.builderModel).toBe("sonnet");
-    expect(custom.verifierModel).toBe("inherit");
-    expect(resolveConfig({ builderModel: "" }).builderModel).toBe("haiku");
-    expect(describeModel("haiku")).toBe("claude:haiku");
-    expect(describeModel("sonnet")).toBe("claude:sonnet");
-  });
-
-  test("invalid token settings use the default", async () => {
-    for (const invalid of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "bad", "", true, false]) {
-      expect(resolveConfig({ prepareThresholdTokens: invalid }).prepareThresholdTokens).toBe(150_000);
-    }
-    expect(resolveConfig({ prepareThresholdTokens: "200000" }).prepareThresholdTokens).toBe(200_000);
-  });
-
-  test("only absolute token usage triggers thresholds, including the exact boundary", async () => {
-    expect(isAtOrAbove({ tokens: 159_999, percent: 99 }, 160_000)).toBe(false);
-    expect(isAtOrAbove({ tokens: 160_000, percent: 16 }, 160_000)).toBe(true);
-    for (const tokens of [undefined, null, NaN, Infinity]) {
-      expect(isAtOrAbove({ tokens, percent: 100 }, 160_000)).toBe(false);
-    }
-    const legacy = resolveConfig({ prepareThresholdPercent: 1, hardThresholdTokens: 2 });
-    expect(legacy.prepareThresholdTokens).toBe(150_000);
-  });
-
-  test("auto-compact window defaults to 190k and is on", async () => {
-    const config = resolveConfig({});
-    expect(config.autoCompactWindowTokens).toBe(190_000);
-    expect(config.configureAutoCompactWindow).toBe(true);
-    expect(resolveConfig({ configureAutoCompactWindow: false }).configureAutoCompactWindow).toBe(false);
-    expect(resolveConfig({ autoCompactWindowTokens: -5 }).autoCompactWindowTokens).toBe(190_000);
-  });
-
-  test("idle-compaction floor defaults to 100k, on, and never goes below 100k", async () => {
-    const config = resolveConfig({});
-    expect(config.idleCompactMinTokens).toBe(100_000);
-    expect(config.configureIdleCompaction).toBe(true);
-    expect(resolveConfig({ idleCompactMinTokens: 50_000 }).idleCompactMinTokens).toBe(100_000);
-    expect(resolveConfig({ idleCompactMinTokens: 120_000 }).idleCompactMinTokens).toBe(120_000);
-    expect(resolveConfig({ configureIdleCompaction: false }).configureIdleCompaction).toBe(false);
-  });
-});
-
-describe("idle-compaction floor decision", () => {
-  const config = resolveConfig({});
-
-  test("applies when nothing chose a floor", async () => {
-    expect(decideIdleCompaction(config, { envValue: undefined, settings: {} })).toEqual({ apply: true });
-  });
-
-  test("keeps a person's floor, respects idleCompaction false and the toggle", async () => {
-    expect(decideIdleCompaction(config, { envValue: "150000", settings: {} })).toEqual({ apply: false, reason: "kept-env 150000" });
-    expect(decideIdleCompaction(config, { envValue: undefined, settings: { idleCompaction: false } })).toEqual({ apply: false, reason: "off-settings" });
-    const off = resolveConfig({ configureIdleCompaction: false });
-    expect(decideIdleCompaction(off, { envValue: undefined, settings: {} })).toEqual({ apply: false, reason: "disabled" });
-  });
-});
-
-describe("auto-compact window decision", () => {
-  const facts = (overrides: Partial<WindowFacts> = {}): WindowFacts => ({
-    model: "claude-opus-5-5",
-    modelWindow: 1_000_000,
-    source: "model-default",
-    settings: {},
-    decidedBefore: false,
-    ...overrides,
-  });
-  const config = resolveConfig({});
-
-  test("applies on a model's first session with no chosen window", async () => {
-    expect(decideAutoCompactWindow(config, facts())).toEqual({ apply: true });
-  });
-
-  test("never overrides an env, settings or explicit auto window", async () => {
-    expect(decideAutoCompactWindow(config, facts({ source: "env" }))).toMatchObject({ apply: false, reason: "kept-env", final: true });
-    expect(decideAutoCompactWindow(config, facts({ source: "settings" }))).toMatchObject({ reason: "kept-settings" });
-    // `/autocompact auto` reports model-default, so settings are read too.
-    const explicitAuto = { modelSettings: { "claude-opus-5-5": { autoCompactWindow: "auto" } } };
-    expect(decideAutoCompactWindow(config, facts({ settings: explicitAuto }))).toMatchObject({ reason: "kept-settings" });
-    expect(decideAutoCompactWindow(config, facts({ settings: { autoCompactWindow: 300_000 } }))).toMatchObject({ reason: "kept-settings" });
-    // Another model's choice does not count for this one.
-    const other = { modelSettings: { "claude-sonnet-5-5": { autoCompactWindow: 300_000 } } };
-    expect(decideAutoCompactWindow(config, facts({ settings: other }))).toEqual({ apply: true });
-  });
-
-  test("decides once per model and skips windows that cannot work", async () => {
-    expect(decideAutoCompactWindow(config, facts({ decidedBefore: true }))).toMatchObject({ reason: "decided-before" });
-    expect(decideAutoCompactWindow(resolveConfig({ configureAutoCompactWindow: false }), facts())).toMatchObject({ reason: "disabled", final: false });
-    expect(decideAutoCompactWindow(config, facts({ modelWindow: 190_000 }))).toMatchObject({ reason: "model-window-smaller", final: false });
-    const inverted = resolveConfig({ prepareThresholdTokens: 200_000 });
-    expect(decideAutoCompactWindow(inverted, facts())).toMatchObject({ reason: "window-below-prepare-threshold" });
-  });
-});
-
-describe("auto-compact window setup", () => {
-  function startHost(options: Record<string, number | string | boolean>, initial: { source: string; raw: number }, settings = {}, env: Record<string, string> = {}) {
-    const store = new Map<string, unknown>();
-    const runs: Array<{ command: string; args: string }> = [];
-    let effective = { ...initial };
-    const handlers = new Map<string, any>();
-    const on = ((event: string, ...args: unknown[]) => {
-      if (args.length === 1) handlers.set(event, args[0]);
-      return { catch: () => undefined };
-    }) as On;
-    const $ = {
-      plugin: { root: "/plugin" },
-      session: {
-        cwd: async () => "/repo",
-        id: async () => "window-test",
-        messages: async () => [],
-        usage: async () => ({
-          context: {
-            window: 1_000_000,
-            breakdown: { model: "claude-opus-5-5", rawMaxTokens: effective.raw, autocompactSource: effective.source },
-          },
-        }),
-      },
-      agent: { register: async () => ({}) },
-      command: {
-        register: async () => ({}),
-        run: async (input: { command: string; args: string }) => {
-          runs.push(input);
-          effective = { source: "settings", raw: Number(input.args) };
-          return { text: "set" };
-        },
-      },
-      settings: { read: async () => settings },
-      env: {
-        get: async (name: string) => env[name],
-        set: async (name: string, value: string | undefined) => {
-          if (value === undefined) delete env[name];
-          else env[name] = value;
-        },
-      },
-      store: { get: async (key: string) => store.get(key), set: async (key: string, value: unknown) => { store.set(key, value); } },
-      fs: { write: async () => undefined },
-      ui: { log: () => undefined },
-    } as unknown as EngineInterface;
-    register(on, options);
-    return {
-      runs,
-      store,
-      env,
-      start: () => handlers.get("session.start")!($, { cwd: "/repo" }, async (e: { cwd: string }) => ({ cwd: e.cwd })),
-    };
-  }
-
-  test("sets the window once through /autocompact and remembers the model", async () => {
-    const h = startHost({}, { source: "model-default", raw: 1_000_000 });
-    await h.start();
-    expect(h.runs).toEqual([{ command: "autocompact", args: "190000" }]);
-    expect(h.store.get("autoCompactWindowDecisions")).toEqual({ "claude-opus-5-5": "applied:190000" });
-    await h.start();
-    expect(h.runs.length).toBe(1);
-  });
-
-  test("leaves an existing window alone and records that", async () => {
-    const h = startHost({}, { source: "model-default", raw: 1_000_000 }, { modelSettings: { "claude-opus-5-5": { autoCompactWindow: "auto" } } });
-    await h.start();
-    expect(h.runs.length).toBe(0);
-    expect(h.store.get("autoCompactWindowDecisions")).toEqual({ "claude-opus-5-5": "kept-settings" });
-  });
-
-  test("disabled does nothing and remembers nothing", async () => {
-    const h = startHost({ configureAutoCompactWindow: false }, { source: "model-default", raw: 1_000_000 });
-    await h.start();
-    expect(h.runs.length).toBe(0);
-    expect(h.store.size).toBe(0);
-  });
-
-  test("lowers the idle-compaction floor unless the person set one", async () => {
-    const h = startHost({}, { source: "model-default", raw: 1_000_000 });
-    await h.start();
-    expect(h.env.CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS).toBe("100000");
-    const kept = startHost({}, { source: "model-default", raw: 1_000_000 }, {}, { CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS: "180000" });
-    await kept.start();
-    expect(kept.env.CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS).toBe("180000");
-  });
-});
-
-// Drive the registered hooks with a small host so preparation and
-// compaction are deterministic and never invoke real models or core.
 type Reply = (request: { system: string; prompt: string }) => string;
-
-/** What the fake Pi worker does with one run request. */
-type PiWorker = (request: PiRunRequest) => PiRunResult | "crash";
 
 interface HostFakes {
   /** Answers isolated Claude worker calls; absent, the worker is unavailable. */
   workerReply?: Reply;
   /** Agent answers land only after this many host sleeps (a slow pipeline). */
   workerDelaySleeps?: number;
-  piWorker?: PiWorker;
   /** Host `sleep` fails, as on a host without it or Node. */
   noSleep?: boolean;
-  piRunTimeMs?: number;
+  workerRunTimeMs?: number;
+  workerResult?: (request: ClaudeRunRequest, answer: string) => object;
   historyRead?: (messages: SessionMessage[]) => Promise<SessionMessage[]>;
 }
 
@@ -769,13 +394,13 @@ function host(options: Record<string, number | string | boolean> = {}, reply?: R
   type Handler = ($: EngineInterface, e: any, next: (e: any) => Promise<any>) => any;
   const handlers = new Map<string, Handler>();
   const scheduled: Array<{ at: number; callback: () => void }> = [];
-  const stoppedAgents: string[] = [];
   const logs: string[] = [];
   let canonical: SessionMessage[] = [];
   let workerCalls = 0;
   let selfCompactions = 0;
   const files = new Map<string, string>();
-  const piRuns: PiRunRequest[] = [];
+  const completeRequests: Array<{ model: string; system: string; prompt: string; effort?: string; timeoutMs?: number }> = [];
+  const commandNames: string[] = [];
   const claudeRuns: ClaudeRunRequest[] = [];
   const appended = new Set<string>();
   let now = 0;
@@ -795,7 +420,10 @@ function host(options: Record<string, number | string | boolean> = {}, reply?: R
   }) as On;
   const $ = {
     plugin: { root: "/plugin" },
+    settings: { read: async () => ({}) },
+    env: { get: async () => undefined, set: async () => undefined },
     session: {
+      usage: async () => ({ context: { window: 1_000_000 } }),
       cwd: async () => "/repo",
       id: async () => "host-test",
       messages: async () => fakes.historyRead ? fakes.historyRead(canonical) : canonical,
@@ -810,7 +438,7 @@ function host(options: Record<string, number | string | boolean> = {}, reply?: R
       sleep: () => new Promise(() => undefined),
       now: async () => now,
     },
-    command: { register: async (spec: { name: string }) => ({ command: spec.name }), run: async () => { throw new Error("Shadow must not run commands"); } },
+    command: { register: async (spec: { name: string }) => { commandNames.push(spec.name); return { command: spec.name }; }, run: async () => { throw new Error("Shadow must not run commands"); } },
     fs: {
       write: async (path: string, text: string) => { files.set(path, text); },
       read: async (path: string) => {
@@ -838,40 +466,30 @@ function host(options: Record<string, number | string | boolean> = {}, reply?: R
           const request = JSON.parse(init.stdin!) as ClaudeRunRequest;
           claudeRuns.push(request);
           if (!fakes.workerReply) throw new Error("Worker unavailable in test");
+          now += fakes.workerRunTimeMs ?? 0;
+          fireTimers();
           const answer = fakes.workerReply(request);
           if (fakes.workerDelaySleeps !== undefined) {
             return new Promise<{ exitCode: number; stdout: string; stderr: string }>(resolve => {
               delayed.push({ at: sleeps + fakes.workerDelaySleeps!, deliver: async () => {
-                files.set(request.outputPath, JSON.stringify({ nonce: request.nonce, ok: true, answer, durationMs: 1 }));
+                files.set(request.outputPath, JSON.stringify(fakes.workerResult?.(request, answer) ?? { nonce: request.nonce, ok: true, answer, durationMs: 1 }));
                 resolve({ exitCode: 0, stdout: '{"ok":true}', stderr: "" });
               } });
             });
           }
-          files.set(request.outputPath, JSON.stringify({ nonce: request.nonce, ok: true, answer, durationMs: 1 }));
+          files.set(request.outputPath, JSON.stringify(fakes.workerResult?.(request, answer) ?? { nonce: request.nonce, ok: true, answer, durationMs: 1 }));
           return { exitCode: 0, stdout: '{"ok":true}', stderr: "" };
         }
-        if (!fakes.piWorker) throw new Error("Shadow must not start processes");
-        expect(argv[1]).toBe("/plugin/dist/pi-checkpoint-worker.mjs");
-        const request = JSON.parse(init.stdin!) as PiRunRequest;
-        piRuns.push(request);
-        now += fakes.piRunTimeMs ?? 0;
-        fireTimers();
-        const result = fakes.piWorker(request);
-        if (result === "crash") return { exitCode: 1, stdout: "", stderr: "node: bad bundle" };
-        files.set(request.outputPath, JSON.stringify(result));
-        return { exitCode: 0, stdout: '{"ok":true}', stderr: "" };
+        throw new Error(`Unexpected process: ${argv[0]}`);
       },
     },
-    model: { complete: async (request: { system: string; prompt: string }) => {
+    model: { complete: async (request: { model: string; system: string; prompt: string }) => {
+      completeRequests.push(request);
       if (!reply) throw new Error("Models unavailable in test");
       return { isAnswered: true, text: reply(request), usage: {} };
     } },
     ui: { log: (text: string) => { logs.push(text); }, status: (text: string) => { logs.push(text); } },
-    tool: { call: async (input: { tool: string; task_id: string }) => {
-      expect(input.tool).toBe("TaskStop");
-      stoppedAgents.push(input.task_id);
-      return { text: "stopped" };
-    } },
+
   } as unknown as EngineInterface;
   register(on, options);
   const keep = (uuid: string, row: { type: string; role?: string; content: unknown; isMeta?: boolean }, door: string) => {
@@ -892,14 +510,17 @@ function host(options: Record<string, number | string | boolean> = {}, reply?: R
     }
   };
   return {
+    end: async () => { await handlers.get("session.end")!($, {}, async () => ({})); await settle(); },
     logs,
     settle,
     start: async () => handlers.get("session.start")!($, { cwd: "/repo" }, async () => ({ cwd: "/repo" })),
     get workerCalls() { return workerCalls; },
     files,
-    piRuns,
+    completeRequests,
+    commandNames,
+    commandHandlers: [...handlers.keys()].filter(key => key.startsWith("command.run:")),
+    events: () => [...files.entries()].filter(([path]) => path.includes("/events/")).map(([, text]) => JSON.parse(text)),
     claudeRuns,
-    stoppedAgents,
     get selfCompactions() { return selfCompactions; },
     get sleeps() { return sleeps; },
     /** Delivers every held agent answer, as a slow pipeline finishing late. */
@@ -935,6 +556,8 @@ function host(options: Record<string, number | string | boolean> = {}, reply?: R
       trigger = "auto",
       core: SessionMessage[] = [message("user", "native summary")],
       signal?: AbortSignal,
+      remainingMs?: number,
+      agentId?: string,
     ) => {
       canonical = [...messages];
       let coreCalls = 0;
@@ -947,8 +570,9 @@ function host(options: Record<string, number | string | boolean> = {}, reply?: R
           return { messages: core };
         },
         signal ? { signal } : {},
+        remainingMs !== undefined ? { budget: { remainingMs } } : {},
       );
-      const result = await handlers.get("session.compact")!($, { trigger, messages }, next);
+      const result = await handlers.get("session.compact")!($, { trigger, messages, agentId }, next);
       if (result.messages) canonical = [...result.messages];
       return { result: result as { messages?: SessionMessage[]; skip?: string }, coreCalls, cancelledBeforeCore };
     },
@@ -960,915 +584,625 @@ function host(options: Record<string, number | string | boolean> = {}, reply?: R
   };
 }
 
-const longText = (label: string) => `${label} ${"detail ".repeat(200)}`;
-const turns: Array<[string, "user" | "assistant", string]> = [
-  ["u1", "user", longText("task")],
-  ["a1", "assistant", longText("answer")],
-  ["u2", "user", longText("second ask")],
-  ["a2", "assistant", longText("second answer")],
-  ["u3", "user", "latest ask"],
-  ["a3", "assistant", "latest answer"],
-];
-const transcript = (rows = turns): SessionMessage[] =>
-  rows.map(([id, role, text]) => ({ ...message(role, text), handle: id }));
 
-/** Builder covers through `coverage`; the verifier accepts. */
-const covering = (coverage: string): Reply => (request) =>
-  request.system.includes("create evidence-grounded")
-    ? JSON.stringify({ checkpoint: checkpointJson("E0001"), coverageEndEntryId: coverage })
-    : JSON.stringify({ verdict: "accept", reason: "grounded" });
-
-async function readyHost(coverage = "a2") {
-  const h = host({ recentTurns: 1 }, covering(coverage));
-  for (const [id, role, text] of turns) await h.append(id, role, text);
+const longText = (label: string) => `${label} ${"detail ".repeat(220)}`;
+const turns: Array<[string, "user" | "assistant", string]> = Array.from({ length: 20 }, (_, i) => [
+  [`u${i + 1}`, "user", longText(`task ${i + 1}`)],
+  [`a${i + 1}`, "assistant", longText(`answer ${i + 1}`)],
+] as Array<[string, "user" | "assistant", string]>).flat();
+const transcript = (rows = turns): SessionMessage[] => rows.map(([id, role, text]) => message(role, text, { handle: id }));
+const covering = (coverage = "a18"): Reply => request => request.system === BUILDER_SYSTEM_PROMPT
+  ? JSON.stringify({ checkpoint: checkpointJson("E0001"), coverageEndEntryId: coverage })
+  : '{"verdict":"accept","reason":"grounded"}';
+const coveringManifest: Reply = request => {
+  if (request.system === VERIFIER_SYSTEM_PROMPT) return '{"verdict":"accept"}';
+  const manifest = JSON.parse(request.prompt.split("Session manifest (start here):\n")[1]!.split("\n")[0]!);
+  return JSON.stringify({ checkpoint: checkpointJson("E0001"), coverageEndEntryId: manifest.lastTranscriptRowId });
+};
+async function fill(h: ReturnType<typeof host>, rows = turns) {
+  for (const [id, role, text] of rows) await h.append(id, role, text);
+  await h.settle();
+}
+async function readyHost(coverage = "a18", options = {}, fakes: HostFakes = {}) {
+  const h = host(options, undefined, { workerReply: covering(coverage), ...fakes });
+  await fill(h);
   await h.measure(160_000);
   return h;
 }
 
-const adaptiveCovering: Reply = request => request.system === BUILDER_SYSTEM_PROMPT
-  ? JSON.stringify({ checkpoint: { ...checkpointJson("E0001"), constraints: [{ text: "The second ask remains in scope", evidenceRefs: ["E0003"] }] }, coverageEndEntryId: "a2" })
-  : JSON.stringify({ verdict: "accept", reason: "grounded" });
-
-describe("adaptive host integration", () => {
-  test("a validated checkpoint installs with the existing prefix proof and exact uncovered tail", async () => {
-    const h = host({ verificationMode: "adaptive", recentTurns: 1 }, undefined, { workerReply: adaptiveCovering });
-    await fill(h);
-    expect(h.workerCalls).toBe(1);
-    expect(await h.status()).toContain("phase=validated");
-    expect(await h.status()).toContain("independent=skipped risk=low");
-    const outcome = JSON.parse([...h.files.entries()].find(([path]) => path.endsWith("/outcome.json"))![1]);
-    expect(outcome.metrics).toMatchObject({ builderCalls: 1, verifierCalls: 0, route: "single-agent" });
-    const { result, coreCalls } = await h.compact(transcript());
-    expect(coreCalls).toBe(0);
-    expect(result.messages?.slice(1)).toEqual(transcript().slice(4));
+describe("three configuration preferences", () => {
+  test("defaults are 160k, haiku, high and both roles share the preferences", async () => {
+    expect(resolveConfig({})).toEqual({ prepareThresholdTokens: 160_000, checkpointModel: "haiku", checkpointEffort: "high" });
+    const h = await readyHost("a18", { checkpointModel: "sonnet", checkpointEffort: "max" });
+    expect(h.claudeRuns.map(run => [run.role, run.model, run.effort])).toEqual([["builder", "sonnet", "max"], ["verifier", "sonnet", "max"]]);
   });
-
-  test("adaptive preparation removes one full worker wait on eligible evidence", async () => {
-    const adaptive = host({ verificationMode: "adaptive", recentTurns: 1 }, undefined, { workerReply: adaptiveCovering, workerDelaySleeps: 3 });
-    await fill(adaptive);
-    expect((await adaptive.compact(transcript())).coreCalls).toBe(0);
-    expect(adaptive.workerCalls).toBe(1);
-    const baseline = host({ recentTurns: 1 }, undefined, { workerReply: adaptiveCovering, workerDelaySleeps: 3 });
-    await fill(baseline);
-    expect((await baseline.compact(transcript())).coreCalls).toBe(0);
-    expect(baseline.workerCalls).toBe(2);
-    expect(baseline.sleeps).toBeGreaterThanOrEqual(adaptive.sleeps + 3);
+  test("stored removed controls cannot disable verification, the hold, or internal limits", () => {
+    expect(resolveConfig({ builderBackend: "pi", verificationMode: "adaptive", holdCompaction: false,
+      recentTurns: 1, prepareTimeoutSeconds: 1, checkpointModel: " opus ", checkpointEffort: "low" }))
+      .toEqual({ prepareThresholdTokens: 160_000, checkpointModel: "opus", checkpointEffort: "low" });
+    expect(PREPARE_TIMEOUT_SECONDS).toBe(360);
+    expect(RECENT_ROUNDS).toBe(10);
   });
-
-  test("a failed Claude verifier reuses its builder draft for inline verification", async () => {
-    const inlineRoles: string[] = [];
-    const h = host({ recentTurns: 1 }, request => {
-      inlineRoles.push(request.system === VERIFIER_SYSTEM_PROMPT ? "verifier" : "builder");
-      return '{"verdict":"accept"}';
-    }, { workerReply: request => {
-      if (request.system === VERIFIER_SYSTEM_PROMPT) throw new Error("transport disconnected");
-      return adaptiveCovering(request);
-    } });
-    await fill(h);
-    expect(h.claudeRuns.map(run => run.role)).toEqual(["builder", "verifier"]);
-    expect(inlineRoles).toEqual(["verifier"]);
-    expect(await h.status()).toContain("phase=verified");
-    const outcome = JSON.parse([...h.files.entries()].find(([path]) => path.endsWith("/outcome.json"))![1]);
-    expect(outcome.metrics).toMatchObject({ builderCalls: 1, verifierCalls: 2 });
+  test("invalid thresholds and efforts use defaults; valid custom token counts survive", () => {
+    for (const invalid of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "bad", "", true]) {
+      expect(resolveConfig({ prepareThresholdTokens: invalid }).prepareThresholdTokens).toBe(160_000);
+    }
+    expect(resolveConfig({ prepareThresholdTokens: "180000", checkpointEffort: "invalid", checkpointModel: " " }))
+      .toEqual({ prepareThresholdTokens: 180_000, checkpointModel: "haiku", checkpointEffort: "high" });
+    expect(isAtOrAbove({ tokens: 159_999, percent: 99 }, 160_000)).toBe(false);
+    expect(isAtOrAbove({ tokens: 160_000 }, 160_000)).toBe(true);
+    expect(isAtOrAbove({ percent: 100 }, 160_000)).toBe(false);
   });
-
-  test("a rejected checkpoint goes to native without restarting on inline completion", async () => {
-    let inlineCalls = 0;
-    const h = host({ recentTurns: 1 }, () => { inlineCalls += 1; return '{"verdict":"accept"}'; }, { workerReply: request =>
-      request.system === VERIFIER_SYSTEM_PROMPT ? '{"verdict":"unusable","reason":"unsupported claims"}' : adaptiveCovering(request) });
-    await fill(h);
-    expect(await h.status()).toContain("checkpoint=none");
-    expect(inlineCalls).toBe(0);
-    expect((await h.compact(transcript())).coreCalls).toBe(1);
-  });
-
-  test("adaptive preparation shares the deadline and rejects late low-risk answers", async () => {
-    const h = host({ verificationMode: "adaptive", recentTurns: 1, prepareTimeoutSeconds: 2 }, undefined,
-      { workerReply: adaptiveCovering, workerDelaySleeps: 1000 });
-    await fill(h);
-    await h.advance(2000);
-    await h.deliverLate();
-    expect(h.workerCalls).toBe(1);
-    expect(await h.status()).toContain("checkpoint=none");
-    expect(await h.status()).toContain("preparation deadline reached");
-    const outcome = JSON.parse([...h.files.entries()].find(([path]) => path.endsWith("/outcome.json"))![1]);
-    expect(outcome.readiness).toBe(null);
-  });
-
-  test("independent readiness is required for high-risk adaptive drafts", async () => {
-    const h = host({ verificationMode: "adaptive", recentTurns: 1 }, undefined, { workerReply: covering("a2") });
-    await fill(h);
-    // The builder omitted the second person's prompt; an existing citation is insufficient.
-    expect(h.claudeRuns.map(run => run.role)).toEqual(["builder", "verifier"]);
-    expect(await h.status()).toContain("independent=accepted risk=high");
-  });
-
-  test("adaptive low-risk Pi generation skips the verifier without changing worker transport", async () => {
-    const h = host({ ...PI_BOTH, verificationMode: "adaptive", recentTurns: 1 }, undefined, { piWorker: request => ({
-      nonce: request.nonce, ok: true, answer: adaptiveCovering(request), usage,
-      toolRounds: 3, durationMs: 10,
-    }) });
-    await fill(h);
-    expect(h.piRuns.map(run => run.role)).toEqual(["builder"]);
-    expect(h.workerCalls).toBe(0);
-    expect(await h.status()).toContain("phase=validated");
-    expect((await h.compact(transcript())).coreCalls).toBe(0);
-  });
-
-  test("adaptive readiness still refuses a changed covered prefix", async () => {
-    const h = host({ verificationMode: "adaptive", holdCompaction: false, recentTurns: 1 }, undefined, { workerReply: adaptiveCovering });
-    await fill(h);
-    expect(await h.status()).toContain("phase=validated");
-    const changed = transcript();
-    changed[0] = { ...changed[0]!, text: longText("changed task") };
-    expect((await h.compact(changed)).coreCalls).toBe(1);
-  });
-
-  test("a backend change cannot reset the generator correction budget", async () => {
-    let workerCalls = 0;
-    let inlineCalls = 0;
-    const h = host({ recentTurns: 1 }, () => { inlineCalls += 1; return "still malformed"; }, { workerReply: () => {
-      workerCalls += 1;
-      if (workerCalls === 1) return "malformed";
-      throw new Error("correction transport failed");
-    } });
-    await fill(h);
-    expect(workerCalls).toBe(2);
-    expect(inlineCalls).toBe(1);
-    expect(await h.status()).toContain("checkpoint=none");
-    const outcome = JSON.parse([...h.files.entries()].find(([path]) => path.endsWith("/outcome.json"))![1]);
-    expect(outcome.metrics.correctionCount).toBe(1);
+  test("only status and the native escape hatch are registered", async () => {
+    const h = host();
+    await h.start();
+    expect(h.commandNames).toEqual(["compact-native", "shadow-status"]);
+    expect(h.commandHandlers).toEqual(["command.run:shadow-status", "command.run:compact-native"]);
+    const status = await h.status();
+    expect(status).toContain("Shadow Compact v0.4.11 · idle");
+    expect(status).toContain("Model: haiku · effort: high · prepare: 160,000 tokens");
+    expect(status.split("\n").length).toBe(5);
   });
 });
 
-describe("token threshold", () => {
-  test("checkpoint preparation starts at the token boundary without percentage usage", async () => {
-    const h = host();
-    await h.append("u1", "user", "task");
-    await h.append("a1", "assistant", "answer");
-    await h.measure(149_999, 99);
+describe("automatic window policy and migration", () => {
+  const config = resolveConfig({});
+  const facts = (patch: Partial<WindowFacts> = {}): WindowFacts => ({
+    model: "test-model", modelWindow: 1_000_000, effectiveWindow: 1_000_000,
+    source: "model-default", settings: {}, ...patch,
+  });
+  test("targets roughly 200k after headroom and caps at the actual model window", () => {
+    expect(decideAutoCompactWindow(config, facts())).toEqual({ apply: true, tokens: 235_000 });
+    expect(decideAutoCompactWindow(config, facts({ modelWindow: 200_000 }))).toEqual({ apply: true, tokens: 200_000 });
+    expect(decideAutoCompactWindow(resolveConfig({ prepareThresholdTokens: 220_000 }), facts()))
+      .toEqual({ apply: true, tokens: 295_000 });
+    expect(decideAutoCompactWindow(config, facts({ modelWindow: NaN }))).toMatchObject({ apply: false });
+  });
+  test("migrates only a proven Shadow-managed per-model value", () => {
+    const owned = facts({ source: "settings", effectiveWindow: 190_000, previousDecision: "applied:190000",
+      settings: { modelSettings: { "test-model": { autoCompactWindow: 190_000 } } } });
+    expect(decideAutoCompactWindow(config, owned)).toEqual({ apply: true, tokens: 235_000 });
+    expect(decideAutoCompactWindow(config, { ...owned, previousDecision: undefined })).toMatchObject({ apply: false, reason: "kept-settings" });
+    expect(decideAutoCompactWindow(config, { ...owned, effectiveWindow: 210_000 })).toMatchObject({ apply: false, reason: "kept-settings" });
+    expect(decideAutoCompactWindow(config, { ...owned, source: "env" })).toMatchObject({ apply: false, reason: "kept-env" });
+    expect(decideAutoCompactWindow(config, { ...owned, settings: { autoCompactWindow: 190_000, modelSettings: { "test-model": { autoCompactWindow: 190_000 } } } }))
+      .toMatchObject({ apply: false, reason: "kept-settings" });
+  });
+  test("preserves explicit auto, independent settings, and changed managed values", () => {
+    for (const value of ["auto", 190_000, 300_000]) {
+      expect(decideAutoCompactWindow(config, facts({ settings: { modelSettings: { "test-model": { autoCompactWindow: value } } } })))
+        .toMatchObject({ apply: false, reason: "kept-settings" });
+    }
+    expect(decideAutoCompactWindow(config, facts({ previousDecision: "applied:190000" })))
+      .toMatchObject({ apply: false, reason: "kept-user-choice" });
+    expect(decideAutoCompactWindow(config, facts({ source: "settings", effectiveWindow: 235_000,
+      settings: { modelSettings: { "test-model": { autoCompactWindow: 235_000 } } },
+      previousDecision: "applied:235000" }))).toMatchObject({ apply: false, reason: "managed" });
+  });
+  test("idle policy honors an explicit host floor or disabled native idle compaction", () => {
+    expect(decideIdleCompaction({ envValue: undefined, settings: {} })).toEqual({ apply: true });
+    expect(decideIdleCompaction({ envValue: "180000", settings: {} })).toMatchObject({ apply: false, reason: "kept-env 180000" });
+    expect(decideIdleCompaction({ envValue: undefined, settings: { idleCompaction: false } })).toMatchObject({ apply: false, reason: "off-settings" });
+  });
+});
+
+describe("checkpoint scheduling", () => {
+  test("the exact threshold starts preparation and high context cannot spin duplicate work", async () => {
+    const h = host({}, undefined, { workerReply: covering() });
+    await fill(h);
+    await h.measure(159_999);
     expect(h.workerCalls).toBe(0);
-    await h.measure(150_000);
-    expect(h.workerCalls).toBe(1);
-  });
-
-  test("Shadow never starts a compaction itself, at any context size", async () => {
-    const h = await readyHost();
-    expect(await h.status()).toContain("phase=verified");
-    await h.measure(400_000);
-    await h.complete();
-    await h.flush();
+    await h.measure(160_000);
+    expect(h.workerCalls).toBe(2);
+    await h.measure(190_000);
+    expect(h.workerCalls).toBe(2);
     expect(h.selfCompactions).toBe(0);
-    const reply = await h.runCommand("shadow-compact");
-    expect(reply.text).toContain("/compact will check live coverage");
   });
-
-  test("a completed turn above the idle floor prepares for idle compaction, refreshed once at the threshold", async () => {
-    const h = host();
-    await h.append("u1", "user", "task");
-    await h.append("a1", "assistant", "answer");
+  test("a custom threshold applies at the selected token boundary", async () => {
+    const h = host({ prepareThresholdTokens: 180_000 }, undefined, { workerReply: covering() });
+    await fill(h);
+    await h.measure(179_999);
+    expect(h.workerCalls).toBe(0);
+    await h.measure(180_000);
+    expect(h.workerCalls).toBe(2);
+  });
+  test("a finished turn at 100k prepares for idle compaction and refreshes once at 160k", async () => {
+    const h = host({}, undefined, { workerReply: covering() });
+    await fill(h);
     await h.measure(99_999);
     await h.complete();
     expect(h.workerCalls).toBe(0);
-    await h.measure(120_000);
+    await h.measure(100_000);
     expect(h.workerCalls).toBe(0);
     await h.complete();
-    expect(h.workerCalls).toBe(1);
-    await h.flush();
-    await h.complete();
-    expect(h.workerCalls).toBe(1);
-    await h.measure(150_000);
     expect(h.workerCalls).toBe(2);
-    await h.measure(160_000);
-    expect(h.workerCalls).toBe(2);
-  });
-
-  test("idle preparation stays off when the toggle is off", async () => {
-    const h = host({ configureIdleCompaction: false } as unknown as Record<string, number | string>);
-    await h.append("u1", "user", "task");
-    await h.append("a1", "assistant", "answer");
-    await h.measure(120_000);
-    await h.complete();
-    expect(h.workerCalls).toBe(0);
-  });
-
-  test("a failed preparation is not retried while context stays high", async () => {
-    const h = host();
-    await h.append("u1", "user", "task");
-    await h.append("a1", "assistant", "answer");
-    await h.measure(160_000);
-    await h.measure(170_000);
-    expect(h.workerCalls).toBe(1);
-    expect(await h.status()).toContain("then failed:");
-  });
-});
-
-describe("compaction install", () => {
-  test("inline fallback refuses a large archive instead of silently omitting later evidence", async () => {
-    const h = host({}, covering("a2"));
-    for (const [id, role, text] of turns) await h.append(id, role, text);
-    for (let i = 0; i < 40; i++) await h.append(`large-${i}`, "assistant", `row ${i} ${"x".repeat(3900)}`);
-    await h.measure(160_000);
-    expect(await h.status()).toContain("refusing truncated fallback");
-    expect(await h.status()).toContain("checkpoint=none");
-  });
-  test("real attachment, cancelled-row and role-less assistant shapes do not block a ready checkpoint", async () => {
-    const h = host({ recentTurns: 1 }, covering("a2"));
-    for (const [id, role, text] of turns) await h.append(id, role, text);
-    for (let i = 0; i < 35; i++) {
-      await h.appendRow(`attachment-${i}`, { type: "attachment", role: "user", content: [{ type: "text", text: "environment reminder" }] });
-    }
-    await h.append("cancelled-result", "user", "not in active history", "tool-result");
-    await h.appendRow("virtual", { type: "user", content: [{ type: "text", text: "not on the wire" }] }, "delivery");
-    await h.appendRow("limit", { type: "assistant", content: [{ type: "text", text: "Session limit reached" }] }, "response");
-    await h.measure(160_000);
-    const live = [transcript()[0]!, message("assistant", "Session limit reached", { handle: "limit" }), ...transcript().slice(1)];
-    const result = await h.compact(live);
-    expect(result.coreCalls).toBe(0);
-    expect(result.result.messages?.slice(1).map(row => row.handle)).toEqual(["u3", "a3"]);
-    const events = [...h.files.entries()].filter(([path]) => path.includes("/events/")).map(([, text]) => JSON.parse(text));
-    expect(events.some(event => event.event === "compact-shadow")).toBe(true);
-    expect(events.find(event => event.event === "compact-enter").unknownHandles).toBe(0);
-  });
-
-  test("a complete prefix proof permits opaque handle changes", async () => {
-    const h = await readyHost();
-    const live = transcript().map(row => row.handle === "a2" ? { ...row, handle: "another-row" } : row);
-    expect((await h.compact(live)).coreCalls).toBe(0);
-  });
-
-  test("a confirmed full prefix permits host UUID cloning and a second Shadow install", async () => {
-    let boundary = "a2";
-    const h = host({ recentTurns: 1 }, request => covering(boundary)(request));
-    for (const [id, role, text] of turns) await h.append(id, role, text);
-    await h.measure(160_000);
-    const first = await h.compact(transcript());
-    expect(first.coreCalls).toBe(0);
-    h.setCanonical(first.result.messages!);
-    await h.measure(20_000);
-    boundary = "u4";
-    await h.append("u4", "user", longText("next task"));
-    await h.append("a4", "assistant", "latest answer");
-    await h.measure(160_000);
-    const cloned = first.result.messages!.map((row, i) => ({ ...row, handle: `cloned-${i}` }));
-    const secondEvidence = [...h.files.entries()].filter(([path]) => path.endsWith("/evidence.jsonl")).at(-1)![1];
-    expect(secondEvidence).toContain("task detail");
-    const second = await h.compact([...cloned, message("user", longText("next task"), { handle: "u4" }), message("assistant", "latest answer", { handle: "a4" })]);
-    expect(second.coreCalls).toBe(0);
-    expect(second.result.messages?.[0]?.text).toContain("entry u4");
-  });
-
-  test("retained prefix rebinding includes tool arguments and refuses changed history", () => {
-    const index = new LiveTranscript();
-    const old = [message("assistant", "", { toolUses: [{ tool_use_id: "t", tool: "Read", input: { file_path: "old" } }] })];
-    index.remember(old, ["original"]);
-    expect(index.resolve([{ ...old[0]!, handle: "clone" }])).toEqual(["original"]);
-    const changed = message("assistant", "", { handle: "clone", toolUses: [{ tool_use_id: "t", tool: "Read", input: { file_path: "new" } }] });
-    expect(index.resolve([changed])).toEqual(["unknown-0"]);
-  });
-
-  test("an engine compaction installs checkpoint + exact handle tail without core", async () => {
-    const h = await readyHost();
-    const { result, coreCalls } = await h.compact(transcript());
-    expect(coreCalls).toBe(0);
-    expect(result.messages?.[0]?.text).toContain("Covers the session through entry a2");
-    expect(result.messages?.slice(1).map((entry) => entry.handle)).toEqual(["u3", "a3"]);
-    // Handed back is not installed: canonical history must show it.
-    expect(await h.status()).toContain("phase=installed");
-    h.setCanonical(result.messages!.map(({ handle: _handle, ...rest }) => rest));
-    await h.measure(20_000);
-    const status = await h.status();
-    expect(status).toContain("phase=installed");
-    expect(status).toContain("installs=1");
-    expect(status).toContain("lastCompact=trigger=auto shadow:");
-  });
-
-  test("the index stays aligned after install and a stale checkpoint never re-anchors", async () => {
-    const h = await readyHost();
-    const { result } = await h.compact(transcript());
-    // The engine appends the checkpoint row, then the session continues.
-    await h.append("cp", "user", result.messages![0]!.text, "compaction");
-    await h.append("u4", "user", "next ask");
-    await h.append("a4", "assistant", "next answer");
-    const after = [
-      { ...message("user", result.messages![0]!.text), handle: "cp" },
-      ...transcript(turns.slice(4)),
-      { ...message("user", "next ask"), handle: "u4" },
-      { ...message("assistant", "next answer"), handle: "a4" },
-    ];
-    // Same length as the index, but a2 is gone: coverage is unproven.
-    const second = await h.compact(after);
-    expect(second.coreCalls).toBe(1);
-    expect(await h.status()).toContain("lastCompact=trigger=auto native:history-unproven");
-  });
-
-  test("coverage ending mid-turn never drops the uncovered reply", async () => {
-    const h = await readyHost("u2");
-    const { result } = await h.compact(transcript());
-    expect(result.messages?.slice(1).map((entry) => entry.handle)).toEqual(["u2", "a2", "u3", "a3"]);
-  });
-
-  test("duplicate appends do not misalign the index", async () => {
-    const h = await readyHost();
-    await h.append("a3", "assistant", "latest answer");
-    const { coreCalls } = await h.compact(transcript());
-    expect(coreCalls).toBe(0);
-  });
-
-  test("precompute is skipped and never reaches core", async () => {
-    const h = await readyHost();
-    const { result, coreCalls } = await h.compact(transcript(), "precompute");
-    expect(coreCalls).toBe(0);
-    expect(result.skip).toContain("live compaction");
-  });
-
-  test("a compaction Shadow never saw drops the checkpoint", async () => {
-    const h = await readyHost();
-    await h.append("ns", "user", "native summary", "compaction");
-    expect(await h.status()).toContain("checkpoint=none");
-    const { coreCalls } = await h.compact([message("user", "native summary")]);
-    expect(coreCalls).toBe(1);
-  });
-
-  test("native compaction realigns kept handles so a later checkpoint can install", async () => {
-    const h = host({ recentTurns: 1 }, covering("u5"));
-    for (const [id, role, text] of turns) await h.append(id, role, text);
-    // No checkpoint yet: core summarizes and keeps the last turn by handle.
-    const summary = longText("native summary");
-    const kept = transcript(turns.slice(4));
-    const first = await h.compact(transcript(), "auto", [message("user", summary), ...kept]);
-    expect(first.coreCalls).toBe(1);
-    await h.append("ns", "user", summary, "compaction");
-    await h.append("u5", "user", "follow-up ask");
-    await h.append("a5", "assistant", "follow-up answer");
-    await h.measure(160_000);
-    const later = [
-      { ...message("user", summary), handle: "ns" },
-      ...kept,
-      { ...message("user", "follow-up ask"), handle: "u5" },
-      { ...message("assistant", "follow-up answer"), handle: "a5" },
-    ];
-    const second = await h.compact(later);
-    expect(second.coreCalls).toBe(0);
-    expect(second.result.messages?.slice(1).map((entry) => entry.handle)).toEqual(["u5", "a5"]);
-  });
-
-  test("compact-native runs core compaction through the session API", async () => {
-    const h = await readyHost();
-    const reply = await h.runCommand("compact-native");
-    expect(reply.text).toContain("native compaction");
-    await h.flush();
-    expect(h.selfCompactions).toBe(1);
-    expect(await h.status()).toContain("checkpoint=none");
-  });
-
-  test("manual shadow-compact is honest with fewer than 2 rows", async () => {
-    const h = host();
-    const idle = await h.runCommand("shadow-compact");
-    expect(idle.text).toContain("need at least 2 archived rows");
-    expect(idle.text).toContain("archive rows=0");
-  });
-
-  test("worker failure is recorded and fails closed without a checkpoint", async () => {
-    const h = host();
-    await h.append("u1", "user", "task");
-    await h.append("a1", "assistant", "answer");
-    await h.measure(160_000);
-    expect(h.workerCalls).toBe(1);
-    const status = await h.status();
-    expect(status).toContain("checkpoint=none");
-    expect(status).toContain("lastFallback=worker:Worker unavailable in test then failed:Models unavailable in test");
-    expect(status).toContain("builder=claude:haiku");
-    expect(status).toContain("verifier=claude:haiku");
-  });
-});
-
-describe("checkpoint-first compaction gate", () => {
-  test("native compaction cancels in-flight preparation even when native keeps its coverage row", async () => {
-    const h = await preparingHost(1000, { holdCompaction: false });
-    const kept = transcript(turns.slice(2));
-    const { cancelledBeforeCore } = await h.compact(transcript(), "auto", [message("user", longText("native summary")), ...kept]);
-    // Cancelled before native writes its summary, not after.
-    expect(cancelledBeforeCore).toBe(true);
-    // Coverage a2 survives in the kept tail, but the snapshot predates the
-    // native summary: publishing it would displace that summary later.
-    expect([...h.files.keys()].some(path => path.endsWith("/cancel"))).toBe(true);
-    await h.deliverLate();
-    await h.deliverLate();
-    expect(await h.status()).toContain("checkpoint=none");
-    const again = await h.compact([message("user", longText("native summary"), { handle: "cloned-summary" }), ...kept]);
-    expect(again.coreCalls).toBe(1);
-  });
-
-  test("appends crossing the threshold start preparation mid-turn, without a measure", async () => {
-    const h = host({ prepareThresholdTokens: 500 }, undefined, { workerReply: covering("a2"), workerDelaySleeps: 1000 });
-    for (const [id, role, text] of turns) await h.append(id, role, text);
-    // No measure() call: the append stream itself crossed the estimate.
-    await h.status();
-    await h.flush();
-    await h.settle();
-    expect(h.workerCalls).toBe(1);
-    expect(await h.status()).toContain("phase=preparing");
-  });
-
-  test("a just-in-time attempt started by the compaction is waited out to its preparation deadline", async () => {
-    const h = host({ recentTurns: 1 }, undefined, { workerReply: covering("a2"), workerDelaySleeps: 3 });
-    for (const [id, role, text] of turns) await h.append(id, role, text);
-    expect(h.workerCalls).toBe(0);
-    const { result, coreCalls } = await h.compact(transcript());
-    expect(coreCalls).toBe(0);
-    expect(result.messages?.[0]?.text).toContain("Covers the session through entry a2");
-    expect(h.sleeps).toBeGreaterThan(1);
-    expect(await h.status()).toContain(":done");
-  });
-
-  test("a mostly-unknown transcript is reconciled once and installed through private workers", async () => {
-    const h = host({ recentTurns: 1 }, undefined, { workerReply: covering("bogus-3"), workerDelaySleeps: 2 });
-    for (const [id, role, text] of turns) await h.append(id, role, text);
-    const live = transcript().map((row, index) => ({ ...row, handle: `bogus-${index}` }));
-    const { coreCalls, result } = await h.compact(live);
-    expect(coreCalls).toBe(0);
-    expect(h.workerCalls).toBe(2);
-    expect(h.sleeps).toBeGreaterThan(0);
-    expect(result.messages?.slice(1)).toEqual(live.slice(4));
-    expect(await h.status()).toContain("history=reconciled:compact");
-  });
-
-  test("one preparation deadline stops workers and prevents later verifier or fallback calls", async () => {
-    const h = await preparingHost(1_000, { prepareTimeoutSeconds: 2 });
-    await h.advance(2_000);
-    expect([...h.files.keys()].some(path => path.endsWith("/cancel"))).toBe(true);
-    expect(h.workerCalls).toBe(1);
-    expect(await h.status()).toContain("preparation deadline reached");
-    await h.deliverLate();
-    expect(h.workerCalls).toBe(1);
-    expect(await h.status()).toContain("checkpoint=none");
-  });
-
-  test("a native fallback cancels obsolete preparation without waiting for its late answer", async () => {
-    const h = await preparingHost(1_000, { prepareTimeoutSeconds: 2 });
-    expect((await h.compact(transcript())).coreCalls).toBe(1);
-    expect([...h.files.keys()].some(path => path.endsWith("/cancel"))).toBe(true);
-    expect([...h.files.keys()].some(path => path.endsWith("/cancel"))).toBe(true);
-    await h.deliverLate();
-    expect(h.workerCalls).toBe(1);
-  });
-  /** Rows archived and preparation started, with worker answers held back. */
-  async function preparingHost(delaySleeps: number, options: Record<string, number | string | boolean> = {}) {
-    const h = host({ recentTurns: 1, ...options }, undefined, { workerReply: covering("a2"), workerDelaySleeps: delaySleeps });
-    for (const [id, role, text] of turns) await h.append(id, role, text);
-    await h.measure(160_000);
-    expect(await h.status()).toContain("phase=preparing");
-    return h;
-  }
-
-  test("a compaction during preparation waits for the checkpoint and installs it without core", async () => {
-    // The builder answers after 3 host sleeps, the verifier 3 after that.
-    const h = await preparingHost(3);
-    const { result, coreCalls } = await h.compact(transcript());
-    expect(coreCalls).toBe(0);
-    expect(result.messages?.[0]?.text).toContain("Covers the session through entry a2");
-    expect(result.messages?.slice(1).map((entry) => entry.handle)).toEqual(["u3", "a3"]);
-    const status = await h.status();
-    expect(status).toContain("lastCompact=trigger=auto shadow:");
-    expect(status).toContain(":done");
-    expect(h.sleeps).toBeGreaterThan(0);
-  });
-
-  test("a slow preparation holds the compaction past the old 120s wait and installs", async () => {
-    // Builder at 150 sleeps, verifier 150 after: 300s, inside the 360s deadline.
-    const h = await preparingHost(150);
-    const { result, coreCalls } = await h.compact(transcript());
-    expect(coreCalls).toBe(0);
-    expect(result.messages?.[0]?.text).toContain("Covers the session through entry a2");
-    expect(h.sleeps).toBeGreaterThanOrEqual(300);
-    expect(await h.status()).toContain(":done");
-  });
-
-  test("only the preparation deadline hands a held compaction to native, never publishing late", async () => {
-    const h = await preparingHost(1_000, { prepareTimeoutSeconds: 5 });
-    const { coreCalls } = await h.compact(transcript());
-    expect(coreCalls).toBe(1);
-    expect(h.sleeps).toBe(5);
-    expect(await h.status()).toContain("native:no-checkpoint waited=5s:failed");
-    await h.deliverLate();
-    await h.deliverLate();
-    const status = await h.status();
-    expect(status).toContain("checkpoint=none");
-    expect(status).toContain("preparation deadline reached");
-  });
-
-  test("with nothing preparing, the compaction starts one just-in-time attempt", async () => {
-    const h = host({ recentTurns: 1 }, undefined, { workerReply: covering("a2"), workerDelaySleeps: 2 });
-    for (const [id, role, text] of turns) await h.append(id, role, text);
-    expect(h.workerCalls).toBe(0);
-    const { result, coreCalls } = await h.compact(transcript());
-    expect(coreCalls).toBe(0);
-    expect(h.workerCalls).toBe(2);
-    expect(result.messages?.[0]?.text).toContain("Covers the session through entry a2");
-  });
-
-  test("a failed preparation is not retried at compaction", async () => {
-    const h = host();
-    await h.append("u1", "user", "task");
-    await h.append("a1", "assistant", "answer");
-    await h.measure(160_000);
-    expect(h.workerCalls).toBe(1);
-    const { coreCalls } = await h.compact(transcript(turns.slice(0, 2)));
-    expect(coreCalls).toBe(1);
-    expect(h.workerCalls).toBe(1);
-    expect(h.sleeps).toBe(0);
-  });
-
-  test("holdCompaction off (or the former compactWaitSeconds 0) keeps the immediate native fallback", async () => {
-    expect(resolveConfig({ compactWaitSeconds: 0 }).holdCompaction).toBe(false);
-    expect(resolveConfig({ compactWaitSeconds: 120 }).holdCompaction).toBe(true);
-    const h = await preparingHost(3, { holdCompaction: false });
-    const { coreCalls } = await h.compact(transcript());
-    expect(coreCalls).toBe(1);
-    expect(h.sleeps).toBe(0);
-    expect(await h.status()).toMatch(/native:no-checkpoint$/);
-  });
-
-  test("a host that cannot sleep stops waiting instead of spinning", async () => {
-    const h = host({ recentTurns: 1 }, undefined, { workerReply: covering("a2"), workerDelaySleeps: 3, noSleep: true });
-    for (const [id, role, text] of turns) await h.append(id, role, text);
-    await h.measure(160_000);
-    const { coreCalls } = await h.compact(transcript());
-    expect(coreCalls).toBe(1);
-    expect(await h.status()).toContain(":no-pause");
-  });
-
-  test("an interrupted held compaction leaves the conversation as it is", async () => {
-    const h = await preparingHost(1_000);
-    const controller = new AbortController();
-    controller.abort();
-    const { result, coreCalls } = await h.compact(transcript(), "auto", undefined, controller.signal);
-    expect(coreCalls).toBe(0);
-    expect(result.skip).toContain("interrupted");
-  });
-});
-
-const PI_BOTH = {
-  builderBackend: "pi",
-  verifierBackend: "pi",
-  piBuilderProvider: "openrouter",
-  piBuilderModel: "builder-model",
-  piVerifierProvider: "openrouter",
-  piVerifierModel: "verifier-model",
-};
-
-const usage = { totalTokens: 1_000, cost: 0.01 };
-
-/** A Pi worker answering like `covering`, echoing each request's nonce. */
-const piCovering = (coverage: string): PiWorker => (request) => ({
-  nonce: request.nonce,
-  ok: true,
-  answer: covering(coverage)({ system: request.system, prompt: request.prompt }),
-  usage,
-  toolRounds: 3,
-  durationMs: 10,
-});
-
-async function fill(h: ReturnType<typeof host>) {
-  for (const [id, role, text] of turns) await h.append(id, role, text);
-  await h.measure(160_000);
-}
-
-describe("pi backend", () => {
-  test("Pi and Claude fallbacks share one deadline and retain per-call artifacts", async () => {
-    const failure: PiWorker = request => ({ nonce: request.nonce, ok: false, error: "invalid submission", usage: { totalTokens: 123, cost: 0 }, durationMs: 1500 });
-    const h = host({ ...PI_BOTH, recentTurns: 1, prepareTimeoutSeconds: 2 }, undefined, { piWorker: failure, piRunTimeMs: 1500, workerReply: covering("a2"), workerDelaySleeps: 1000 });
-    for (const [id, role, text] of turns) await h.append(id, role, text);
-    await h.measure(160_000);
-    expect(h.piRuns.length).toBe(1);
-    expect(h.workerCalls).toBe(1);
-    expect(h.piRuns[0]!.outputPath).toContain(h.piRuns[0]!.nonce);
-    expect(h.piRuns[0]!.cancelPath).toContain("/prepare-");
-    await h.advance(500);
-    expect([...h.files.keys()].some(path => path.endsWith("/cancel"))).toBe(true);
-    await h.deliverLate();
-    expect(h.workerCalls).toBe(1);
-    expect(await h.status()).toContain("preparation deadline reached");
-  });
-  test("Pi stays off by default and Claude never starts a process", async () => {
-    const config = resolveConfig({});
-    expect(usesPi(config)).toBe(false);
-    expect(describeRole(config, "builder")).toBe("claude:haiku@high");
-    const h = await readyHost();
-    expect(await h.status()).toContain("pi=off");
-    expect(await h.status()).not.toContain("piUsage");
-  });
-
-  test("config resolves per-role backends and needs both provider and model", async () => {
-    const config = resolveConfig({ builderBackend: "pi", piBuilderProvider: "openrouter", verifierBackend: "bogus" });
-    expect(config.verifierBackend).toBe("claude");
-    expect(config.piBuilder).toBe(null);
-    expect(describeRole(config, "builder")).toBe("pi:unconfigured");
-    expect(describeRole(resolveConfig(PI_BOTH), "verifier")).toBe("pi:openrouter/verifier-model@low");
-    expect(resolveConfig(PI_BOTH).piNodePath).toBe("node");
-    // Thinking defaults to low; an unknown level falls back to it.
-    expect(resolveConfig(PI_BOTH).piBuilder?.thinking).toBe("low");
-    const tuned = resolveConfig({ ...PI_BOTH, piBuilderThinking: "high", piVerifierThinking: "loud" });
-    expect(describeRole(tuned, "builder")).toBe("pi:openrouter/builder-model@high");
-    expect(tuned.piVerifier?.thinking).toBe("low");
-  });
-
-  test("Pi answers both roles in separate worker runs and the checkpoint publishes", async () => {
-    const h = host({ ...PI_BOTH, recentTurns: 1 }, undefined, { piWorker: piCovering("a2") });
-    await fill(h);
-    expect(h.workerCalls).toBe(0);
-    expect(h.piRuns.map((run) => `${run.role}:${run.target.model}`)).toEqual([
-      "builder:builder-model",
-      "verifier:verifier-model",
-    ]);
-    // Each run gets its own nonce; both read one frozen snapshot.
-    expect(new Set(h.piRuns.map((run) => run.nonce)).size).toBe(2);
-    expect(h.piRuns[0]!.prompt).toContain(PI_EVIDENCE_ACCESS);
-    const evidence = JSON.parse(h.files.get(h.piRuns[0]!.evidencePath)!) as PiEvidenceFile;
-    expect(evidence.rows.map((row) => row.id)).toEqual(["u1", "a1", "u2", "a2", "u3", "a3"]);
-    const status = await h.status();
-    expect(status).toContain("checkpoint=shadow-");
-    expect(status).toContain("builder=pi:openrouter/builder-model");
-    expect(status).toContain("piUsage calls=2 failures=0 tokens=2000 cost=$0.0200");
-    expect(status).toContain("lastPrepare=pi ");
-    expect(status).toContain("lastFallback=none");
-    const { coreCalls } = await h.compact(transcript());
-    expect(coreCalls).toBe(0);
-  });
-
-  test("a failed Pi preparation is redone with the Claude models", async () => {
-    const failing: PiWorker = (request) => ({ nonce: request.nonce, ok: false, error: "provider 429", usage, durationMs: 5 });
-    const h = host({ ...PI_BOTH, recentTurns: 1 }, covering("a2"), { piWorker: failing });
-    await fill(h);
-    const status = await h.status();
-    expect(status).toContain("checkpoint=shadow-");
-    expect(status).toContain("lastFallback=pi:pi builder (openrouter/builder-model): provider 429 then worker:");
-    expect(status).toContain("lastPrepare=claude-complete ");
-    expect(status).toContain("piUsage calls=1 failures=1");
-    // Ordinary model failures leave Pi enabled for the next preparation.
-    expect(status).toContain("pi=unchecked");
-  });
-
-  test("a failed Pi verifier reuses the Pi builder draft with only the Claude verifier", async () => {
-    const verifierDown: PiWorker = (request) =>
-      request.role === "builder"
-        ? piCovering("a2")(request)
-        : { nonce: request.nonce, ok: false, error: "submit_verdict rejected 3 times: Checkpoint must be a JSON object", usage, durationMs: 5 };
-    const h = host({ ...PI_BOTH, recentTurns: 1 }, covering("a2"), { piWorker: verifierDown, workerReply: covering("a2") });
-    await fill(h);
-    // Two Pi runs (builder + failed verifier), then ONE Claude spawn: the verifier only.
-    expect(h.piRuns.map((run) => run.role)).toEqual(["builder", "verifier"]);
-    expect(h.workerCalls).toBe(1);
-    const status = await h.status();
-    expect(status).toContain("checkpoint=shadow-");
-    expect(status).toContain("pi:pi verifier");
-    const { coreCalls } = await h.compact(transcript());
-    expect(coreCalls).toBe(0);
-  });
-
-  test("an unusable Pi verdict fails closed without asking another backend", async () => {
-    const unusable: PiWorker = (request) =>
-      request.role === "builder"
-        ? piCovering("a2")(request)
-        : { nonce: request.nonce, ok: true, answer: JSON.stringify({ verdict: "unusable", reason: "ungrounded" }), usage, toolRounds: 1, durationMs: 5 };
-    const h = host({ ...PI_BOTH, recentTurns: 1 }, covering("a2"), { piWorker: unusable });
-    await fill(h);
-    const status = await h.status();
-    expect(status).toContain("checkpoint=none");
-    expect(status).toContain("Verifier rejected the checkpoint as unusable: ungrounded");
-    expect(h.workerCalls).toBe(0);
-  });
-
-  test("a stale result file from another run is never trusted", async () => {
-    const stale: PiWorker = (request) => ({ ...(piCovering("a2")(request) as PiRunResult), nonce: "old-run" });
-    const h = host({ ...PI_BOTH, recentTurns: 1 }, covering("a2"), { piWorker: stale });
-    await fill(h);
-    const status = await h.status();
-    expect(status).toContain("checkpoint=shadow-");
-    expect(status).toContain("lastPrepare=claude-complete ");
-    expect(status).toContain("pi=failed:pi builder worker exited 0");
-  });
-
-  test("a worker that cannot run disables Pi for the session instead of relaunching", async () => {
-    const h = host({ ...PI_BOTH, recentTurns: 1 }, covering("a2"), { piWorker: () => "crash" });
-    await fill(h);
-    expect(h.piRuns.length).toBe(1);
-    expect(await h.status()).toContain("pi=failed:pi builder worker exited 1: node: bad bundle");
-    await h.runCommand("compact-native");
-    await h.flush();
-    await h.measure(160_000);
-    // The second preparation skips Pi entirely.
-    expect(h.piRuns.length).toBe(1);
-    expect(await h.status()).toContain("lastFallback=pi-unavailable:");
-    // Native compaction removed a2, so a checkpoint covering it is born stale.
-    expect(await h.status()).toContain("coverageEndEntryId is not a session row: a2");
-    expect(await h.status()).toContain("checkpoint=none");
-  });
-
-  test("mixed mode runs the Pi builder with the Claude worker verifier", async () => {
-    const config = { builderBackend: "pi", piBuilderProvider: "openrouter", piBuilderModel: "builder-model", recentTurns: 1 };
-    const h = host(config, undefined, { piWorker: piCovering("a2"), workerReply: covering("a2") });
-    await fill(h);
-    expect(h.piRuns.map((run) => run.role)).toEqual(["builder"]);
-    expect(h.workerCalls).toBe(1);
-    const status = await h.status();
-    expect(status).toContain("checkpoint=shadow-");
-    expect(status).toContain("verifier=claude:haiku");
-    expect(status).toContain("lastPrepare=mixed ");
-  });
-
-  test("the availability check reports a missing model or credential without inference", async () => {
-    const config = resolveConfig(PI_BOTH);
-    const fake = (stdout: string, exitCode = 0) =>
-      ({ plugin: { root: "/plugin" }, process: { run: async () => ({ exitCode, stdout, stderr: "boom" }) } }) as unknown as EngineInterface;
-    const ok = JSON.stringify({ ok: true, targets: [{ role: "builder", ok: true }, { role: "verifier", ok: true }] });
-    expect(await checkPi(fake(ok), config)).toBe("ok");
-    const noAuth = JSON.stringify({ ok: false, targets: [{ role: "builder", ok: true }, { role: "verifier", ok: false, error: "no auth for openrouter" }] });
-    expect(await checkPi(fake(noAuth), config)).toBe("failed:verifier: no auth for openrouter");
-    expect(await checkPi(fake("", 127), config)).toBe("failed:worker exited 127: boom");
-    expect(await checkPi(fake(ok), resolveConfig({ builderBackend: "pi" }))).toContain("failed:builder needs piBuilderProvider");
-  });
-});
-
-/** A real worker selects its boundary from the reconciled manifest. */
-const coveringManifest: Reply = request => {
-  if (request.system === VERIFIER_SYSTEM_PROMPT) return JSON.stringify({ verdict: "accept", reason: "checked" });
-  const manifest = JSON.parse(request.prompt.split("Session manifest (start here):\n")[1]!.split("\n")[0]!);
-  return JSON.stringify({ checkpoint: checkpointJson("E0001"), coverageEndEntryId: manifest.lastTranscriptRowId });
-};
-
-describe("0.4.9 complete history and exact tail", () => {
-  test("an empty startup read retries and includes history before the reload", async () => {
-    const h = host({ recentTurns: 1 }, undefined, { workerReply: coveringManifest });
-    await h.start();
-    h.setCanonical(transcript());
-    await h.append("u4", "user", longText("after reload"));
-    await h.append("a4", "assistant", longText("new answer"));
-    await h.measure(160_000);
-    expect(await h.status()).toContain("archive rows=8");
-    expect(await h.status()).toContain("phase=verified");
-    const evidence = [...h.files.entries()].find(([path]) => path.endsWith("/evidence.jsonl"))![1];
-    expect(evidence).toContain("task detail");
-    expect(h.claudeRuns.length).toBe(2);
-    const live = [...transcript(), ...transcript([["u4", "user", longText("after reload")], ["a4", "assistant", longText("new answer")]])];
-    expect((await h.compact(live)).coreCalls).toBe(0);
-  });
-
-  test("a rejected startup read is retained and retried before preparation", async () => {
-    let unavailable = true;
-    const h = host({ recentTurns: 1 }, undefined, {
-      workerReply: coveringManifest,
-      historyRead: async messages => { if (unavailable) throw new Error("session not bound yet"); return messages; },
-    });
-    await h.start();
-    expect(await h.status()).toContain("retryable:session not bound yet");
-    unavailable = false;
-    h.setCanonical(transcript());
-    await h.measure(160_000);
-    expect(await h.status()).toContain("phase=verified");
-    expect(h.claudeRuns.length).toBe(2);
     expect((await h.compact(transcript())).coreCalls).toBe(0);
+    expect(h.selfCompactions).toBe(0);
+    const refreshing = host({}, undefined, { workerReply: covering() });
+    await fill(refreshing);
+    await refreshing.measure(100_000);
+    await refreshing.complete();
+    await refreshing.measure(160_000);
+    expect(refreshing.workerCalls).toBe(4);
+    await refreshing.measure(180_000);
+    expect(refreshing.workerCalls).toBe(4);
   });
-
-  test("appends racing a serialized history read survive once in canonical order", async () => {
-    let release!: () => void;
-    const gate = new Promise<void>(resolve => { release = resolve; });
-    let reads = 0;
-    const h = host({ recentTurns: 1 }, undefined, {
-      workerReply: coveringManifest,
-      historyRead: async messages => { reads += 1; const snapshot = [...messages]; if (reads === 1) await gate; return snapshot; },
-    });
-    h.setCanonical(transcript());
-    const starting = h.start();
-    await h.settle();
-    await h.append("u4", "user", longText("arrived during read"));
-    await h.append("a4", "assistant", longText("answer during read"));
-    release();
-    await starting;
+  test("turn completion uses append growth, including outputs beyond the evidence cap", async () => {
+    const h = host({}, undefined, { workerReply: coveringManifest });
+    await fill(h);
+    await h.measure(99_900);
+    await h.append("large", "assistant", "tool output ".repeat(1000));
+    await h.complete();
+    expect(h.workerCalls).toBe(2);
+    const midTurn = host({}, undefined, { workerReply: coveringManifest });
+    await fill(midTurn);
+    await midTurn.measure(150_000);
+    await midTurn.append("large", "assistant", "tool output ".repeat(8000));
+    await midTurn.settle();
+    expect(midTurn.workerCalls).toBe(2);
+  });
+  test("a failed preparation is not retried against unchanged high context", async () => {
+    const h = host();
+    await fill(h);
     await h.measure(160_000);
-    expect(await h.status()).toContain("archive rows=8");
-    const evidence = [...h.files.entries()].find(([path]) => path.endsWith("/evidence.jsonl"))![1];
-    const rows = evidence.trim().split("\n").map(line => JSON.parse(line));
-    expect(rows.length).toBe(8);
-    expect(rows[0].text).toContain("task detail");
-    expect(rows[6].text).toContain("arrived during read");
-    expect(rows[7].text).toContain("answer during read");
+    await h.measure(180_000);
+    await h.complete();
+    expect(h.workerCalls).toBe(1);
+    expect(await h.status()).toContain("Models unavailable");
   });
-
-  test("every message after the checkpoint survives even beyond the recent-round minimum", async () => {
-    const h = await readyHost("a2");
-    const newer: Array<[string, "user" | "assistant", string]> = [];
-    for (let round = 4; round <= 18; round += 1) {
-      newer.push([`u${round}`, "user", `new task ${round}`], [`a${round}`, "assistant", `new answer ${round}`]);
-    }
-    for (const [id, role, text] of newer) await h.append(id, role, text);
-    const live = [...transcript(), ...transcript(newer)];
-    const result = await h.compact(live);
+  test("subagent compaction and speculative precompute do not touch main history", async () => {
+    const h = await readyHost();
+    const result = await h.compact(transcript(), "precompute");
     expect(result.coreCalls).toBe(0);
-    expect(result.result.messages?.slice(1)).toEqual(live.slice(4));
+    expect(result.result.skip).toContain("live compaction");
+    expect(h.workerCalls).toBe(2);
   });
+});
 
-  test("the last X rounds remain verbatim when the checkpoint covers through the present", async () => {
-    const h = host({ recentTurns: 2 }, covering("a3"));
-    for (const [id, role, text] of turns) await h.append(id, role, text);
-    await h.measure(160_000);
-    const { result, coreCalls } = await h.compact(transcript());
+describe("verified swap and recovery", () => {
+  test("a ready checkpoint swaps immediately, keeps ten exact rounds, and makes no model call", async () => {
+    const h = await readyHost();
+    const live = transcript();
+    const { result, coreCalls } = await h.compact(live);
     expect(coreCalls).toBe(0);
-    expect(result.messages?.slice(1)).toEqual(transcript().slice(2));
+    expect(h.workerCalls).toBe(2);
+    expect(h.sleeps).toBe(0);
+    expect(result.messages?.[0]?.text).toContain("entry a18");
+    expect(result.messages?.slice(1)).toEqual(live.slice(20));
+    expect(await h.status()).toContain("· installed");
+    expect(await h.status()).toContain("installs: 1");
+    expect(h.events().filter(event => event.event === "install-confirmed").length).toBe(1);
+    const entered = h.events().find(event => event.event === "compact-enter");
+    expect(entered.measuredTokens).toBe(160_000);
   });
-
-  test("mutating an older row under the same UUID forces a fresh full-history checkpoint", async () => {
-    const h = host({ recentTurns: 1 }, undefined, { workerReply: covering("a2") });
-    for (const [id, role, text] of turns) await h.append(id, role, text);
-    await h.measure(160_000);
+  test("manual compact uses Shadow through the same swap path", async () => {
+    const h = await readyHost();
+    expect((await h.compact(transcript(), "manual")).coreCalls).toBe(0);
+    expect(h.workerCalls).toBe(2);
+  });
+  test("all uncovered messages survive even when they exceed the ten-round minimum", async () => {
+    const h = await readyHost("a2");
+    const live = transcript();
+    const { result, coreCalls } = await h.compact(live);
+    expect(coreCalls).toBe(0);
+    expect(result.messages?.slice(1)).toEqual(live.slice(4));
+  });
+  test("opaque handle changes are safe only with a full unchanged prefix", async () => {
+    const h = await readyHost();
+    const live = transcript().map((row, index) => ({ ...row, handle: `clone-${index}` }));
+    const { result, coreCalls } = await h.compact(live);
+    expect(coreCalls).toBe(0);
+    expect(result.messages?.slice(1)).toEqual(live.slice(20));
+    expect(h.workerCalls).toBe(2);
+  });
+  test("a changed older row is reconciled and independently verified before replacement", async () => {
+    const h = await readyHost();
     const live = transcript().map((row, index) => index === 0 ? { ...row, text: longText("corrected original task") } : row);
     const { result, coreCalls } = await h.compact(live);
     expect(coreCalls).toBe(0);
     expect(h.workerCalls).toBe(4);
+    expect(result.messages?.slice(1)).toEqual(live.slice(20));
     const snapshots = [...h.files.entries()].filter(([path]) => path.endsWith("/evidence.jsonl"));
     expect(snapshots.at(-1)![1]).toContain("corrected original task");
-    expect(result.messages?.slice(1)).toEqual(live.slice(4));
-    expect([...h.files.values()].some(value => value.includes('"event":"compact-reconcile"'))).toBe(true);
+    expect(h.events().some(event => event.event === "compact-reconcile")).toBe(true);
   });
-
-  test("a capped canonical read defers to the complete compact snapshot", async () => {
-    const h = host({ recentTurns: 1 }, undefined, {
-      workerReply: coveringManifest, historyRead: async () => Array.from({ length: 4096 }, () => message("user", "capped")),
-    });
-    for (const [id, role, text] of turns) await h.append(id, role, text);
-    await h.measure(160_000);
-    expect(h.workerCalls).toBe(0);
-    expect(await h.status()).toContain("history-read-limited:4096");
-    const { coreCalls } = await h.compact(transcript());
-    expect(coreCalls).toBe(0);
+  test("duplicate handles cannot authorize deletion or a repair loop", async () => {
+    const h = await readyHost();
+    const live = transcript().map((row, index) => index === 1 ? { ...row, handle: "u1" } : row);
+    expect((await h.compact(live)).coreCalls).toBe(1);
+    expect(h.workerCalls).toBe(2);
+    expect(await h.status()).toContain("coverage-ambiguous");
+  });
+  test("a compaction arriving before preparation starts waits for one builder and verifier", async () => {
+    const h = host({}, undefined, { workerReply: covering(), workerDelaySleeps: 3 });
+    await fill(h);
+    const result = await h.compact(transcript());
+    expect(result.coreCalls).toBe(0);
+    expect(h.workerCalls).toBe(2);
+    expect(h.sleeps).toBeGreaterThanOrEqual(6);
+  });
+  test("a still-running checkpoint holds beyond the old 120-second limit", async () => {
+    const h = await readyHost("a18", {}, { workerDelaySleeps: 150 });
+    expect(await h.status()).toContain("· preparing");
+    expect((await h.compact(transcript())).coreCalls).toBe(0);
+    expect(h.sleeps).toBeGreaterThanOrEqual(300);
     expect(h.workerCalls).toBe(2);
   });
-
-  test("a failed repair does not loop or get a fresh deadline", async () => {
-    const h = host({ recentTurns: 1, prepareTimeoutSeconds: 2 }, undefined, { workerReply: coveringManifest, workerDelaySleeps: 1000 });
-    const live = transcript().map((row, index) => ({ ...row, handle: `opaque-${index}` }));
-    const result = await h.compact(live);
+  test("one shared deadline stops work and discards every late answer", async () => {
+    const h = await readyHost("a18", {}, { workerDelaySleeps: 1000 });
+    const result = await h.compact(transcript());
     expect(result.coreCalls).toBe(1);
+    expect(result.cancelledBeforeCore).toBe(true);
     expect(h.workerCalls).toBe(1);
-    expect(h.sleeps).toBe(2);
+    expect(h.sleeps).toBeGreaterThanOrEqual(360);
     await h.deliverLate();
     expect(h.workerCalls).toBe(1);
-    expect(await h.status()).toContain("checkpoint=none");
+    expect(await h.status()).toContain("Checkpoint: none yet");
+    expect(h.events().filter(event => event.event === "prepare-start").length).toBe(1);
   });
-
-  test("historical evidence stays available but only live rows can anchor coverage", () => {
-    const archive = archiveWith([["old", "user", "original request"], ["live", "assistant", "current state"]]);
-    const snapshot = archive.snapshot(archive.size - 1, new Set(["live"]));
-    expect(snapshot.size).toBe(2);
-    expect(snapshot.rows[0]?.text).toContain("original request");
-    expect(snapshot.manifest().lastTranscriptRowId).toBe("live");
-    expect(() => parseSubmission(JSON.stringify({ checkpoint: checkpointJson("E0001"), coverageEndEntryId: "old" }), snapshot)).toThrow(/must name a user or assistant row/);
-    expect(archive.rows[0]?.isTranscript).toBe(undefined);
+  test("a host unable to pause cancels obsolete work before native compaction", async () => {
+    const h = await readyHost("a18", {}, { workerDelaySleeps: 1000, noSleep: true });
+    const result = await h.compact(transcript());
+    expect(result.coreCalls).toBe(1);
+    expect(result.cancelledBeforeCore).toBe(true);
+    expect(await h.status()).toContain("no-pause");
+    await h.deliverLate();
+    expect(await h.status()).toContain("Checkpoint: none yet");
   });
+  test("an interrupted hold skips compaction and cancels its workers", async () => {
+    const h = await readyHost("a18", {}, { workerDelaySleeps: 1000 });
+    const controller = new AbortController();
+    controller.abort();
+    const result = await h.compact(transcript(), "auto", [], controller.signal);
+    expect(result.coreCalls).toBe(0);
+    expect(result.result.skip).toContain("interrupted");
+    await h.deliverLate();
+    expect(h.workerCalls).toBe(1);
+  });
+  test("low remaining hook budget falls back before spending more wait time", async () => {
+    const h = await readyHost("a18", {}, { workerDelaySleeps: 1000 });
+    expect((await h.compact(transcript(), "auto", undefined, undefined, 100)).coreCalls).toBe(1);
+    expect(h.sleeps).toBe(0);
+    expect(await h.status()).toContain("budget");
+  });
+  test("an unverified or unusable draft never reaches installation or transport retry", async () => {
+    const h = await readyHost("a18", {}, { workerReply: request => request.system === BUILDER_SYSTEM_PROMPT ? covering()(request) : '{"verdict":"unusable","reason":"ungrounded"}' });
+    expect(h.completeRequests.length).toBe(0);
+    expect((await h.compact(transcript())).coreCalls).toBe(1);
+    expect(h.workerCalls).toBe(2);
+    expect(await h.status()).toContain("native fallbacks: 1");
+  });
+  test("only the exact checkpoint text can confirm an installation", async () => {
+    const h = await readyHost();
+    const first = await h.compact(transcript());
+    const forged = first.result.messages!.map((row, i) => i === 0 ? { ...row, text: `${row.text}\nchanged` } : row);
+    h.setCanonical(forged);
+    expect(await h.status()).toContain("· installing");
+    expect(await h.status()).toContain("installs: 0");
+    h.setCanonical(first.result.messages!);
+    expect(await h.status()).toContain("installs: 1");
+  });
+});
 
-  test("completion responses normalize current and legacy hosts and surface unanswered reasons", () => {
+describe("Claude role transport", () => {
+  test("verifier transport fallback reuses the builder draft and selected model", async () => {
+    const h = host({ checkpointModel: "sonnet", checkpointEffort: "high" }, request => {
+      expect(request.system).toBe(VERIFIER_SYSTEM_PROMPT);
+      expect(request.prompt).toContain("Session evidence (sanitized JSONL rows");
+      expect(request.prompt).not.toContain("Read the session evidence from the file");
+      return '{"verdict":"accept"}';
+    }, { workerReply: request => { if (request.system === VERIFIER_SYSTEM_PROMPT) throw new Error("transport unavailable"); return covering()(request); } });
+    await fill(h);
+    await h.measure(160_000);
+    expect(h.claudeRuns.map(run => run.role)).toEqual(["builder", "verifier"]);
+    expect(h.completeRequests.map(run => [run.model, run.effort])).toEqual([["sonnet", "high"]]);
+    expect(h.completeRequests[0]!.timeoutMs!).toBeGreaterThan(0);
+    expect((await h.compact(transcript())).coreCalls).toBe(0);
+  });
+  test("changing transport cannot reset the builder's bounded correction", async () => {
+    let workers = 0;
+    let inline = 0;
+    const h = host({}, () => { inline += 1; return "still malformed"; }, { workerReply: () => {
+      workers += 1;
+      if (workers === 1) return "malformed";
+      throw new Error("transport unavailable");
+    } });
+    await fill(h);
+    await h.measure(160_000);
+    expect(workers).toBe(2);
+    expect(inline).toBe(1);
+    expect(await h.status()).toContain("builder failed validation");
+    expect(h.claudeRuns.some(run => run.role === "verifier")).toBe(false);
+  });
+  test("inline fallback refuses oversized evidence rather than dropping source rows", async () => {
+    const h = host({}, covering());
+    await fill(h);
+    for (let i = 0; i < 40; i++) await h.append(`large-${i}`, "assistant", "context ".repeat(700));
+    await h.measure(160_000);
+    expect(h.completeRequests.length).toBe(0);
+    expect(await h.status()).toContain("refusing truncated fallback");
+    expect(await h.status()).toContain("Checkpoint: none yet");
+  });
+  test("a stale nonce is ignored and the same role can recover through inline completion", async () => {
+    const h = host({}, covering(), { workerReply: covering(), workerResult: (_request, answer) => ({ nonce: "stale", ok: true, answer }) });
+    await fill(h);
+    await h.measure(160_000);
+    expect(h.claudeRuns.length).toBe(1);
+    expect(h.completeRequests.length).toBe(2);
+    expect((await h.compact(transcript())).coreCalls).toBe(0);
+  });
+  test("deadline expiry during a worker prevents the verifier or inline fallback from starting", async () => {
+    const h = await readyHost("a18", {}, { workerRunTimeMs: 360_001 });
+    expect(h.workerCalls).toBe(1);
+    expect(h.completeRequests.length).toBe(0);
+    expect(await h.status()).toContain("preparation deadline reached");
+  });
+  test("session end cancels a pending preparation and cannot publish its late result", async () => {
+    const h = await readyHost("a18", {}, { workerDelaySleeps: 1000 });
+    await h.end();
+    await h.deliverLate();
+    expect(h.workerCalls).toBe(1);
+    expect(await h.status()).toContain("Checkpoint: none yet");
+    expect(await h.status()).toContain("· idle");
+  });
+});
+
+describe("history reconciliation and fidelity", () => {
+  test("an empty startup read is retried and includes history predating the reload", async () => {
+    const h = host({}, undefined, { workerReply: coveringManifest });
+    await h.start();
+    h.setCanonical(transcript());
+    await h.append("u21", "user", longText("after reload"));
+    await h.append("a21", "assistant", longText("new answer"));
+    await h.measure(160_000);
+    const evidence = [...h.files.entries()].find(([path]) => path.endsWith("/evidence.jsonl"))![1];
+    expect(evidence).toContain("task 1 detail");
+    expect(evidence).toContain("after reload");
+    expect(h.workerCalls).toBe(2);
+    expect((await h.compact([...transcript(), ...transcript([["u21", "user", longText("after reload")], ["a21", "assistant", longText("new answer")]])])).coreCalls).toBe(0);
+  });
+  test("a capped canonical read recovers against the complete live compact snapshot", async () => {
+    const h = host({}, undefined, { workerReply: coveringManifest, historyRead: async () => Array.from({ length: 4096 }, () => message("user", "capped")) });
+    await fill(h);
+    await h.measure(160_000);
+    expect(h.workerCalls).toBe(0);
+    expect((await h.compact(transcript())).coreCalls).toBe(0);
+    expect(h.workerCalls).toBe(2);
+  });
+  test("appends racing a canonical read survive once in the final evidence order", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let reads = 0;
+    const h = host({}, undefined, { workerReply: coveringManifest, historyRead: async messages => {
+      reads += 1; const snapshot = [...messages]; if (reads === 1) await gate; return snapshot;
+    } });
+    h.setCanonical(transcript());
+    const starting = h.start();
+    await h.settle();
+    await h.append("u21", "user", longText("arrived during read"));
+    await h.append("a21", "assistant", longText("answer during read"));
+    release();
+    await starting;
+    await h.measure(160_000);
+    const evidence = [...h.files.entries()].find(([path]) => path.endsWith("/evidence.jsonl"))![1];
+    const rows = evidence.trim().split("\n").map(line => JSON.parse(line));
+    expect(rows.length).toBe(42);
+    expect(rows[0].text).toContain("task 1 detail");
+    expect(rows[40].text).toContain("arrived during read");
+  });
+  test("output projection preserves final errors with honest clipping metadata", () => {
+    const archive = new EvidenceArchive("/repo");
+    archive.addAppend("output", "tool-result", { type: "user", role: "user", content: [{ type: "tool_result", tool_use_id: "x", content: "Command: npm test\n" + "irrelevant log\n".repeat(800) + "\nFAIL tests/export.test.ts:42 expected 17 received 0", is_error: true }] });
+    const row = archive.rows[0]!;
+    expect(row.text.length).toBe(4000);
+    expect(row.text).toContain("Command: npm test");
+    expect(row.text).toContain("FAIL tests/export.test.ts:42 expected 17 received 0");
+    expect(row.text).toContain("characters omitted");
+    expect(row.textTruncated).toBe(true);
+    expect(row.isError).toBe(true);
+  });
+  test("parallel tool calls and their results remain in the original exact tail", async () => {
+    const h = host({}, undefined, { workerReply: coveringManifest });
+    await fill(h);
+    await h.appendRow("calls", { type: "assistant", content: [{ type: "tool_use", id: "x", name: "Read", input: { path: "a.ts" } }, { type: "tool_use", id: "y", name: "Grep", input: { pattern: "needle" } }] }, "response");
+    await h.appendRow("results", { type: "user", role: "user", content: [{ type: "tool_result", tool_use_id: "x", content: "first output" }, { type: "tool_result", tool_use_id: "y", content: "second output" }] }, "tool-result");
+    await h.measure(160_000);
+    const calls = message("assistant", "", { handle: "calls", toolUses: [{ tool_use_id: "x", tool: "Read", input: { path: "a.ts" } }, { tool_use_id: "y", tool: "Grep", input: { pattern: "needle" } }] });
+    const results = message("user", "", { handle: "results", toolResults: [{ tool_use_id: "x", text: "first output", isError: false }, { tool_use_id: "y", text: "second output", isError: false }] });
+    const compacted = await h.compact([...transcript(), calls, results]);
+    expect(compacted.coreCalls).toBe(0);
+    expect(compacted.result.messages?.slice(-2)).toEqual([calls, results]);
+    expect(hasOrphanedToolResult(compacted.result.messages!)).toBe(false);
+  });
+  test("current and legacy completion responses normalize and unanswered reasons surface", () => {
     expect(completionText({ isAnswered: true, text: "answer", usage: {} })).toBe("answer");
     expect(completionText("legacy")).toBe("legacy");
     expect(() => completionText({ isAnswered: false, reason: "aborted" })).toThrow(/aborted/);
   });
 });
 
-describe("engine integration", () => {
-  test("shadow-status command answers through the engine", async ($, on) => {
+describe("host window setup", () => {
+  function startHost(initial: { source: string; raw: number }, initialSettings: Record<string, any> = {}, previous?: unknown, unconfirmed = false) {
+    const model = "test-model";
+    const settings = structuredClone(initialSettings);
+    const store = new Map<string, unknown>();
+    if (previous !== undefined) store.set("autoCompactWindowDecisions", { [model]: previous });
+    const runs: Array<{ command: string; args: string }> = [];
+    const env: Record<string, string> = {};
+    let effective = { ...initial };
+    const handlers = new Map<string, any>();
+    const on = ((event: string, ...args: unknown[]) => { if (args.length === 1) handlers.set(event, args[0]); return { catch: () => undefined }; }) as On;
+    const $ = {
+      plugin: { root: "/plugin" },
+      session: { cwd: async () => "/repo", id: async () => "window-test", messages: async () => [],
+        usage: async () => ({ context: { window: 1_000_000, breakdown: { model, rawMaxTokens: effective.raw, autocompactSource: effective.source } } }) },
+      clock: { now: async () => 0 },
+      command: { register: async () => ({}), run: async (input: { command: string; args: string }) => {
+        runs.push(input);
+        if (!unconfirmed) {
+          effective = { source: "settings", raw: Number(input.args) };
+          settings.modelSettings ??= {};
+          settings.modelSettings[model] = { autoCompactWindow: Number(input.args) };
+        }
+        return { text: "set" };
+      } },
+      settings: { read: async () => settings },
+      env: { get: async (name: string) => env[name], set: async (name: string, value: string) => { env[name] = value; } },
+      store: { get: async (key: string) => store.get(key), set: async (key: string, value: unknown) => { store.set(key, value); } },
+      fs: { write: async () => undefined }, ui: { log: () => undefined },
+    } as unknown as EngineInterface;
+    register(on, {});
+    return { runs, store, env, start: () => handlers.get("session.start")!($, {}, async () => ({})) };
+  }
+  test("configures and confirms the window once, then keeps it on later starts", async () => {
+    const h = startHost({ source: "model-default", raw: 1_000_000 });
+    await h.start();
+    expect(h.runs).toEqual([{ command: "autocompact", args: "235000" }]);
+    expect(h.store.get("autoCompactWindowDecisions")).toEqual({ "test-model": "applied:235000" });
+    expect(h.env.CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS).toBe("100000");
+    await h.start();
+    expect(h.runs.length).toBe(1);
+  });
+  test("a recorded old 190k window is upgraded once", async () => {
+    const h = startHost({ source: "settings", raw: 190_000 }, { modelSettings: { "test-model": { autoCompactWindow: 190_000 } } }, "applied:190000");
+    await h.start();
+    await h.start();
+    expect(h.runs).toEqual([{ command: "autocompact", args: "235000" }]);
+  });
+  test("an unconfirmed host setting never becomes an ownership record", async () => {
+    const h = startHost({ source: "model-default", raw: 1_000_000 }, {}, undefined, true);
+    await h.start();
+    expect(h.store.has("autoCompactWindowDecisions")).toBe(false);
+  });
+  test("a changed user value and an environment override are preserved", async () => {
+    const changed = startHost({ source: "settings", raw: 210_000 }, { modelSettings: { "test-model": { autoCompactWindow: 210_000 } } }, "applied:190000");
+    await changed.start();
+    expect(changed.runs.length).toBe(0);
+    const env = startHost({ source: "env", raw: 190_000 }, { modelSettings: { "test-model": { autoCompactWindow: 190_000 } } }, "applied:190000");
+    await env.start();
+    expect(env.runs.length).toBe(0);
+  });
+});
+
+describe("continued sessions", () => {
+  test("a successful install followed by shrink re-arms a fresh checkpoint", async () => {
+    const h = host({}, undefined, { workerReply: coveringManifest });
+    await fill(h);
+    await h.measure(160_000);
+    const first = await h.compact(transcript());
+    await h.measure(20_000);
+    const newer = Array.from({ length: 12 }, (_, i) => [
+      [`u${i + 21}`, "user", longText(`new task ${i + 21}`)],
+      [`a${i + 21}`, "assistant", longText(`new answer ${i + 21}`)],
+    ] as Array<[string, "user" | "assistant", string]>).flat();
+    await fill(h, newer);
+    await h.measure(160_000);
+    expect(h.workerCalls).toBe(4);
+    const live = [...first.result.messages!, ...transcript(newer)].map((row, i) => ({ ...row, handle: `new-handle-${i}` }));
+    expect((await h.compact(live)).coreCalls).toBe(0);
+    expect(await h.status()).toContain("installs: 2");
+  });
+  test("the native escape hatch cancels pending work and runs exactly once", async () => {
+    const h = await readyHost("a18", {}, { workerDelaySleeps: 1000 });
+    await h.runCommand("compact-native");
+    await h.flush();
+    expect(h.selfCompactions).toBe(1);
+    expect([...h.files.keys()].some(path => path.endsWith("/cancel"))).toBe(true);
+    await h.deliverLate();
+    expect(h.workerCalls).toBe(1);
+    expect(await h.status()).toContain("Checkpoint: none yet");
+  });
+  test("tool arguments participate in prefix proof even when IDs and prose match", () => {
+    const index = new LiveTranscript();
+    const old = [message("assistant", "", { toolUses: [{ tool_use_id: "t", tool: "Read", input: { file_path: "old" } }] })];
+    index.remember(old, ["original"]);
+    expect(index.resolve([{ ...old[0]!, handle: "clone" }])).toEqual(["original"]);
+    expect(index.resolve([message("assistant", "", { handle: "clone", toolUses: [{ tool_use_id: "t", tool: "Read", input: { file_path: "new" } }] })])).toEqual(["unknown-0"]);
+  });
+});
+
+// These two tests use Claude Code's real engine fixture. The portable Node
+// adapter skips them; run `npm run check:host` in a Claude Code development host.
+describe("engine fixture integration", () => {
+  test("status command is routed through the Claude engine", async ($, on) => {
     on("session.start", (_$, e) => ({ cwd: e.cwd }));
     await $.session.start({ cwd: "/repo", surface: "terminal", isInteractive: true });
-    const result = await $.command.run({
-      command: "shadow-status",
-      args: "",
-      origin: { kind: "composer" },
-      presentation: { isFullscreen: false, columns: 80 },
-    });
-    expect(result.text).toContain("shadow-compact: v");
-    expect(result.text).toContain("phase=");
-    expect(result.text).toContain("prepare=150000 tokens");
-    expect(result.text).toContain("autoCompactWindow=");
-    expect(result.text).toContain("builder=claude:haiku");
-    expect(result.text).toContain("verifier=claude:haiku");
-    expect(result.text).toContain("lastFallback=none");
-    expect(result.text).toContain("lastCompact=unseen");
-    expect(result.text).toContain("v0.4.10");
+    const result = await $.command.run({ command: "shadow-status", args: "", origin: { kind: "composer" }, presentation: { isFullscreen: false, columns: 80 } });
+    expect(result.text).toContain("Shadow Compact v0.4.11");
+    expect(result.text).toContain("prepare: 160,000 tokens");
+    expect(result.text).toContain("Model: haiku · effort: high");
   });
-
-  test("compact with no checkpoint defers without inventing messages", async ($, on) => {
-    // The test's own hooks sit beneath every plugin and answer as core:
-    // a native compaction that keeps the transcript as-is.
+  test("an unsafe tiny compaction cannot invent a checkpoint", async ($, on) => {
     on("session.compact", (_$, e) => ({ messages: e.messages }));
-    const result = await $.session.compact({
-      trigger: "manual",
-      messages: [
-        { role: "user", text: "hello", toolUses: [] },
-        { role: "assistant", text: "hi there", toolUses: [] },
-      ],
-    });
-    // Either core compacts/skips on an empty test transcript, or a hook
-    // vetoed: what must never happen is a fabricated checkpoint message.
-    const texts = (result.messages ?? []).map((entry) => entry.text);
-    expect(texts.some((text) => text.includes("Continuation Checkpoint"))).toBe(false);
+    const result = await $.session.compact({ trigger: "manual", messages: [message("user", "hello"), message("assistant", "hi there")] });
+    expect((result.messages ?? []).some(entry => entry.text.includes("Continuation Checkpoint"))).toBe(false);
+  });
+});
+
+describe("refresh and install races", () => {
+  test("an in-flight installation confirms its own checkpoint after a refresh publishes", () => {
+    const state = new ShadowState();
+    const candidate = (id: string): PublishedCheckpoint => ({ checkpointId: id, rendered: id, coverageEndEntryId: id,
+      validation: { deterministic: "passed", independent: "accepted" },
+      proof: { sessionId: "test", epoch: 0, snapshotId: id, coveredCount: 1, prefixDigest: id, evidenceDigest: id } });
+    const old = candidate("older");
+    state.publish(state.startPreparing()!, old);
+    state.rearm();
+    const generation = state.startPreparing()!;
+    state.attemptInstall(old);
+    state.publish(generation, candidate("newer"));
+    expect(state.attemptedCheckpoint?.checkpointId).toBe("older");
+    expect(state.confirmInstall("newer")).toBe(false);
+    expect(state.confirmInstall("older")).toBe(true);
+    expect(state.installedCheckpointId).toBe("older");
+    expect(state.published?.checkpointId).toBe("newer");
+    expect(state.phase).toBe("ready");
+  });
+  test("an idle checkpoint serves instantly while its threshold refresh is still running", async () => {
+    const fakes: HostFakes = { workerReply: coveringManifest };
+    const h = host({}, undefined, fakes);
+    await fill(h);
+    await h.measure(100_000);
+    await h.complete();
+    expect(h.workerCalls).toBe(2);
+    fakes.workerDelaySleeps = 1000;
+    await h.append("u21", "user", longText("new request"));
+    await h.append("a21", "assistant", longText("new response"));
+    await h.measure(160_000);
+    expect(await h.status()).toContain("· refreshing");
+    const live = [...transcript(), ...transcript([["u21", "user", longText("new request")], ["a21", "assistant", longText("new response")]])];
+    const result = await h.compact(live);
+    expect(result.coreCalls).toBe(0);
+    expect(result.result.messages?.[0]?.text).toContain("entry a20");
+    expect(result.result.messages?.slice(-2)).toEqual(live.slice(-2));
+    expect(h.sleeps).toBe(0);
+    await h.deliverLate();
+    await h.deliverLate();
+    expect(h.events().filter(event => event.event === "prepare-verified").length).toBe(1);
+    expect(await h.status()).toContain("installs: 1");
+  });
+  test("a subagent compaction bypasses the main-session checkpoint", async () => {
+    const h = await readyHost();
+    const result = await h.compact(transcript(), "auto", undefined, undefined, undefined, "child-agent");
+    expect(result.coreCalls).toBe(1);
+    expect(h.workerCalls).toBe(2);
+    expect(h.events().some(event => event.event === "compact-enter")).toBe(false);
+  });
+});
+
+describe("retryable history reads", () => {
+  test("a startup read failure is visible and a later preparation retries the full history", async () => {
+    let unavailable = true;
+    const h = host({}, undefined, { workerReply: coveringManifest, historyRead: async messages => {
+      if (unavailable) throw new Error("session not bound yet");
+      return messages;
+    } });
+    await h.start();
+    expect(await h.status()).toContain("Last issue: retryable:session not bound yet");
+    unavailable = false;
+    h.setCanonical(transcript());
+    await h.measure(160_000);
+    expect(h.workerCalls).toBe(2);
+    expect((await h.compact(transcript())).coreCalls).toBe(0);
   });
 });

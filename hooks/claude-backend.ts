@@ -10,14 +10,14 @@ export function askViaClaudeWorker($: EngineInterface, config: ShadowConfig, con
     const outputPath = `${control.directory}/claude-${request.role}-${nonce}-result.json`;
     const timeoutMs = Math.min(600_000, control.remaining(await $.clock.now()));
     const run: ClaudeRunRequest = {
-      nonce, role: request.role, claudePath: config.claudePath,
+      nonce, role: request.role, claudePath: "claude",
       model: request.model === "inherit" ? await $.session.model() : request.model,
-      effort: request.role === "builder" ? config.builderEffort : config.verifierEffort,
+      effort: config.checkpointEffort,
       system: request.system, prompt: request.prompt, outputPath,
       cancelPath: `${control.directory}/cancel`,
       deadlineMs: Math.max(1, timeoutMs - Math.min(5_000, Math.floor(timeoutMs / 10))),
     };
-    const exited = await $.process.run([config.piNodePath, `${$.plugin.root}/${CLAUDE_WORKER_PATH}`], {
+    const exited = await $.process.run(["node", `${$.plugin.root}/${CLAUDE_WORKER_PATH}`], {
       stdin: JSON.stringify(run), timeoutMs,
     });
     const raw = await $.fs.read(outputPath).catch(() => "");

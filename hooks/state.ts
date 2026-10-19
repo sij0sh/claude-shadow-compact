@@ -32,7 +32,7 @@ export class ShadowState {
   #published: PublishedCheckpoint | undefined = undefined;
   #preparing: number | undefined = undefined;
   /** Checkpoint handed to the engine, awaiting canonical confirmation. */
-  #attemptedCheckpointId: string | undefined = undefined;
+  #attemptedCheckpoint: PublishedCheckpoint | undefined = undefined;
   #installedCheckpointId: string | undefined = undefined;
   #installCount = 0;
   #refreshArmed = true;
@@ -44,7 +44,10 @@ export class ShadowState {
     return this.#preparing !== undefined;
   }
   get attemptedCheckpointId(): string | undefined {
-    return this.#attemptedCheckpointId;
+    return this.#attemptedCheckpoint?.checkpointId;
+  }
+  get attemptedCheckpoint(): PublishedCheckpoint | undefined {
+    return this.#attemptedCheckpoint;
   }
   get installedCheckpointId(): string | undefined {
     return this.#installedCheckpointId;
@@ -55,12 +58,11 @@ export class ShadowState {
   get refreshArmed(): boolean {
     return this.#refreshArmed;
   }
-  get phase(): "idle" | "preparing" | "validated" | "validated-preparing" | "verified" | "verified-preparing" | "installing" | "installed" {
-    if (this.#attemptedCheckpointId) return "installing";
+  get phase(): "idle" | "preparing" | "ready" | "refreshing" | "installing" | "installed" {
+    if (this.#attemptedCheckpoint) return "installing";
     const ready = this.#published && this.#published.checkpointId !== this.#installedCheckpointId;
-    const independentlyVerified = this.#published?.validation.independent !== "skipped";
-    if (this.preparing) return ready ? (independentlyVerified ? "verified-preparing" : "validated-preparing") : "preparing";
-    if (ready) return independentlyVerified ? "verified" : "validated";
+    if (this.preparing) return ready ? "refreshing" : "preparing";
+    if (ready) return "ready";
     return this.#installedCheckpointId ? "installed" : "idle";
   }
 
@@ -77,8 +79,7 @@ export class ShadowState {
   publish(generation: number, result: PublishedCheckpoint): boolean {
     if (this.#preparing !== generation) return false;
     if (result.validation.deterministic !== "passed" ||
-      (result.validation.independent === "skipped" &&
-        (result.validation.mode !== "adaptive" || result.validation.risk.level !== "low"))) return false;
+      !["accepted", "repaired"].includes(result.validation.independent)) return false;
     this.#preparing = undefined;
     this.#published = result;
     return true;
@@ -104,22 +105,23 @@ export class ShadowState {
   }
 
   /** The compact hook handed the serving checkpoint to the engine. */
-  attemptInstall(): void {
-    this.#attemptedCheckpointId = this.#published?.checkpointId;
+  attemptInstall(checkpoint: PublishedCheckpoint | undefined = this.#published): void {
+    this.#attemptedCheckpoint = checkpoint;
   }
 
   /** Canonical history now opens with the attempted checkpoint. */
-  confirmInstall(): boolean {
-    if (!this.#attemptedCheckpointId) return false;
-    this.#installedCheckpointId = this.#attemptedCheckpointId;
-    this.#attemptedCheckpointId = undefined;
+  confirmInstall(expectedCheckpointId?: string): boolean {
+    if (!this.#attemptedCheckpoint ||
+      (expectedCheckpointId !== undefined && this.#attemptedCheckpoint.checkpointId !== expectedCheckpointId)) return false;
+    this.#installedCheckpointId = this.#attemptedCheckpoint.checkpointId;
+    this.#attemptedCheckpoint = undefined;
     this.#installCount += 1;
     return true;
   }
 
   /** Canonical history does not show the attempted checkpoint. */
   rejectInstall(): void {
-    this.#attemptedCheckpointId = undefined;
+    this.#attemptedCheckpoint = undefined;
   }
 
   /** Re-arms the refresh gate after an observed install + shrink or a native compaction. */
@@ -141,7 +143,7 @@ export class ShadowState {
   reset(): void {
     this.#preparing = undefined;
     this.#published = undefined;
-    this.#attemptedCheckpointId = undefined;
+    this.#attemptedCheckpoint = undefined;
     this.#installedCheckpointId = undefined;
     this.#installCount = 0;
     this.#generation += 1;
