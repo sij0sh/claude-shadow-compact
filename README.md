@@ -7,10 +7,16 @@ message handles and tool results preserved.
 
 ## Install
 
-Extract the release archive, then load the extracted directory:
+/plugin install shadow-compact --marketplace sij0sh/claude-shadow-compact
 
-```sh
-claude --plugin-dir /absolute/path/to/shadow-compact
+Or, from a local checkout, load it for one session with
+`claude --plugin-dir /path/to/claude-shadow-compact`.
+
+If the marketplace reports a stale version after a release, refresh it:
+
+```bash
+claude plugin marketplace update claude-shadow-compact
+claude plugin update shadow-compact@claude-shadow-compact
 ```
 
 The release contains the worker JavaScript. Installation needs no npm install
