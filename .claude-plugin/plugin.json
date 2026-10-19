@@ -1,6 +1,6 @@
 {
   "name": "shadow-compact",
-  "version": "0.4.9",
+  "version": "0.4.10",
   "description": "Verified-checkpoint compaction for Claude Code: isolated builder/verifier workers prepare evidence-grounded checkpoints, reconcile complete history after reload, and preserve every uncovered message plus the exact recent tail.",
   "author": {
     "name": "pi-shadow-compact port"
@@ -70,6 +70,16 @@
         "haiku",
         "sonnet",
         "opus"
+      ]
+    },
+    "verificationMode": {
+      "type": "string",
+      "title": "Verification mode",
+      "description": "always independently verifies every draft; adaptive skips verification only for eligible low-risk drafts after deterministic checks and self-review.",
+      "default": "always",
+      "options": [
+        "always",
+        "adaptive"
       ]
     },
     "builderEffort": {
