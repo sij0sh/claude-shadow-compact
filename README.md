@@ -121,22 +121,23 @@ no/unproven checkpoint ──► next(e): Claude native compaction (fail closed)
   must actually shrink the context. `precompute` compactions are skipped.
 - **Checkpoint-first gate.** A checkpoint that is still preparing is not
   a failed one. When Claude Code compacts before the checkpoint is ready,
-  Shadow holds that compaction for up to `compactWaitSeconds` (120 by
-  default) while the in-flight preparation finishes, then installs it;
-  when nothing is preparing it starts one just-in-time attempt and waits
-  on that. The wait runs as a chain of one-second host `sleep` processes
-  (or Node, where `sleep` is missing), because a hook's 10-second budget
-  pauses during host calls but not during `$.clock` waits. Native
-  compaction runs only when the wait times out, the preparation fails,
-  coverage still cannot be proven, or a failed preparation has not been
+  Shadow holds that compaction until the in-flight preparation finishes
+  or fails, then installs it; when nothing is preparing it starts one
+  just-in-time attempt and holds for that. Slowness alone never hands the
+  compaction to native: the preparation deadline (`prepareTimeoutSeconds`)
+  is the failure signal for an attempt that is merely slow. The hold runs
+  as a chain of one-second host `sleep` processes (or Node, where `sleep`
+  is missing), because a hook's 10-second budget pauses during host calls
+  but not during `$.clock` waits. Native compaction runs only when the
+  preparation fails (its deadline included), coverage still cannot be
+  proven, the host cannot pause, or a failed preparation has not been
   re-armed (failures are never retried at compaction). A preparation that
   finishes after a compaction removed its covered row is discarded
-  instead of published. `lastCompact` records the wait, e.g.
-  `waited=48s:done`. Set `compactWaitSeconds` to `0` for the old
-  immediate native fallback. A just-in-time attempt started by the
-  compaction itself is waited out to its preparation deadline instead;
-  a transcript whose handles mostly resolve to nothing (for example
-  after a mid-session runtime restart) gets no just-in-time attempt.
+  instead of published. `lastCompact` records the hold, e.g.
+  `waited=48s:done` or `waited=360s:failed`. Set `holdCompaction` to
+  `false` for the old immediate native fallback. A transcript whose
+  handles mostly resolve to nothing (for example after a mid-session
+  runtime restart) gets no just-in-time attempt.
 - **Preparation deadline.** `prepareTimeoutSeconds` (360 by default,
   at most 600) is one deadline across both roles, retries, and every
   backend fallback. Native compaction always cancels in-flight
@@ -146,8 +147,8 @@ no/unproven checkpoint ──► next(e): Claude native compaction (fail closed)
   request through a cancellation marker; owned Claude agents receive
   `TaskStop`. An already-running `model.complete` call has no explicit
   abort API, but its late answer is ignored and no further calls start.
-  The compaction hold remains separately bounded by `compactWaitSeconds`
-  for preparations that were already running.
+  A held compaction waits on this same deadline, so raise it (up to
+  600) for slower checkpoint models rather than accept native summaries.
 - **Install confirmation.** Returning the checkpoint is an attempt, not
   an install. It counts once canonical history (`$.session.messages()`)
   opens with that checkpoint's coverage line; `/shadow-status` shows
@@ -160,8 +161,8 @@ no/unproven checkpoint ──► next(e): Claude native compaction (fail closed)
   model's first session Shadow sets Claude Code's auto-compact window to
   190,000 through `/autocompact` (it applies at once and is saved under
   `modelSettings` in your user settings). The observed Opus compaction
-  trigger is around 157–162k for that window, so the bounded hold can be
-  needed to finish preparation. Shadow leaves the window
+  trigger is around 150–162k for that window, so the hold usually
+  carries the end of preparation. Shadow leaves the window
   alone when one is already chosen: `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, a
   settings `autoCompactWindow` (including `auto`), or managed settings.
   It decides once per model and remembers that, so a later
@@ -224,9 +225,10 @@ Set via the plugin's `userConfig` (Claude Code `/config` or
 | `configureIdleCompaction` | `true` | Lower Claude Code's idle-compaction floor and prepare at a completed turn above it |
 | `idleCompactMinTokens` | `100000` | Idle-compaction floor; values under 100,000 use 100,000 |
 | `recentTurns` | `10` | Minimum recent rounds kept verbatim (prompt + reply, or assistant response + its tool results) |
-| `compactWaitSeconds` | `120` | How long a compaction waits for an already-preparing checkpoint before native fallback; a just-in-time attempt started by that compaction is waited out to its preparation deadline; `0` never waits, at most `600` |
-| `prepareTimeoutSeconds` | `360` | Overall preparation deadline across roles, retries and backend fallbacks; positive integer, at most `600` |
+| `holdCompaction` | `true` | Hold a compaction until its checkpoint preparation finishes or fails (the preparation deadline is the failure signal); `false` falls back to native at once. The former `compactWaitSeconds: 0` still turns it off |
+| `prepareTimeoutSeconds` | `360` | Overall preparation deadline across roles, retries and backend fallbacks, and the only thing that ends a compaction hold on a slow preparation; positive integer, at most `600` |
 | `builderModel` / `verifierModel` | `haiku` | Checkpoint agent models; `inherit` uses the session model |
+| `builderEffort` / `verifierEffort` | `high` | Reasoning effort for the private Claude checkpoint agents (`low` … `max`) |
 | `manualCompactMode` | `shadow` | `shadow` or `native` for manual `/compact` |
 | `builderBackend` / `verifierBackend` | `claude` | `claude` or `pi` per role (see [Optional Pi backend](#optional-pi-backend)) |
 | `piBuilderProvider` / `piBuilderModel` | `""` | Pi provider and model id for a `pi` builder |
@@ -298,7 +300,7 @@ claude plugin marketplace update claude-shadow-compact
 claude plugin update shadow-compact@claude-shadow-compact
 ```
 
-`/shadow-status` shows the running version (`v0.4.7`).
+`/shadow-status` shows the running version (`v0.4.8`).
 
 ## Deferred from the Pi version
 

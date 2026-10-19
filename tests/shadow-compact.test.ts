@@ -344,6 +344,27 @@ describe("config", () => {
     expect(resolveConfig({ prepareTimeoutSeconds: 999 }).prepareTimeoutSeconds).toBe(600);
     expect(resolveConfig({ prepareTimeoutSeconds: 0 }).prepareTimeoutSeconds).toBe(360);
   });
+  test("placeholder text fails validation in items, verification and continuation", () => {
+    const refs = new Set(["E0001"]);
+    const stub = (patch: Record<string, unknown>) => () => validateCheckpointObject({ ...checkpointJson("E0001"), ...patch }, refs);
+    expect(stub({ objective: [{ text: "test", evidenceRefs: ["E0001"] }] })).toThrow("placeholder text");
+    expect(stub({ objective: [{ text: "TODO.", evidenceRefs: ["E0001"] }] })).toThrow("placeholder text");
+    expect(stub({ verificationState: [{ text: "x", status: "unverified", evidenceRefs: ["E0001"] }] })).toThrow("placeholder text");
+    expect(stub({ continuationState: { currentGoal: "y", currentApproach: "x", immediateNextStep: "z" } })).toThrow("placeholder text");
+    // The exact stub a Pi builder submitted in a live session.
+    expect(stub({
+      objective: [{ text: "test", evidenceRefs: ["E0001"] }],
+      nextActions: undefined,
+      verificationState: undefined,
+      continuationState: { currentApproach: "x", currentGoal: "y", immediateNextStep: "z" },
+    })).toThrow("placeholder text");
+    expect(stub({ modifiedFiles: [{ text: "src/a.ts", evidenceRefs: ["E0001"] }] })).not.toThrow();
+  });
+  test("checkpoint agents default to high effort", () => {
+    expect(resolveConfig({}).builderEffort).toBe("high");
+    expect(resolveConfig({}).verifierEffort).toBe("high");
+    expect(resolveConfig({ verifierEffort: "max", builderEffort: "bogus" })).toMatchObject({ builderEffort: "high", verifierEffort: "max" });
+  });
   test("token default and custom threshold hold", async () => {
     expect(resolveConfig({}).prepareThresholdTokens).toBe(150_000);
     expect(resolveConfig({ prepareThresholdTokens: 180_000 }).prepareThresholdTokens).toBe(180_000);
@@ -550,7 +571,7 @@ interface HostFakes {
   piRunTimeMs?: number;
 }
 
-function host(options: Record<string, number | string> = {}, reply?: Reply, fakes: HostFakes = {}) {
+function host(options: Record<string, number | string | boolean> = {}, reply?: Reply, fakes: HostFakes = {}) {
   type Handler = ($: EngineInterface, e: any, next: (e: any) => Promise<any>) => any;
   const handlers = new Map<string, Handler>();
   const scheduled: Array<{ at: number; callback: () => void }> = [];
@@ -703,15 +724,18 @@ function host(options: Record<string, number | string> = {}, reply?: Reply, fake
       signal?: AbortSignal,
     ) => {
       let coreCalls = 0;
+      /** Whether the preparation was already cancelled when core began. */
+      let cancelledBeforeCore = false;
       const next = Object.assign(
         async () => {
           coreCalls += 1;
+          cancelledBeforeCore = [...files.keys()].some(path => path.endsWith("/cancel"));
           return { messages: core };
         },
         signal ? { signal } : {},
       );
       const result = await handlers.get("session.compact")!($, { trigger, messages }, next);
-      return { result: result as { messages?: SessionMessage[]; skip?: string }, coreCalls };
+      return { result: result as { messages?: SessionMessage[]; skip?: string }, coreCalls, cancelledBeforeCore };
     },
     flush: async () => {
       now += 50;
@@ -989,9 +1013,11 @@ describe("compaction install", () => {
 
 describe("checkpoint-first compaction gate", () => {
   test("native compaction cancels in-flight preparation even when native keeps its coverage row", async () => {
-    const h = await preparingHost(1000, { compactWaitSeconds: 0 });
+    const h = await preparingHost(1000, { holdCompaction: false });
     const kept = transcript(turns.slice(2));
-    await h.compact(transcript(), "auto", [message("user", longText("native summary")), ...kept]);
+    const { cancelledBeforeCore } = await h.compact(transcript(), "auto", [message("user", longText("native summary")), ...kept]);
+    // Cancelled before native writes its summary, not after.
+    expect(cancelledBeforeCore).toBe(true);
     // Coverage a2 survives in the kept tail, but the snapshot predates the
     // native summary: publishing it would displace that summary later.
     expect(h.stoppedAgents).toEqual(["agent-1"]);
@@ -1011,7 +1037,7 @@ describe("checkpoint-first compaction gate", () => {
   });
 
   test("a just-in-time attempt started by the compaction is waited out to its preparation deadline", async () => {
-    const h = host({ recentTurns: 1, compactWaitSeconds: 1 }, undefined, { agentReply: covering("a2"), agentDelaySleeps: 3 });
+    const h = host({ recentTurns: 1 }, undefined, { agentReply: covering("a2"), agentDelaySleeps: 3 });
     for (const [id, role, text] of turns) await h.append(id, role, text);
     expect(h.spawns).toBe(0);
     const { result, coreCalls } = await h.compact(transcript());
@@ -1032,7 +1058,7 @@ describe("checkpoint-first compaction gate", () => {
     expect(await h.status()).toContain("native:history-unproven");
   });
   test("one preparation deadline stops agents and prevents later verifier or fallback calls", async () => {
-    const h = await preparingHost(1_000, { prepareTimeoutSeconds: 2, compactWaitSeconds: 10 });
+    const h = await preparingHost(1_000, { prepareTimeoutSeconds: 2 });
     await h.advance(2_000);
     expect(h.stoppedAgents).toEqual(["agent-1"]);
     expect(h.spawns).toBe(1);
@@ -1043,7 +1069,7 @@ describe("checkpoint-first compaction gate", () => {
   });
 
   test("a native fallback cancels obsolete preparation without waiting for its late answer", async () => {
-    const h = await preparingHost(1_000, { compactWaitSeconds: 1 });
+    const h = await preparingHost(1_000, { prepareTimeoutSeconds: 2 });
     expect((await h.compact(transcript())).coreCalls).toBe(1);
     expect(h.stoppedAgents).toEqual(["agent-1"]);
     expect([...h.files.keys()].some(path => path.endsWith("/cancel"))).toBe(true);
@@ -1051,7 +1077,7 @@ describe("checkpoint-first compaction gate", () => {
     expect(h.spawns).toBe(1);
   });
   /** Rows archived and preparation started, with agent answers held back. */
-  async function preparingHost(delaySleeps: number, options: Record<string, number | string> = {}) {
+  async function preparingHost(delaySleeps: number, options: Record<string, number | string | boolean> = {}) {
     const h = host({ recentTurns: 1, ...options }, undefined, { agentReply: covering("a2"), agentDelaySleeps: delaySleeps });
     for (const [id, role, text] of turns) await h.append(id, role, text);
     await h.measure(160_000);
@@ -1072,19 +1098,27 @@ describe("checkpoint-first compaction gate", () => {
     expect(h.sleeps).toBeGreaterThan(0);
   });
 
-  test("a preparation outliving the wait falls back to native once and never publishes stale", async () => {
-    const h = await preparingHost(1_000, { compactWaitSeconds: 5 });
+  test("a slow preparation holds the compaction past the old 120s wait and installs", async () => {
+    // Builder at 150 sleeps, verifier 150 after: 300s, inside the 360s deadline.
+    const h = await preparingHost(150);
+    const { result, coreCalls } = await h.compact(transcript());
+    expect(coreCalls).toBe(0);
+    expect(result.messages?.[0]?.text).toContain("Covers the session through entry a2");
+    expect(h.sleeps).toBeGreaterThanOrEqual(300);
+    expect(await h.status()).toContain(":done");
+  });
+
+  test("only the preparation deadline hands a held compaction to native, never publishing late", async () => {
+    const h = await preparingHost(1_000, { prepareTimeoutSeconds: 5 });
     const { coreCalls } = await h.compact(transcript());
     expect(coreCalls).toBe(1);
     expect(h.sleeps).toBe(5);
-    expect(await h.status()).toContain("native:no-checkpoint waited=5s:timeout");
-    // The slow pipeline finishes after native summarized a2 away.
-    await h.append("ns", "user", "native summary", "compaction");
+    expect(await h.status()).toContain("native:no-checkpoint waited=5s:failed");
     await h.deliverLate();
     await h.deliverLate();
     const status = await h.status();
     expect(status).toContain("checkpoint=none");
-    expect(status).toContain("stale:native compaction replaced history");
+    expect(status).toContain("preparation deadline reached");
   });
 
   test("with nothing preparing, the compaction starts one just-in-time attempt", async () => {
@@ -1109,8 +1143,10 @@ describe("checkpoint-first compaction gate", () => {
     expect(h.sleeps).toBe(0);
   });
 
-  test("compactWaitSeconds 0 keeps the immediate native fallback", async () => {
-    const h = await preparingHost(3, { compactWaitSeconds: 0 });
+  test("holdCompaction off (or the former compactWaitSeconds 0) keeps the immediate native fallback", async () => {
+    expect(resolveConfig({ compactWaitSeconds: 0 }).holdCompaction).toBe(false);
+    expect(resolveConfig({ compactWaitSeconds: 120 }).holdCompaction).toBe(true);
+    const h = await preparingHost(3, { holdCompaction: false });
     const { coreCalls } = await h.compact(transcript());
     expect(coreCalls).toBe(1);
     expect(h.sleeps).toBe(0);
@@ -1181,7 +1217,7 @@ describe("pi backend", () => {
   test("Pi stays off by default and Claude never starts a process", async () => {
     const config = resolveConfig({});
     expect(usesPi(config)).toBe(false);
-    expect(describeRole(config, "builder")).toBe("claude:haiku");
+    expect(describeRole(config, "builder")).toBe("claude:haiku@high");
     const h = await readyHost();
     expect(await h.status()).toContain("pi=off");
     expect(await h.status()).not.toContain("piUsage");
@@ -1335,7 +1371,7 @@ describe("engine integration", () => {
     expect(result.text).toContain("verifier=claude:haiku");
     expect(result.text).toContain("lastFallback=none");
     expect(result.text).toContain("lastCompact=unseen");
-    expect(result.text).toContain("v0.4.7");
+    expect(result.text).toContain("v0.4.8");
   });
 
   test("compact with no checkpoint defers without inventing messages", async ($, on) => {

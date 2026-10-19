@@ -83,9 +83,11 @@ const VERIFIER_TYPE = "shadow-compact:checkpoint-verifier";
 const COMPACT_POLL_SECONDS = 1;
 /** A held compaction stops waiting while this much hook budget is left. */
 const COMPACT_BUDGET_RESERVE_MS = 2_000;
+/** Hold past the preparation deadline, only for a cancellation that never lands. */
+const HOLD_GRACE_SECONDS = 30;
 
 /** Running plugin version shown in status; bump with the manifest. */
-const PLUGIN_VERSION = "0.4.7";
+const PLUGIN_VERSION = "0.4.8";
 
 /** Inline evidence cap for the model.complete fallback. */
 const INLINE_EVIDENCE_CHARS = 120_000;
@@ -245,6 +247,15 @@ async function compactNatively(
 ): Promise<SessionCompactResult> {
   const beforeIds = rt.transcript.resolve(before);
   const byHandle = new Map(before.flatMap((message, index) => message.handle ? [[message.handle, beforeIds[index]!] as const] : []));
+  // Native is about to summarize this history: any in-flight snapshot
+  // predates that summary, even when its coverage row survives in the
+  // kept tail. Publishing it later would displace the native summary at
+  // the next compaction with older, partial state, so it is cancelled
+  // now rather than left running (and spending) while native writes.
+  // A stale cancel re-arms, so a failed native run re-prepares later.
+  if (rt.preparation) {
+    await stopPreparation($, rt, "stale:native compaction replaced history");
+  }
   rt.awaitingCompactionRow = true;
   const result = await run().catch((error: unknown) => {
     rt.awaitingCompactionRow = false;
@@ -262,13 +273,6 @@ async function compactNatively(
     return id;
   });
   rt.transcript.remember(result.messages, rt.messageRowIds);
-  // Native just summarized this history: any in-flight snapshot predates
-  // that summary, even when its coverage row survives in the kept tail.
-  // Publishing it later would displace the native summary at the next
-  // compaction with older, partial state, so it is always cancelled.
-  if (rt.preparation) {
-    await stopPreparation($, rt, "stale:native compaction replaced history");
-  }
   // The pre-compaction token figures describe history that is gone.
   rt.tokenEstimate = null;
   rt.lastTokens = null;
@@ -624,11 +628,11 @@ async function hostPause($: EngineInterface, rt: Runtime): Promise<boolean> {
   return false;
 }
 
-type WaitOutcome = "done" | "timeout" | "interrupted" | "budget" | "no-pause";
+type WaitOutcome = "done" | "failed" | "timeout" | "interrupted" | "budget" | "no-pause";
 
 /**
- * Holds a live compaction while a preparation runs, up to the configured
- * wait. Preparation keeps running in its own dispatches (agent answers
+ * Holds a live compaction while a preparation runs, until it settles or
+ * `waitSeconds` pass. Preparation keeps running in its own dispatches (agent answers
  * arrive through `turn.complete`, Pi through its own process); this only
  * watches for it to settle.
  */
@@ -636,7 +640,7 @@ async function waitForPreparation(
   $: EngineInterface,
   rt: Runtime,
   next: { signal?: AbortSignal; budget?: { remainingMs: number } },
-  waitSeconds: number = rt.config.compactWaitSeconds,
+  waitSeconds: number,
 ): Promise<WaitOutcome> {
   const deadline = (await $.clock.now()) + waitSeconds * 1000;
   while (rt.state.preparing) {
@@ -645,7 +649,7 @@ async function waitForPreparation(
     if ((await $.clock.now()) >= deadline) return "timeout";
     if (!(await hostPause($, rt))) return "no-pause";
   }
-  return "done";
+  return rt.state.published ? "done" : "failed";
 }
 
 /**
@@ -742,7 +746,7 @@ function statusText(rt: Runtime): string {
       : "checkpoint=none",
     `installs=${rt.state.installCount}`,
     `prepare=${rt.config.prepareThresholdTokens} tokens recentRounds=${rt.config.recentTurns}`,
-    `compactWait=${rt.config.compactWaitSeconds}s`,
+    `holdCompaction=${rt.config.holdCompaction ? "until-settled" : "off"}`,
     `prepareTimeout=${rt.config.prepareTimeoutSeconds}s`,
     `diagnostics=${dataDirText(rt)}/events`,
     `autoCompactWindow=${rt.autoCompactWindow ?? "unseen"}`,
@@ -786,6 +790,7 @@ export const register: Register = (on, options) => {
         description: "Private Shadow Compact checkpoint builder. Never offer to the acting model.",
         prompt: BUILDER_SYSTEM_PROMPT,
         ...(rt.config.builderModel !== "inherit" ? { model: rt.config.builderModel } : {}),
+        effort: rt.config.builderEffort,
       })
       .catch(() => undefined);
     await $.agent
@@ -795,6 +800,7 @@ export const register: Register = (on, options) => {
         description: "Private Shadow Compact checkpoint verifier. Never offer to the acting model.",
         prompt: VERIFIER_SYSTEM_PROMPT,
         ...(rt.config.verifierModel !== "inherit" ? { model: rt.config.verifierModel } : {}),
+        effort: rt.config.verifierEffort,
       })
       .catch(() => undefined);
     await $.command
@@ -951,21 +957,18 @@ export const register: Register = (on, options) => {
     }
     // Checkpoint-first: a checkpoint still preparing is not a failed one.
     // Hold this compaction for it (or for one just-in-time attempt when
-    // none is running) instead of letting native win the race.
-    if ("reason" in plan && plan.reason !== "history-unproven" && plan.reason !== "coverage-ambiguous" && rt.config.compactWaitSeconds > 0) {
+    // none is running) until it settles. Only a failure hands the
+    // compaction to native; the preparation deadline is that failure
+    // for an attempt that is merely slow.
+    if ("reason" in plan && plan.reason !== "history-unproven" && plan.reason !== "coverage-ambiguous" && rt.config.holdCompaction) {
       firstReason = plan.reason;
-      const wasPreparing = rt.state.preparing;
-      if (!wasPreparing) void runPreparation($, rt, false);
+      if (!rt.state.preparing) void runPreparation($, rt, false);
       if (rt.state.preparing) {
         const started = await $.clock.now();
-        // An attempt this compaction itself started is waited out to
-        // its preparation deadline (bounded by prepareTimeoutSeconds):
-        // abandoning it at compactWaitSeconds would waste the hold.
-        // A background preparation that had its head start keeps the
-        // configured compactWaitSeconds bound.
-        const waitSeconds = wasPreparing || !rt.preparation
-          ? rt.config.compactWaitSeconds
-          : Math.max(rt.config.compactWaitSeconds, Math.ceil((rt.preparation.deadline - started) / 1000));
+        // The deadline timer cancels the preparation, which settles it;
+        // the grace only guards a cancellation that never lands.
+        const deadline = rt.preparation?.deadline ?? started + rt.config.prepareTimeoutSeconds * 1000;
+        const waitSeconds = Math.ceil((deadline - started) / 1000) + HOLD_GRACE_SECONDS;
         await trace($, rt, "compact-wait-start", { trigger: e.trigger, reason: firstReason, seconds: waitSeconds });
         const outcome = await waitForPreparation($, rt, next, waitSeconds);
         waited = ` waited=${Math.round(((await $.clock.now()) - started) / 1000)}s:${outcome}`;

@@ -22,16 +22,12 @@ export const DEFAULT_AUTO_COMPACT_WINDOW_TOKENS = 190_000;
 export const DEFAULT_IDLE_COMPACT_MIN_TOKENS = 100_000;
 export const MIN_IDLE_COMPACT_MIN_TOKENS = 100_000;
 export const DEFAULT_RECENT_TURNS = 10;
-/**
- * How long a live compaction waits for an in-flight (or just-started)
- * preparation before Claude Code's native summarizer runs. 0 never waits.
- */
-export const DEFAULT_COMPACT_WAIT_SECONDS = 120;
-/** `$.process.run` refuses longer children; the wait is a chain of them. */
-export const MAX_COMPACT_WAIT_SECONDS = 600;
 export const DEFAULT_PREPARE_TIMEOUT_SECONDS = 360;
 /** Default checkpoint-agent model: cheap and fast, never the session model. */
 export const DEFAULT_MODEL = "haiku";
+export const AGENT_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type AgentEffort = (typeof AGENT_EFFORTS)[number];
+export const DEFAULT_AGENT_EFFORT: AgentEffort = "high";
 
 export type ManualCompactMode = "shadow" | "native";
 
@@ -49,10 +45,17 @@ export interface ShadowConfig {
   configureIdleCompaction: boolean;
   /** Recent assistant/tool rounds kept verbatim (option key kept from turns). */
   recentTurns: number;
-  compactWaitSeconds: number;
+  /**
+   * Hold a live compaction until its preparation settles: a checkpoint,
+   * or a failure (the preparation deadline included). Slowness alone
+   * never hands the compaction to native.
+   */
+  holdCompaction: boolean;
   prepareTimeoutSeconds: number;
   builderModel: string;
   verifierModel: string;
+  builderEffort: AgentEffort;
+  verifierEffort: AgentEffort;
   manualCompactMode: ManualCompactMode;
   builderBackend: CheckpointBackend;
   verifierBackend: CheckpointBackend;
@@ -70,15 +73,12 @@ function positiveInt(value: unknown, fallback: number): number {
   return parsed;
 }
 
-function nonNegativeInt(value: unknown, fallback: number): number {
-  if (typeof value !== "number" && typeof value !== "string") return fallback;
-  const parsed = typeof value === "number" ? value : Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed < 0) return fallback;
-  return parsed;
-}
-
 function model(value: unknown): string {
   return typeof value === "string" && value.trim() !== "" ? value.trim() : DEFAULT_MODEL;
+}
+
+function effort(value: unknown): AgentEffort {
+  return (AGENT_EFFORTS as readonly unknown[]).includes(value) ? (value as AgentEffort) : DEFAULT_AGENT_EFFORT;
 }
 
 function text(value: unknown): string {
@@ -110,13 +110,13 @@ export function resolveConfig(options: PluginOptions): ShadowConfig {
     ),
     configureIdleCompaction: options.configureIdleCompaction !== false,
     recentTurns: positiveInt(options.recentTurns, DEFAULT_RECENT_TURNS),
-    compactWaitSeconds: Math.min(
-      MAX_COMPACT_WAIT_SECONDS,
-      nonNegativeInt(options.compactWaitSeconds, DEFAULT_COMPACT_WAIT_SECONDS),
-    ),
+    // The former `compactWaitSeconds: 0` meant "never wait".
+    holdCompaction: options.holdCompaction !== false && Number(options.compactWaitSeconds) !== 0,
     prepareTimeoutSeconds: Math.min(600, positiveInt(options.prepareTimeoutSeconds, DEFAULT_PREPARE_TIMEOUT_SECONDS)),
     builderModel: model(options.builderModel),
     verifierModel: model(options.verifierModel),
+    builderEffort: effort(options.builderEffort),
+    verifierEffort: effort(options.verifierEffort),
     manualCompactMode: options.manualCompactMode === "native" ? "native" : "shadow",
     builderBackend: backend(options.builderBackend),
     verifierBackend: backend(options.verifierBackend),
@@ -147,7 +147,9 @@ export function usesPi(config: ShadowConfig): boolean {
 /** A role's backend and model for `/shadow-status`. */
 export function describeRole(config: ShadowConfig, role: CheckpointRole): string {
   if (roleBackend(config, role) === "claude") {
-    return describeModel(role === "builder" ? config.builderModel : config.verifierModel);
+    return role === "builder"
+      ? `${describeModel(config.builderModel)}@${config.builderEffort}`
+      : `${describeModel(config.verifierModel)}@${config.verifierEffort}`;
   }
   const target = piTargetFor(config, role);
   return target ? `pi:${target.provider}/${target.model}@${target.thinking}` : "pi:unconfigured";

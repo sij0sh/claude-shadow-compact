@@ -1,6 +1,6 @@
 {
   "name": "shadow-compact",
-  "version": "0.4.7",
+  "version": "0.4.8",
   "description": "Verified-checkpoint compaction for Claude Code: a private builder and independent verifier prepare an evidence-grounded checkpoint in the background, and Claude Code's own /compact or auto-compaction installs it through session.compact with the exact recent tail preserved by handle.",
   "author": {
     "name": "pi-shadow-compact port"
@@ -42,11 +42,11 @@
       "description": "Minimum number of recent rounds preserved exactly (by engine handle) after the checkpoint. A round is a prompt with its reply, or one assistant response with its tool results, so long single-prompt agentic turns can still compact.",
       "default": 10
     },
-    "compactWaitSeconds": {
-      "type": "number",
-      "title": "Compaction wait for checkpoint (seconds)",
-      "description": "When Claude Code compacts while a checkpoint is still preparing, Shadow holds the compaction up to this long for it before falling back to native compaction. A just-in-time attempt started by that compaction itself is instead waited out to its preparation deadline. 0 never waits (native fallback at once). At most 600.",
-      "default": 120
+    "holdCompaction": {
+      "type": "boolean",
+      "title": "Hold compaction for the checkpoint",
+      "description": "When Claude Code compacts while a checkpoint is still preparing (or none has been tried), Shadow holds the compaction until that preparation finishes or fails. Slowness alone never falls back to native; the preparation deadline is the failure signal. Off runs native compaction at once.",
+      "default": true
     },
     "builderModel": {
       "type": "string",
@@ -70,6 +70,32 @@
         "haiku",
         "sonnet",
         "opus"
+      ]
+    },
+    "builderEffort": {
+      "type": "string",
+      "title": "Builder effort",
+      "description": "Reasoning effort for the private checkpoint-builder Claude agent.",
+      "default": "high",
+      "options": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    "verifierEffort": {
+      "type": "string",
+      "title": "Verifier effort",
+      "description": "Reasoning effort for the private checkpoint-verifier Claude agent.",
+      "default": "high",
+      "options": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
       ]
     },
     "builderBackend": {
@@ -165,7 +191,7 @@
     "prepareTimeoutSeconds": {
       "type": "number",
       "title": "Preparation deadline (seconds)",
-      "description": "One deadline shared by builder, verifier, retries and backend fallbacks. Obsolete work is cancelled after native compaction. Positive integer, at most 600.",
+      "description": "One deadline shared by builder, verifier, retries and backend fallbacks. A held compaction falls back to native only when this deadline passes without a checkpoint. Positive integer, at most 600.",
       "default": 360
     }
   }

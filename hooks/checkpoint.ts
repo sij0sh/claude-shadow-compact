@@ -8,6 +8,21 @@
 
 export const CHECKPOINT_SCHEMA_VERSION = 3;
 const MAX_ITEM_CHARS = 8_000;
+/** Shorter text cannot carry continuation state; it reads as a stub. */
+const MIN_ITEM_CHARS = 6;
+/** Stub answers a model submits to probe the schema, never real state. */
+const PLACEHOLDER_TEXTS = new Set([
+  "test", "testing", "todo", "tbd", "tba", "placeholder", "example", "sample",
+  "none", "null", "undefined", "n/a", "na", "foo", "bar", "baz", "lorem ipsum", "...",
+]);
+
+/** Rejects stub text such as `x`, `test` or `TODO` that passes the shape checks. */
+function requireSubstance(text: string, where: string): void {
+  const normalized = text.toLowerCase().replace(/[.!?:;,]+$/, "").trim();
+  if (text.length < MIN_ITEM_CHARS || PLACEHOLDER_TEXTS.has(normalized)) {
+    throw new Error(`${where} is placeholder text (${JSON.stringify(text)}); describe the real session state`);
+  }
+}
 const MAX_ITEMS_PER_SECTION = 100;
 const MAX_REFS_PER_ITEM = 32;
 const MAX_RENDERED_CHARS = 64_000;
@@ -121,6 +136,7 @@ function parseVerificationItem(
   if (text.length > MAX_ITEM_CHARS) {
     throw new Error(`Item ${index} in ${VERIFICATION_SECTION} exceeds text limit`);
   }
+  requireSubstance(text, `Item ${index} in ${VERIFICATION_SECTION}`);
   if (record.status !== "verified" && record.status !== "unverified") {
     throw new Error(
       `Item ${index} in ${VERIFICATION_SECTION} needs status verified or unverified`,
@@ -156,6 +172,7 @@ function parseContinuationState(source: Record<string, unknown>): ContinuationSt
     if (text.length > MAX_ITEM_CHARS) {
       throw new Error(`Checkpoint section ${CONTINUATION_KEY}.${field} exceeds text limit`);
     }
+    requireSubstance(text, `Checkpoint section ${CONTINUATION_KEY}.${field}`);
     state[field] = text;
   }
   return state;
@@ -212,6 +229,7 @@ function parseItem(
   if (text.length > MAX_ITEM_CHARS) {
     throw new Error(`Item ${index} in ${section} exceeds text limit`);
   }
+  requireSubstance(text, `Item ${index} in ${section}`);
   return { text, evidenceRefs: parseRefs(record.evidenceRefs, index, section, knownRefs) };
 }
 
