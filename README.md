@@ -1,170 +1,144 @@
-# Shadow Compact 0.4.11
+# Shadow Compact 0.4.12
 
-A Claude Code mod that prepares a verified continuation checkpoint in the
-background and installs it at Claude's normal compaction boundary. The result
-is a structured checkpoint plus the exact recent conversation, with original
-message handles and tool results preserved.
+A Claude Code mod that prepares an independently verified continuation checkpoint
+in the background, then installs it with the exact recent conversation at the
+host's compaction boundary. Original message handles and tool results are preserved.
 
 ## Install
 
-/plugin install shadow-compact --marketplace sij0sh/claude-shadow-compact
+Extract the archive and load its directory:
 
-Or, from a local checkout, load it for one session with
-`claude --plugin-dir /path/to/claude-shadow-compact`.
-
-If the marketplace reports a stale version after a release, refresh it:
-
-```bash
-claude plugin marketplace update claude-shadow-compact
-claude plugin update shadow-compact@claude-shadow-compact
+```sh
+claude --plugin-dir /absolute/path/to/shadow-compact
 ```
 
-The release contains the worker JavaScript. Installation needs no npm install
-or build. Node.js 22.13+ and `claude` must be on PATH. Use a Claude Code build
-that supports function-hook mods and `--safe-mode`; host rollout and organization
-policy can affect availability. See [Claude's mod setup guide](https://code.claude.com/docs/en/plugins/mods/create).
+The archive includes built JavaScript workers. Installation needs no npm install
+or build. Node.js 22.13+ and `claude` must be on PATH. Use Claude Code with
+function-hook mods, `--safe-mode`, replacement-message compaction, and the usage
+breakdown APIs. Native idle compaction requires Claude Code 2.1.290 or later.
+Host rollout and organization policy can affect availability.
 
 ## Configuration
 
-There are three preferences in Claude Code's plugin configuration:
+| Preference | Default | Behavior |
+| --- | --- | --- |
+| `checkpointModel` | `haiku` | Model for the curator and independent verifier; `inherit` uses the session model |
+| `checkpointEffort` | `high` | Same effort for both roles, subject to model support and host policy |
+| `prepareThresholdTokens` | `160000` | Starts background preparation; capped to an internal safe estimate on smaller windows |
 
-| Setting | Default | Effect |
-|---|---|---|
-| `checkpointModel` | `haiku` | Claude model or alias for the builder and independent verifier; `inherit` uses the session model |
-| `checkpointEffort` | `high` | Thinking effort for both roles; subject to model support and host policy |
-| `prepareThresholdTokens` | `160000` | Context size that starts background checkpoint preparation |
-
-Both roles receive the same model and effort through the worker and inline
-fallback transports. A verifier always independently audits the builder's draft.
-Invalid token counts or effort values use the defaults.
+There are no backend, verifier-mode, timeout, or compaction-hold settings.
 
 ## Automatic behavior
 
-1. At 160,000 context tokens, start preparing a checkpoint. The live estimate
-   also counts full appended messages and tool outputs between measurements.
-2. After a completed turn at or above 100,000 tokens, prepare for native idle
-   compaction. An earlier idle checkpoint can serve while a fresher checkpoint
-   prepares at the main threshold.
-3. At a live automatic, idle, or manual `/compact`, check the entire covered
-   prefix. If proven safe, immediately return the checkpoint and exact tail,
-   without generating another summary.
-4. If preparation is still running, hold compaction within its shared 360-second
-   preparation deadline and the host's remaining hook budget. Failures fall back
-   to native compaction; cancellation stops the pending work.
+1. Prepare at 160k tokens, including append growth between host measurements.
+2. After a completed turn at or above 100k, prepare for eligible idle compaction.
+   A verified idle checkpoint remains available during its main-threshold refresh.
+3. At a live compaction, install an eligible checkpoint immediately. A ready swap
+   makes no new model call.
+4. If no eligible checkpoint exists, start or join preparation even below 160k.
+   Hold the live compaction until that preparation succeeds or reaches a defined
+   failure. A previous failed attempt does not close a permanent preparation gate.
+5. Use native summarization after a terminal error or unsafe replacement.
+   Interruption cancels the compaction attempt and its preparation.
 
-The tail keeps at least ten whole assistant/tool rounds and **every message
-after the checkpoint's coverage boundary**. Original handles preserve the
-host's full blocks. An unsafe tool pairing or a candidate that saves no space
-uses native compaction.
+The result keeps the checkpoint, at least ten whole recent rounds, and **all
+uncovered messages**. Tool results cannot be separated from their retained calls.
+Prefix proof, message identity, coverage, size, and savings checks run before
+installation. Only canonical confirmation counts an installation as successful.
 
-### Compaction timing
+### Curation and independent verification
 
-Shadow configures the native window automatically unless an explicit user,
-environment, or managed choice owns it. The initial policy targets roughly
-200,000 tokens of live context: a 235,000-token configured window on larger
-models allows an estimated 35,000 tokens of native headroom. With a 200,000-token
-model, the configured window is capped at 200,000. A higher preparation threshold
-increases the target when the model permits it.
+The normal path uses two isolated, tool-free Claude requests. The curator writes
+current continuation state; the verifier returns a short pass/fail verdict.
+Neither agent pages through files, runs project tools, or regenerates the task.
+A rejected or malformed candidate is never published.
 
-**This is an internal scheduling estimate, not a measured guarantee that native
-compaction fires at 200,000.** Claude controls the actual trigger; the bounded
-hold covers a checkpoint that finishes later. The
-[host's window documentation](https://code.claude.com/docs/en/model-config#context-window-and-auto-compaction)
-describes the native controls. Actual measured and estimated tokens at each
-compaction are recorded in diagnostics.
+One executor handles both roles. Retry a transient transport failure once after
+60 seconds, retaining a valid curator draft when only verification must retry.
+There is no worker-to-inline fallback or 120,000-character transport cliff.
 
-Shadow lowers native idle compaction's floor to 100,000 unless the host has an
-explicit environment floor or disables idle compaction. Native idle eligibility
-and timing still belong to Claude Code; crossing 100,000 does not start an
-immediate forced swap or a second timer.
+Each role has a fresh request allowance of up to 600 seconds, including process
+overhead. The child aborts five seconds before the host process limit. There is
+no combined 360-second pipeline deadline. History/setup I/O has a separate
+30-second guard. A renewable 240-second wait lease does not fail or restart a
+healthy preparation and does not authorize native summarization.
 
-### Upgrading from 0.4.10
+The source packets target estimated input limits of 24k tokens for curation and
+12k for verification. Visible answers are limited to approximately 4k and 1k
+respectively. Request generation limits of 8k and 4k leave room for reasoning.
+These input/visible-answer sizes use a conservative sizing heuristic, not a
+provider tokenizer or actual usage measurement.
 
-The old 190,000 window migrates only when Shadow's stored record says it applied
-that value, the current effective window still matches, and the current per-model
-setting matches too. Global settings, environment overrides, explicit `auto`,
-and changed or unowned settings are preserved.
+Full user instructions and prior checkpoint obligations are protected. If they
+cannot fit both requests, coverage moves earlier and the rest remains verbatim.
+If no safe boundary exists, preparation fails explicitly. Optional repeated logs
+are deduplicated; source excerpts retain decisive errors/results and exact
+identifiers. The independent audit includes user requirements even if the
+curator did not cite them. A source ID is not a guarantee of semantic accuracy.
 
-The threshold key is unchanged, so a previously saved threshold is retained.
-The new model and effort keys default to `haiku` and `high`; select different
-values in the three-field configuration if needed. Old builder/verifier settings,
-Pi controls, verification modes, deadlines, tail sizes, hold toggles, and host
-tuning options are no longer read.
+### Native compaction window
 
-## Commands
+While enabled, Shadow attempts a **session-scoped environment override** that
+takes precedence over a saved per-model window such as:
 
-| Command | Behavior |
-|---|---|
-| `/shadow-status` | Short health report: phase, checkpoint, selected model/effort, install count, last issue, and diagnostics path |
-| `/compact` | Claude's normal manual compaction, using Shadow when safe |
-| `/compact-native` | Emergency native compaction for this invocation |
-
-Preparation is automatic. `/shadow-export` and `/shadow-compact` are removed.
-
-## What is preserved
-
-The evidence archive, serialized canonical reconciliation, frozen snapshots,
-strict schema/coverage/reference checks, independent verification, generation and
-history-epoch guards, complete prefix digests, exact tail, bounded recovery,
-worker cancellation, and native fallback remain. A returned checkpoint is counted
-as installed only when canonical history confirms the exact checkpoint text.
-A refresh cannot change which checkpoint an in-flight installation confirms.
-
-Builder and verifier are instructed to retain essential older commands, errors,
-test results, and non-reproducible observations as source-cited `criticalContext`
-and `verificationState` excerpts.
-Evidence rows remain bounded at 4,000 characters: clipped projections retain both
-the beginning and end, an omission marker, and truncation metadata. This does
-not promise full retention of arbitrary older output outside the exact tail.
-
-### Private workers and transport fallback
-
-Builder and verifier each run in an isolated `claude --safe-mode --print`
-process with Read/Grep access to a frozen evidence directory, existing Claude
-authentication, no session persistence, and parent routing removed. Each answer
-arrives through a nonce-tagged result file rather than the parent conversation.
-
-One role executor handles deadlines, cancellation, worker results, and fallback.
-A worker transport failure retries that role through `model.complete`, inlining
-the **same** evidence only when it fits the 120,000-character limit. A valid
-builder draft survives verifier transport failure. Quality rejection is terminal;
-changing transport cannot reset a correction budget or bypass the verifier.
-
-### Diagnostics
-
-Diagnostic event files and per-attempt evidence, checkpoint, worker results,
-and outcome records live under `.shadow-data/<session-id>/`. `/shadow-status`
-shows the event directory. These records distinguish attempted and confirmed
-installs, verification failures, holds, native fallbacks, and window decisions.
-Routine checkpoint maintenance uses status/debug output.
-
-## Development and verification
-
-Node.js 22.13+ provides the TypeScript transform used for offline builds and
-portable tests. Deployment files use only Node built-ins.
-
-```sh
-npm run check          # build, portable hooks, worker process tests, packaging checks
+```json
+{"modelSettings":{"claude-opus-5-5":{"autoCompactWindow":190000}}}
 ```
 
-With development dependencies and the current host types installed:
+The internal policy is `min(model capacity, max(240000, threshold + 80000))`,
+capped at the host's supported 1M window. It preserves saved settings beneath the
+override. For 200k models it cannot enlarge their actual context capacity.
+
+A configured 240k window is an initial scheduling policy, **not a guarantee of a
+200k actual trigger**. Claude controls headroom and token accounting. Shadow
+confirms the override from the host's effective usage breakdown, reapplies it on
+model changes, and reports an unconfirmed override when it cannot prove
+application. The live gate still handles an early compaction event.
+
+The idle floor is 100k unless the host explicitly sets another floor or disables
+idle compaction. Eligibility and idle timing belong to Claude. Owned environment
+values are restored on normal session end only when still unchanged.
+
+### Commands
+
+| Command | Behavior |
+| --- | --- |
+| `/shadow-status` | Phase, checkpoint, model/effort, effective preparation threshold, install count, last issue, and diagnostics path |
+| `/compact` | Normal manual compaction through Shadow; explicit focus instructions reach both roles |
+| `/compact-native` | Emergency native compaction for this invocation |
+
+`/shadow-export` and `/shadow-compact` remain removed.
+
+## Diagnostics and upgrading
+
+Private source snapshots, bounded role requests, nonce-tagged results, checkpoints,
+outcomes, and events live in `.shadow-data/<session-id>/`. Events distinguish
+request deadlines, retry errors, wait leases, native recovery, and confirmed
+installation. The release archive excludes session diagnostics.
+
+Upgrading from 0.4.11 retains the three preference keys. The former saved 190k
+window remains on disk; the active-session override takes precedence when the
+host supports it. There is no ownership-record prerequisite or settings-preserving
+early return. Existing per-session checkpoints are rebuilt after loading the mod.
+
+## Development and validation
+
+```sh
+npm run check          # offline build, portable regressions, release packaging checks
+npm run typecheck:core # pure checkpoint/core types, after installing dev dependencies
+```
+
+For host validation, first load the mod in an interactive Claude session to
+produce `.claude-plugin/types/`, then run:
 
 ```sh
 npm ci
-npm run typecheck:core
-# Generate current Claude mod types with /plugin-types in a development host.
-npm run check:host     # full typecheck, Claude validation, native engine fixture tests
+npm run check:host
 ```
 
-[Claude's mod reference](https://code.claude.com/docs/en/plugins/mods/reference)
-explains host types and validation. Portable tests use deterministic fake hosts
-and fake CLI processes; they cannot prove live model quality, host eligibility,
-or the real automatic compaction trigger. See
-[release notes](docs/release-0.4.11.md) for this release's validation record.
-
-## Origins
-
-The checkpoint approach derives from
-[pi-shadow-compact](https://github.com/sij0sh/pi-shadow-compact).
-The optional Pi execution backend has been removed; this release uses Claude
-for both checkpoint roles.
+The release environment has no Claude executable and dependency downloads were
+blocked. Live host waiting/window application, full TypeScript checks, and paid
+model quality/latency evaluations remain unverified. The portable suite exercises
+the reported failure paths using controlled host simulations and tests the built
+workers as actual processes. See [release notes](docs/release-0.4.12.md) for scope
+and the live verification checklist.

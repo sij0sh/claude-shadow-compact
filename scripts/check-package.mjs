@@ -25,7 +25,7 @@ for (const module of hooks.modules) {
   await access(path);
 }
 const files = await readdir("dist");
-assert.deepEqual(files.sort(), ["cancellation.mjs", "claude-checkpoint-worker.mjs", "claude-worker.mjs"]);
+assert.deepEqual(files.sort(), ["cancellation.mjs", "checkpoint-waiter.mjs", "claude-checkpoint-worker.mjs", "claude-worker.mjs", "outcome-waiter.mjs"]);
 for (const file of files) {
   const check = spawnSync(process.execPath, ["--check", `dist/${file}`], { encoding: "utf8" });
   assert.equal(check.status, 0, check.stderr);

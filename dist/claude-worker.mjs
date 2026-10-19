@@ -6,6 +6,8 @@ export function workerEnvironment(source) {
     const env = {
         ...source
     };
+    delete env.CLAUDE_CODE_EFFORT_LEVEL;
+    delete env.MAX_THINKING_TOKENS;
     for (const key of Object.keys(env)){
         if (key === "CLAUDECODE" || /^CLAUDE_(?:CODE_)?(?:SESSION|PARENT|AGENT|TEAM|REMOTE|SSE|PLUGIN)/.test(key)) delete env[key];
     }
@@ -19,14 +21,10 @@ export function workerArguments(request) {
         "--output-format",
         "json",
         "--no-session-persistence",
-        "--strict-mcp-config",
-        "--mcp-config",
-        '{"mcpServers":{}}',
-        "--disable-slash-commands",
         "--tools",
-        "Read,Grep",
-        "--allowedTools",
-        "Read,Grep",
+        "",
+        "--max-turns",
+        "1",
         "--permission-mode",
         "dontAsk",
         "--model",
@@ -37,16 +35,20 @@ export function workerArguments(request) {
         request.system
     ];
 }
-export async function runClaudeWorker(request) {
+export async function runClaudeWorker(request, parentSignal) {
     const started = performance.now();
-    const cancellation = workerCancellation(request.deadlineMs, request.cancelPath);
+    const cancellation = workerCancellation(request.deadlineMs, request.cancelPath, parentSignal);
     try {
         await cancellation.check();
         cancellation.signal.throwIfAborted();
         const raw = await new Promise((resolve, reject)=>{
             const child = spawn(request.claudePath, workerArguments(request), {
                 cwd: dirname(request.outputPath),
-                env: workerEnvironment(process.env),
+                env: {
+                    ...workerEnvironment(process.env),
+                    CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(request.maxTokens ?? (request.role === "builder" ? 8192 : 4096)),
+                    CLAUDE_CODE_MAX_RETRIES: "0"
+                },
                 detached: process.platform !== "win32",
                 stdio: [
                     "pipe",
@@ -65,7 +67,7 @@ export async function runClaudeWorker(request) {
                 } catch  {}
             };
             const stop = ()=>{
-                failure ??= new Error("Claude checkpoint cancelled or deadline reached");
+                failure ??= new Error(cancellation.signal.reason?.name === "TimeoutError" ? "role_deadline_exceeded" : "preparation_cancelled");
                 kill("SIGTERM");
                 escalation ??= setTimeout(()=>kill("SIGKILL"), 500);
             };
@@ -106,10 +108,14 @@ export async function runClaudeWorker(request) {
             durationMs: Math.round(performance.now() - started)
         };
     } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const code = /role_deadline_exceeded|TimeoutError/.test(message) ? "role_deadline_exceeded" : /preparation_cancelled|abort/i.test(message) ? "preparation_cancelled" : /ENOENT/.test(message) ? "claude_unavailable" : "worker_failed";
         return {
             nonce: request.nonce,
             ok: false,
-            error: error instanceof Error ? error.message : String(error),
+            error: message,
+            code,
+            retryable: code === "worker_failed",
             durationMs: Math.round(performance.now() - started)
         };
     } finally{
@@ -120,15 +126,24 @@ export async function main() {
     const chunks = [];
     for await (const chunk of process.stdin)chunks.push(chunk);
     const request = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const result = await runClaudeWorker(request);
-    const temporary = `${request.outputPath}.${process.pid}.tmp`;
-    await writeFile(temporary, JSON.stringify(result), {
-        mode: 0o600
-    });
-    await rename(temporary, request.outputPath);
-    process.stdout.write(`${JSON.stringify({
-        ok: result.ok,
-        role: request.role,
-        durationMs: result.durationMs
-    })}\n`);
+    const stopping = new AbortController();
+    const stop = ()=>stopping.abort(new Error("preparation_cancelled"));
+    process.once("SIGTERM", stop);
+    process.once("SIGINT", stop);
+    try {
+        const result = await runClaudeWorker(request, stopping.signal);
+        const temporary = `${request.outputPath}.${process.pid}.tmp`;
+        await writeFile(temporary, JSON.stringify(result), {
+            mode: 0o600
+        });
+        await rename(temporary, request.outputPath);
+        process.stdout.write(`${JSON.stringify({
+            ok: result.ok,
+            role: request.role,
+            durationMs: result.durationMs
+        })}\n`);
+    } finally{
+        process.removeListener("SIGTERM", stop);
+        process.removeListener("SIGINT", stop);
+    }
 }

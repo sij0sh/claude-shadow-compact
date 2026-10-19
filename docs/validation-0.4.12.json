@@ -1,0 +1,25 @@
+{
+  "version": "0.4.12",
+  "date": "2026-10-19",
+  "command": "npm run check",
+  "status": "passed",
+  "tests": {
+    "total": 103,
+    "passed": 101,
+    "failed": 0,
+    "skipped": 2
+  },
+  "completed": [
+    "Offline worker build",
+    "Portable hook regression tests with controlled host simulation",
+    "Built-worker and waiter process tests",
+    "Release metadata, configuration defaults, hook paths, and runtime module checks"
+  ],
+  "unverified": [
+    "Claude plugin validate/test: no Claude executable available",
+    "Full TypeScript checking: dependencies unavailable; npm registry returned 403",
+    "Real host hook budgets, compaction replacement, and effective window override",
+    "Paid model semantic continuation quality and latency benchmarks"
+  ],
+  "timing_note": "The 262s + 191s regression uses a simulated host clock. It is not a measured provider latency result."
+}

@@ -4,10 +4,8 @@
  * from the one being built (`preparing`): a published checkpoint keeps
  * serving while its replacement prepares. `generation` identifies one
  * preparation attempt so a slow superseded completion can never alias
- * a newer preparation. The refresh gate re-arms only after a confirmed
- * installation followed by below-prepare context, or after native
- * compaction, so preparation never spins (or retries a failure) while
- * context stays above the threshold.
+ * a newer preparation. Scheduling and bounded retries belong to the runtime;
+ * failure never leaves a hidden permission latch closed.
  */
 import type { PreparedCheckpoint } from "./prepare.js";
 
@@ -16,6 +14,7 @@ export interface PublishedCheckpoint {
   rendered: string;
   /** Archive uuid of the last transcript message the checkpoint represents. */
   coverageEndEntryId: string;
+  compactionInstructions?: string;
   validation: PreparedCheckpoint["validation"];
   proof: {
     sessionId: string;
@@ -35,7 +34,6 @@ export class ShadowState {
   #attemptedCheckpoint: PublishedCheckpoint | undefined = undefined;
   #installedCheckpointId: string | undefined = undefined;
   #installCount = 0;
-  #refreshArmed = true;
 
   get published(): PublishedCheckpoint | undefined {
     return this.#published;
@@ -55,15 +53,12 @@ export class ShadowState {
   get installCount(): number {
     return this.#installCount;
   }
-  get refreshArmed(): boolean {
-    return this.#refreshArmed;
-  }
   get phase(): "idle" | "preparing" | "ready" | "refreshing" | "installing" | "installed" {
     if (this.#attemptedCheckpoint) return "installing";
     const ready = this.#published && this.#published.checkpointId !== this.#installedCheckpointId;
     if (this.preparing) return ready ? "refreshing" : "preparing";
     if (ready) return "ready";
-    return this.#installedCheckpointId ? "installed" : "idle";
+    return this.#published && this.#installedCheckpointId ? "installed" : "idle";
   }
 
   /** Starts a preparation; returns its generation, or undefined while one is in flight. */
@@ -71,33 +66,19 @@ export class ShadowState {
     if (this.#preparing !== undefined) return undefined;
     this.#generation += 1;
     this.#preparing = this.#generation;
-    this.#refreshArmed = false;
     return this.#generation;
   }
 
   /** Publishes a completed preparation, replacing the serving checkpoint. */
   publish(generation: number, result: PublishedCheckpoint): boolean {
     if (this.#preparing !== generation) return false;
-    if (result.validation.deterministic !== "passed" ||
-      !["accepted", "repaired"].includes(result.validation.independent)) return false;
+    if (result.validation.deterministic !== "passed" || result.validation.independent !== "accepted") return false;
     this.#preparing = undefined;
     this.#published = result;
     return true;
   }
 
-  /**
-   * A completion whose coverage a compaction already removed from the
-   * transcript: never published, and the refresh gate re-arms so the
-   * next measure prepares against the history that is actually live.
-   */
-  discardStale(generation: number): boolean {
-    if (this.#preparing !== generation) return false;
-    this.#preparing = undefined;
-    this.#refreshArmed = true;
-    return true;
-  }
-
-  /** A failed preparation stays failed until the next compaction re-arms. */
+  /** Clear the active generation without displacing an earlier checkpoint. */
   fail(generation: number): boolean {
     if (this.#preparing !== generation) return false;
     this.#preparing = undefined;
@@ -124,19 +105,9 @@ export class ShadowState {
     this.#attemptedCheckpoint = undefined;
   }
 
-  /** Re-arms the refresh gate after an observed install + shrink or a native compaction. */
-  rearm(): boolean {
-    if (this.#refreshArmed) return false;
-    this.#refreshArmed = true;
-    return true;
-  }
-
-  disarmRefresh(): void { this.#refreshArmed = false; }
-
   discardPublished(): boolean {
     if (!this.#published) return false;
     this.#published = undefined;
-    this.#refreshArmed = true;
     return true;
   }
 
@@ -147,6 +118,5 @@ export class ShadowState {
     this.#installedCheckpointId = undefined;
     this.#installCount = 0;
     this.#generation += 1;
-    this.#refreshArmed = true;
   }
 }

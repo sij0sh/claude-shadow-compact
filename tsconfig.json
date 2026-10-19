@@ -1,7 +1,10 @@
 {
   "compilerOptions": {
     "target": "es2023",
-    "lib": ["es2023"],
+    "lib": [
+      "es2023",
+      "dom"
+    ],
     "types": [],
     "module": "esnext",
     "moduleResolution": "bundler",
@@ -14,6 +17,13 @@
     "jsxFactory": "h",
     "jsxFragmentFactory": "Fragment"
   },
-  "include": [".claude/types", "hooks", "tests"],
-  "exclude": ["tests/support/core-host.d.ts"]
+  "include": [
+    ".claude-plugin/types",
+    "hooks",
+    "tests"
+  ],
+  "exclude": [
+    "tests/support/core-host.d.ts"
+  ],
+  "extends": "./.claude-plugin/types/tsconfig.json"
 }

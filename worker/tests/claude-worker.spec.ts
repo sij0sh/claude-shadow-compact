@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { runClaudeWorker, workerArguments, workerEnvironment } from "../claude-checkpoint-worker.js";
 import type { ClaudeRunRequest } from "../../hooks/claude-protocol.js";
 
@@ -16,18 +16,21 @@ function request(directory: string, claudePath: string): ClaudeRunRequest {
 }
 
 test("Claude worker disables customizations and parent routing while preserving authentication", () => {
-  const env = workerEnvironment({ CLAUDECODE: "1", CLAUDE_CODE_PLUGIN_DIRS: "/parent", CLAUDE_CODE_SESSION_ID: "parent", ANTHROPIC_API_KEY: "test-key", CLAUDE_CODE_OAUTH_TOKEN: "test-oauth", PATH: "/bin" });
+  const env = workerEnvironment({ CLAUDECODE: "1", CLAUDE_CODE_PLUGIN_DIRS: "/parent", CLAUDE_CODE_SESSION_ID: "parent", ANTHROPIC_API_KEY: "test-key", CLAUDE_CODE_OAUTH_TOKEN: "test-oauth", PATH: "/bin", CLAUDE_CODE_EFFORT_LEVEL: "low", MAX_THINKING_TOKENS: "32000" });
   assert.equal(env.CLAUDECODE, undefined);
   assert.equal(env.CLAUDE_CODE_PLUGIN_DIRS, undefined);
   assert.equal(env.CLAUDE_CODE_SESSION_ID, undefined);
+  assert.equal(env.CLAUDE_CODE_EFFORT_LEVEL, undefined);
+  assert.equal(env.MAX_THINKING_TOKENS, undefined);
   assert.equal(env.ANTHROPIC_API_KEY, "test-key");
   assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "test-oauth");
   const args = workerArguments(request("/tmp", "claude"));
-  for (const flag of ["--safe-mode", "--no-session-persistence", "--strict-mcp-config", "--disable-slash-commands"]) assert.ok(args.includes(flag));
+  for (const flag of ["--safe-mode", "--no-session-persistence"]) assert.ok(args.includes(flag));
   assert.ok(!args.includes("--bare"));
-  assert.equal(args[args.indexOf("--tools") + 1], "Read,Grep");
+  assert.equal(args[args.indexOf("--tools") + 1], "");
   assert.equal(args[args.indexOf("--permission-mode") + 1], "dontAsk");
   assert.ok(!args.includes("--resume"));
+  assert.equal(args[args.indexOf("--max-turns") + 1], "1");
 });
 
 test("the shipped Claude worker writes only a nonce-tagged atomic result and short status", async () => {
@@ -63,7 +66,7 @@ test("cancellation is checked before launching the CLI", async () => {
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test("a running worker stops its child on the shared deadline", async () => {
+test("a running worker stops its child on its role request deadline", async () => {
   const directory = await mkdtemp(join(tmpdir(), "shadow-claude-deadline-"));
   try {
     const cli = join(directory, "stalled.mjs");
@@ -74,6 +77,54 @@ test("a running worker stops its child on the shared deadline", async () => {
     const result = await runClaudeWorker(run);
     assert.equal(result.ok, false);
     assert.ok(performance.now() - started < 5_000);
-    if (!result.ok) assert.match(result.error, /cancelled|deadline/);
+    if (!result.ok) assert.match(result.error, /role_deadline_exceeded/);
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a cancellation file stops an already-running CLI request", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "shadow-claude-running-"));
+  try {
+    const cli = join(directory, "running.mjs");
+    await writeFile(cli, '#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n', { mode: 0o700 });
+    const run = request(directory, cli);
+    const operation = runClaudeWorker(run);
+    await new Promise(resolve => setTimeout(resolve, 80));
+    await writeFile(run.cancelPath, "user interrupted");
+    const result = await operation;
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, "preparation_cancelled");
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("terminating the shipped worker also stops its isolated CLI child", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "shadow-claude-parent-"));
+  let cliPid: number | undefined;
+  try {
+    const cli = join(directory, "child.mjs");
+    const ready = join(directory, "ready");
+    const stopped = join(directory, "stopped");
+    await writeFile(cli, `#!/usr/bin/env node
+import { writeFileSync } from 'node:fs';
+writeFileSync(${JSON.stringify(ready)}, String(process.pid));
+process.on('SIGTERM', () => { writeFileSync(${JSON.stringify(stopped)}, 'stopped'); process.exit(0); });
+setInterval(() => {}, 1000);
+`, { mode: 0o700 });
+    const run = request(directory, cli);
+    const worker = spawn(process.execPath, [resolve("dist/claude-checkpoint-worker.mjs")], { stdio: ["pipe", "ignore", "ignore"] });
+    const exited = new Promise<number | null>(resolveExit => worker.once("exit", resolveExit));
+    worker.stdin.end(JSON.stringify(run));
+    for (let i = 0; i < 200 && cliPid === undefined; i++) {
+      cliPid = await readFile(ready, "utf8").then(Number, () => undefined);
+      if (cliPid === undefined) await new Promise(resolveWait => setTimeout(resolveWait, 10));
+    }
+    assert.ok(cliPid, "CLI child started");
+    worker.kill("SIGTERM");
+    assert.equal(await exited, 0);
+    assert.equal(await readFile(stopped, "utf8"), "stopped");
+    const result = JSON.parse(await readFile(run.outputPath, "utf8"));
+    assert.equal(result.code, "preparation_cancelled");
+  } finally {
+    if (cliPid) { try { process.kill(cliPid, "SIGKILL"); } catch { /* already reaped */ } }
+    await rm(directory, { recursive: true, force: true });
+  }
 });

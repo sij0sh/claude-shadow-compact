@@ -1,21 +1,27 @@
 {
   "name": "shadow-compact",
   "displayName": "Shadow Compact",
-  "version": "0.4.11",
-  "description": "Automatic verified Claude checkpoints with exact recent-tail preservation.",
+  "version": "0.4.12",
+  "description": "Automatic verified Claude checkpoints with bounded curation and exact recent-tail preservation.",
   "license": "MIT",
   "userConfig": {
     "checkpointModel": {
       "type": "string",
       "title": "Checkpoint model",
-      "description": "Claude model or alias used by both the builder and independent verifier. Use inherit for the session model.",
+      "description": "Claude model or alias for the curator and independent verifier. Use inherit for the session model.",
       "default": "haiku"
     },
     "checkpointEffort": {
       "type": "string",
       "title": "Thinking effort",
       "description": "Reasoning effort for both checkpoint roles, subject to model support and host policy.",
-      "options": ["low", "medium", "high", "xhigh", "max"],
+      "options": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
       "default": "high"
     },
     "prepareThresholdTokens": {

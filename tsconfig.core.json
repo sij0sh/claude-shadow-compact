@@ -1,6 +1,22 @@
 {
-  "extends": "./tsconfig.json",
-  "compilerOptions": { "lib": ["es2023", "dom"] },
+  "compilerOptions": {
+    "target": "es2023",
+    "lib": [
+      "es2023",
+      "dom"
+    ],
+    "types": [],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "jsx": "react",
+    "jsxFactory": "h",
+    "jsxFragmentFactory": "Fragment"
+  },
   "exclude": [],
   "include": [
     "tests/support/core-host.d.ts",
@@ -10,6 +26,8 @@
     "hooks/prepare.ts",
     "hooks/config.ts",
     "hooks/state.ts",
-    "hooks/preparation-control.ts"
+    "hooks/preparation-control.ts",
+    "hooks/evidence-packet.ts",
+    "hooks/failure.ts"
   ]
 }

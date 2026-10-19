@@ -3,3 +3,5 @@ node_modules/
 .agents/artifactss/
 .agents/artifacts/
 .trace/
+
+.claude-plugin/types/

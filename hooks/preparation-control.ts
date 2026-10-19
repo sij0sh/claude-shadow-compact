@@ -1,4 +1,4 @@
-/** One deadline and cancellation boundary for every backend and retry. */
+/** Session cancellation is independent of each role's request deadline. */
 export class PreparationCancelled extends Error {}
 
 export class PreparationControl {
@@ -6,16 +6,17 @@ export class PreparationControl {
   reason: string | null = null;
   finished = false;
   stopping = false;
+  roleDeadline: number | undefined;
+  roleAttempt = 0;
   private reject!: (error: Error) => void;
 
   constructor(
     readonly generation: number,
     readonly directory: string,
-    readonly deadline: number,
     public coverageEndEntryId: string,
+    readonly instructions = "",
   ) {
     this.cancelled = new Promise<never>((_resolve, reject) => { this.reject = reject; });
-    // A deadline can fire between requests, when nobody is awaiting it yet.
     void this.cancelled.catch(() => undefined);
   }
 
@@ -25,13 +26,22 @@ export class PreparationControl {
     this.reject(new PreparationCancelled(reason));
   }
 
-  remaining(now: number): number {
-    if (now >= this.deadline) this.cancel("preparation deadline reached");
+  assertActive(): void {
     if (this.reason) throw new PreparationCancelled(this.reason);
-    return Math.max(1, Math.floor(this.deadline - now));
+  }
+
+  beginRole(now: number, timeoutMs: number): number {
+    this.assertActive();
+    this.roleDeadline = now + timeoutMs;
+    return ++this.roleAttempt;
+  }
+
+  endRole(attempt: number): void {
+    if (this.roleAttempt === attempt) this.roleDeadline = undefined;
   }
 
   race<T>(operation: Promise<T>): Promise<T> {
+    this.assertActive();
     return Promise.race([operation, this.cancelled]);
   }
 }

@@ -1,8 +1,24 @@
 {
-  "extends": "../tsconfig.json",
   "compilerOptions": {
-    "types": ["node"],
-    "lib": ["es2023"]
+    "target": "es2023",
+    "lib": [
+      "es2023"
+    ],
+    "types": [
+      "node"
+    ],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "jsx": "react",
+    "jsxFactory": "h",
+    "jsxFragmentFactory": "Fragment"
   },
-  "include": ["**/*.ts"]
+  "include": [
+    "**/*.ts"
+  ]
 }

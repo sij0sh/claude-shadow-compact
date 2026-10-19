@@ -1,40 +1,25 @@
-import type { EngineInterface } from "claude-code";
-import type { ShadowConfig } from "./config.js";
+/** Pure worker protocol helpers; host API calls stay in register.ts. */
+import type { ClaudeRunRequest, ClaudeRunResult } from "./claude-protocol.js";
+import type { AskRequest } from "./prepare.js";
 import type { PreparationControl } from "./preparation-control.js";
-import type { AskFn } from "./prepare.js";
-import { CLAUDE_WORKER_PATH, type ClaudeRunRequest, type ClaudeRunResult } from "./claude-protocol.js";
+import { PreparationError } from "./failure.js";
 
-export function askViaClaudeWorker($: EngineInterface, config: ShadowConfig, control: PreparationControl): AskFn {
-  return async request => {
-    const nonce = crypto.randomUUID();
-    const outputPath = `${control.directory}/claude-${request.role}-${nonce}-result.json`;
-    const timeoutMs = Math.min(600_000, control.remaining(await $.clock.now()));
-    const run: ClaudeRunRequest = {
-      nonce, role: request.role, claudePath: "claude",
-      model: request.model === "inherit" ? await $.session.model() : request.model,
-      effort: config.checkpointEffort,
-      system: request.system, prompt: request.prompt, outputPath,
-      cancelPath: `${control.directory}/cancel`,
-      deadlineMs: Math.max(1, timeoutMs - Math.min(5_000, Math.floor(timeoutMs / 10))),
-    };
-    const exited = await $.process.run(["node", `${$.plugin.root}/${CLAUDE_WORKER_PATH}`], {
-      stdin: JSON.stringify(run), timeoutMs,
-    });
-    const raw = await $.fs.read(outputPath).catch(() => "");
-    let result: ClaudeRunResult | undefined;
-    try { result = JSON.parse(raw) as ClaudeRunResult; } catch { /* missing/partial output is a failed worker */ }
-    if (!result || result.nonce !== nonce) throw new Error(`Claude ${request.role} worker exited ${exited.exitCode} without its result`);
-    if (!result.ok) throw new Error(`Claude ${request.role} worker: ${result.error}`);
-    if (typeof result.answer !== "string" || !result.answer.trim()) throw new Error("Claude worker returned no answer");
-    return result.answer;
-  };
+export function workerRequest(request: AskRequest, model: string, effort: string, control: PreparationControl, timeoutMs: number): ClaudeRunRequest {
+  const nonce = crypto.randomUUID();
+  return { nonce, role: request.role, claudePath: "claude", model, effort, system: request.system,
+    prompt: request.prompt, maxTokens: request.maxTokens,
+    outputPath: `${control.directory}/claude-${request.role}-${nonce}-result.json`,
+    cancelPath: `${control.directory}/cancel`, deadlineMs: Math.max(1, timeoutMs - 5_000) };
 }
-
-/** Current hosts return a structured result; older supported hosts used text. */
-export function completionText(result: unknown): string {
-  if (typeof result === "string") return result;
-  if (result && typeof result === "object" && "isAnswered" in result && result.isAnswered === true &&
-    "text" in result && typeof result.text === "string") return result.text;
-  const reason = result && typeof result === "object" && "reason" in result ? String(result.reason) : "invalid result";
-  throw new Error(`Claude completion unanswered: ${reason}`);
+export function workerAnswer(raw: string, request: ClaudeRunRequest, exitCode: number): string {
+  let result: ClaudeRunResult;
+  try { result = JSON.parse(raw) as ClaudeRunResult; }
+  catch { throw new PreparationError("worker_result_invalid", `${request.role} exited ${exitCode} without a valid result`, true); }
+  if (!result || result.nonce !== request.nonce) throw new PreparationError("worker_result_invalid", "worker result nonce mismatch", true);
+  if (!result.ok) {
+    const code = result.code ?? "worker_failed";
+    throw new PreparationError(code, `${request.role}: ${result.error}`, result.retryable === true);
+  }
+  if (typeof result.answer !== "string" || !result.answer.trim()) throw new PreparationError("worker_result_invalid", "worker returned no answer", true);
+  return result.answer;
 }

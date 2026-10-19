@@ -1,9 +1,12 @@
 import { access } from "node:fs/promises";
-export function workerCancellation(deadlineMs, cancelPath) {
+export function workerCancellation(deadlineMs, cancelPath, parentSignal) {
     const cancelled = new AbortController();
     const signal = AbortSignal.any([
         AbortSignal.timeout(deadlineMs),
-        cancelled.signal
+        cancelled.signal,
+        ...parentSignal ? [
+            parentSignal
+        ] : []
     ]);
     const check = async ()=>{
         if (cancelPath && await access(cancelPath).then(()=>true, ()=>false)) cancelled.abort();

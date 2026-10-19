@@ -1,19 +1,18 @@
 /** Three user preferences; host scheduling and safety limits are internal policy. */
-import type { ContextWindowSource, PluginOptions, Settings } from "claude-code";
+import type { PluginOptions, Settings } from "claude-code";
 
 export const DEFAULT_PREPARE_THRESHOLD_TOKENS = 160_000;
 export const IDLE_COMPACT_MIN_TOKENS = 100_000;
 export const RECENT_ROUNDS = 10;
-export const PREPARE_TIMEOUT_SECONDS = 360;
+export const ROLE_TIMEOUT_MS = 600_000;
+export const RETRY_COOLDOWN_MS = 60_000;
+export const COMPACT_WAIT_LEASE_MS = 240_000;
 export const DEFAULT_MODEL = "haiku";
 export const AGENT_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type AgentEffort = (typeof AGENT_EFFORTS)[number];
 export const DEFAULT_AGENT_EFFORT: AgentEffort = "high";
-const TARGET_COMPACT_TOKENS = 200_000;
-const PREPARATION_LEAD_TOKENS = 40_000;
-// Initial allowance for native headroom, based on the bundled v0.4.10 observations.
-// This is a scheduling estimate, not a promise about Claude's actual trigger.
-const NATIVE_HEADROOM_TOKENS = 35_000;
+const MIN_AUTO_COMPACT_WINDOW_TOKENS = 240_000;
+const PREPARATION_LEAD_TOKENS = 80_000;
 const MAX_AUTO_COMPACT_WINDOW_TOKENS = 1_000_000;
 
 export interface ShadowConfig {
@@ -47,44 +46,18 @@ export function isAtOrAbove(usage: ThresholdUsage, thresholdTokens: number): boo
   return typeof usage.tokens === "number" && Number.isFinite(usage.tokens) && usage.tokens >= thresholdTokens;
 }
 
-export interface WindowFacts {
-  model: string;
-  modelWindow: number;
-  effectiveWindow: number;
-  source: ContextWindowSource;
-  settings: Settings;
-  /** Persisted `applied:<tokens>` is proof of what Shadow previously set. */
-  previousDecision?: unknown;
-}
+export interface WindowFacts { modelWindow: number }
 
 export type WindowDecision =
   | { apply: true; tokens: number }
   | { apply: false; reason: string };
 
-/** Accept only persisted records that name an actual value Shadow applied. */
-function managedTokens(record: unknown): number | undefined {
-  if (typeof record === "string" && /^applied:\d+$/.test(record)) return Number(record.slice(8));
-  return undefined;
-}
-
 export function decideAutoCompactWindow(config: ShadowConfig, facts: WindowFacts): WindowDecision {
-  if (facts.source === "env") return { apply: false, reason: "kept-env" };
-  // A global choice might come from managed policy; never write over it.
-  if (facts.settings.autoCompactWindow !== undefined) return { apply: false, reason: "kept-settings" };
-  const entry = typeof facts.settings.modelSettings === "object" && facts.settings.modelSettings !== null
-    ? (facts.settings.modelSettings as Record<string, unknown>)[facts.model] : undefined;
-  const chosen = entry && typeof entry === "object" && "autoCompactWindow" in entry ? entry.autoCompactWindow : undefined;
-  const previous = managedTokens(facts.previousDecision);
-  const owned = previous !== undefined && facts.effectiveWindow === previous && chosen === previous;
-  if (!owned && (facts.source === "settings" || chosen !== undefined)) return { apply: false, reason: "kept-settings" };
-  // A user who changed a previously managed window to `auto` also owns that choice.
-  if (!owned && facts.previousDecision !== undefined) return { apply: false, reason: "kept-user-choice" };
   if (!Number.isSafeInteger(facts.modelWindow) || facts.modelWindow < IDLE_COMPACT_MIN_TOKENS) {
     return { apply: false, reason: "model-window-unknown-or-small" };
   }
-  const target = Math.max(TARGET_COMPACT_TOKENS, config.prepareThresholdTokens + PREPARATION_LEAD_TOKENS);
-  const tokens = Math.min(facts.modelWindow, MAX_AUTO_COMPACT_WINDOW_TOKENS, target + NATIVE_HEADROOM_TOKENS);
-  if (owned && previous === tokens) return { apply: false, reason: "managed" };
+  const target = Math.max(MIN_AUTO_COMPACT_WINDOW_TOKENS, config.prepareThresholdTokens + PREPARATION_LEAD_TOKENS);
+  const tokens = Math.min(facts.modelWindow, MAX_AUTO_COMPACT_WINDOW_TOKENS, target);
   return { apply: true, tokens };
 }
 
