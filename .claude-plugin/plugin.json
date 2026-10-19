@@ -1,6 +1,6 @@
 {
   "name": "shadow-compact",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "description": "Verified-checkpoint compaction for Claude Code: a private builder and independent verifier prepare an evidence-grounded checkpoint in the background, and Claude Code's own /compact or auto-compaction installs it through session.compact with the exact recent tail preserved by handle.",
   "author": {
     "name": "pi-shadow-compact port"
@@ -45,7 +45,7 @@
     "compactWaitSeconds": {
       "type": "number",
       "title": "Compaction wait for checkpoint (seconds)",
-      "description": "When Claude Code compacts while a checkpoint is still preparing (or none was started), Shadow holds the compaction up to this long for it before falling back to native compaction. 0 never waits (native fallback at once). At most 600.",
+      "description": "When Claude Code compacts while a checkpoint is still preparing, Shadow holds the compaction up to this long for it before falling back to native compaction. A just-in-time attempt started by that compaction itself is instead waited out to its preparation deadline. 0 never waits (native fallback at once). At most 600.",
       "default": 120
     },
     "builderModel": {

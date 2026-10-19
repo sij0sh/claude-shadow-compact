@@ -25,9 +25,10 @@
  * token-cap recovery (no stable signal in the compact result).
  *
  * Optionally either role runs on a Pi SDK model instead (`pi-backend.ts`),
- * in its own bounded Node process. Pi is opt-in; when a preparation that
- * involves Pi fails for any reason, Shadow redoes the whole preparation
- * with the configured Claude models before giving up.
+ * in its own bounded Node process. Pi is opt-in; when a Pi preparation
+ * fails after its builder produced a draft, only the verifier is redone
+ * with the configured Claude models, and a full redo is started only
+ * while a meaningful share of the preparation deadline remains.
  *
  * Helpers are top-level functions taking `$` explicitly: the engine's
  * validator statically follows `$` only into top-level or imported
@@ -55,8 +56,11 @@ import {
   BUILDER_SYSTEM_PROMPT,
   VERIFIER_SYSTEM_PROMPT,
   prepareCheckpoint,
+  verifyDraft,
   type AskFn,
+  type CheckpointDraft,
 } from "./prepare.js";
+import { estimateTokens } from "./normalize.js";
 import {
   PiWorkerUnavailable,
   askViaPi,
@@ -81,7 +85,7 @@ const COMPACT_POLL_SECONDS = 1;
 const COMPACT_BUDGET_RESERVE_MS = 2_000;
 
 /** Running plugin version shown in status; bump with the manifest. */
-const PLUGIN_VERSION = "0.4.6";
+const PLUGIN_VERSION = "0.4.7";
 
 /** Inline evidence cap for the model.complete fallback. */
 const INLINE_EVIDENCE_CHARS = 120_000;
@@ -116,6 +120,10 @@ interface Runtime {
   idleCompact: string | null;
   /** Last main-loop context tokens `session.measure` reported. */
   lastTokens: number | null;
+  /** Running context estimate: exact at each measure, then grown by
+   * `estimateTokens` for every row appended since, so a single long turn
+   * can cross the prepare threshold between measures. */
+  tokenEstimate: number | null;
   /** The serving or preparing checkpoint was started below the prepare
    * threshold for idle compaction; refresh it once the threshold is hit. */
   idleCheckpoint: boolean;
@@ -148,6 +156,7 @@ function createRuntime(config: ShadowConfig): Runtime {
     autoCompactWindow: null,
     idleCompact: null,
     lastTokens: null,
+    tokenEstimate: null,
     idleCheckpoint: false,
     piStatus: usesPi(config) ? "unchecked" : "off",
     piStats: emptyPiStats(),
@@ -253,9 +262,16 @@ async function compactNatively(
     return id;
   });
   rt.transcript.remember(result.messages, rt.messageRowIds);
-  if (rt.preparation && !rt.messageRowIds.includes(rt.preparation.coverageEndEntryId)) {
-    await stopPreparation($, rt, `stale:coverage ${rt.preparation.coverageEndEntryId} compacted away`);
+  // Native just summarized this history: any in-flight snapshot predates
+  // that summary, even when its coverage row survives in the kept tail.
+  // Publishing it later would displace the native summary at the next
+  // compaction with older, partial state, so it is always cancelled.
+  if (rt.preparation) {
+    await stopPreparation($, rt, "stale:native compaction replaced history");
   }
+  // The pre-compaction token figures describe history that is gone.
+  rt.tokenEstimate = null;
+  rt.lastTokens = null;
   // Native summarized what the checkpoint covered: prepare afresh.
   rt.state.discardPublished();
   rt.state.rearm();
@@ -356,7 +372,7 @@ function askViaAgents($: EngineInterface, rt: Runtime, control: PreparationContr
  * the rest. Each Pi role reads the snapshot through the worker's tools;
  * a Claude role reads the evidence file.
  */
-async function prepareWithPi($: EngineInterface, rt: Runtime, snapshot: EvidenceArchive, control: PreparationControl) {
+async function prepareWithPi($: EngineInterface, rt: Runtime, snapshot: EvidenceArchive, control: PreparationControl, capture: (draft: CheckpointDraft) => void) {
   const dir = control.directory;
   const evidencePath = `${dir}/pi-evidence.json`;
   await writePiEvidence($, evidencePath, snapshot);
@@ -373,7 +389,7 @@ async function prepareWithPi($: EngineInterface, rt: Runtime, snapshot: Evidence
   return prepareCheckpoint(controlledAsk($, control, ask), snapshot, access, {
     builder: rt.config.builderModel,
     verifier: rt.config.verifierModel,
-  }, coverage => { noteDraft($, rt, control, coverage); });
+  }, capture);
 }
 
 /** Claude-only preparation: private agents, then inline `model.complete`. */
@@ -383,6 +399,7 @@ async function prepareWithClaude(
   snapshot: EvidenceArchive,
   notes: string[],
   control: PreparationControl,
+  capture: (draft: CheckpointDraft) => void,
 ): Promise<{ prepared: Awaited<ReturnType<typeof prepareCheckpoint>>; backend: string }> {
   const models = { builder: rt.config.builderModel, verifier: rt.config.verifierModel };
   // Side agents read the paged evidence file; when agents are
@@ -390,15 +407,42 @@ async function prepareWithClaude(
   control.remaining(await $.clock.now());
   const access = await evidenceAccess($, rt, snapshot, control);
   try {
-    return { prepared: await prepareCheckpoint(controlledAsk($, control, askViaAgents($, rt, control)), snapshot, access, models, coverage => { noteDraft($, rt, control, coverage); }), backend: "claude-agents" };
+    return { prepared: await prepareCheckpoint(controlledAsk($, control, askViaAgents($, rt, control)), snapshot, access, models, capture), backend: "claude-agents" };
   } catch (error) {
     if (error instanceof PreparationCancelled) throw error;
     notes.push(`agents:${oneLine(error)}`);
     rt.lastFallback = notes.join(" then ");
   }
   return {
-    prepared: await prepareCheckpoint(controlledAsk($, control, askViaComplete($)), snapshot, inlineEvidence(snapshot), models, coverage => { noteDraft($, rt, control, coverage); }),
+    prepared: await prepareCheckpoint(controlledAsk($, control, askViaComplete($)), snapshot, inlineEvidence(snapshot), models, capture),
     backend: "claude-complete",
+  };
+}
+
+/**
+ * Claude verification of a draft another backend already built: the
+ * builder is never re-run, so a verifier-only failure costs one role.
+ */
+async function verifyWithClaude(
+  $: EngineInterface,
+  rt: Runtime,
+  snapshot: EvidenceArchive,
+  notes: string[],
+  control: PreparationControl,
+  draft: CheckpointDraft,
+): Promise<{ prepared: Awaited<ReturnType<typeof prepareCheckpoint>>; backend: string }> {
+  control.remaining(await $.clock.now());
+  const access = await evidenceAccess($, rt, snapshot, control);
+  try {
+    return { prepared: await verifyDraft(controlledAsk($, control, askViaAgents($, rt, control)), snapshot, access, rt.config.verifierModel, draft), backend: "claude-verify" };
+  } catch (error) {
+    if (error instanceof PreparationCancelled) throw error;
+    notes.push(`agents:${oneLine(error)}`);
+    rt.lastFallback = notes.join(" then ");
+  }
+  return {
+    prepared: await verifyDraft(controlledAsk($, control, askViaComplete($)), snapshot, inlineEvidence(snapshot), rt.config.verifierModel, draft),
+    backend: "claude-verify-complete",
   };
 }
 
@@ -442,23 +486,41 @@ async function runPreparation($: EngineInterface, rt: Runtime, manual: boolean):
     await trace($, rt, "prepare-start", { generation, directory, rows: snapshot.size, coverage, deadline: control.deadline });
     let prepared: Awaited<ReturnType<typeof prepareCheckpoint>> | undefined;
     let backend = "";
+    // A draft any backend built, kept so a verifier-only failure never
+    // pays for the builder again on the fallback backend.
+    let draft: CheckpointDraft | undefined;
+    const capture = (built: CheckpointDraft) => {
+      draft = built;
+      noteDraft($, rt, control, built.coverageEndEntryId);
+    };
     if (usesPi(rt.config)) {
       if (rt.piStatus.startsWith("failed")) {
         notes.push(`pi-unavailable:${rt.piStatus.slice("failed:".length)}`);
       } else {
         try {
-          prepared = await control.race(prepareWithPi($, rt, snapshot, control));
+          prepared = await control.race(prepareWithPi($, rt, snapshot, control, capture));
           backend = rt.config.builderBackend === rt.config.verifierBackend ? "pi" : "mixed";
         } catch (error) {
           if (error instanceof PreparationCancelled) throw error;
-          // Any Pi-involving failure redoes the whole preparation on Claude.
           if (error instanceof PiWorkerUnavailable) rt.piStatus = `failed:${oneLine(error)}`;
           notes.push(`pi:${oneLine(error)}`);
         }
       }
       if (notes.length > 0) rt.lastFallback = notes.join(" then ");
     }
-    if (!prepared) ({ prepared, backend } = await control.race(prepareWithClaude($, rt, snapshot, notes, control)));
+    if (!prepared && draft) {
+      // Only the verifier is redone, on Claude, against the kept draft.
+      ({ prepared, backend } = await control.race(verifyWithClaude($, rt, snapshot, notes, control, draft)));
+      backend = `pi-draft+${backend}`;
+    } else if (!prepared) {
+      // A full redo needs a meaningful share of the deadline left; one
+      // started with seconds to spare only burns agents before failing.
+      const remainingMs = control.deadline - (await $.clock.now());
+      if (usesPi(rt.config) && remainingMs < rt.config.prepareTimeoutSeconds * 250) {
+        throw new Error(`insufficient preparation time for a full redo (${Math.max(0, Math.round(remainingMs / 1000))}s left)`);
+      }
+      ({ prepared, backend } = await control.race(prepareWithClaude($, rt, snapshot, notes, control, capture)));
+    }
     control.remaining(await $.clock.now());
     rt.lastPrepare = `${backend} ${Math.round(performance.now() - started)}ms`;
     const checkpoint: PublishedCheckpoint = {
@@ -574,8 +636,9 @@ async function waitForPreparation(
   $: EngineInterface,
   rt: Runtime,
   next: { signal?: AbortSignal; budget?: { remainingMs: number } },
+  waitSeconds: number = rt.config.compactWaitSeconds,
 ): Promise<WaitOutcome> {
-  const deadline = (await $.clock.now()) + rt.config.compactWaitSeconds * 1000;
+  const deadline = (await $.clock.now()) + waitSeconds * 1000;
   while (rt.state.preparing) {
     if (next.signal?.aborted) return "interrupted";
     if (next.budget && next.budget.remainingMs < COMPACT_BUDGET_RESERVE_MS) return "budget";
@@ -767,14 +830,36 @@ export const register: Register = (on, options) => {
       const rows = await ensureSession($, rt);
       // A replayed uuid is already archived and indexed.
       const added = rows.addAppend(result.uuid, e.door, result.message, e.origin.kind);
-      if (added && isTranscriptRow(result.message)) {
-        rt.transcript.knownIds.add(result.uuid);
-        const isCheckpointRow =
-          rt.awaitingCompactionRow && rows.rows[rows.size - 1]!.text.startsWith(CHECKPOINT_HEADING);
-        if (e.door === "compaction" || isCheckpointRow) {
-          if (noteCompactionRow(rt, result.uuid)) await stopPreparation($, rt, "stale:unobserved compaction replaced history");
+      if (added) {
+        // Grow the context estimate with every kept row, so a single
+        // long turn crossing the threshold between measures still
+        // starts background preparation before compaction.
+        rt.tokenEstimate = (rt.tokenEstimate ?? 0) + estimateTokens(rows.rows[rows.size - 1]!.text);
+        if (isTranscriptRow(result.message)) {
+          rt.transcript.knownIds.add(result.uuid);
+          const isCheckpointRow =
+            rt.awaitingCompactionRow && rows.rows[rows.size - 1]!.text.startsWith(CHECKPOINT_HEADING);
+          if (e.door === "compaction" || isCheckpointRow) {
+            if (noteCompactionRow(rt, result.uuid)) {
+              // History was replaced; the pre-compaction estimate is void.
+              rt.tokenEstimate = null;
+              await stopPreparation($, rt, "stale:unobserved compaction replaced history");
+            }
+          }
+          else rt.messageRowIds.push(result.uuid);
         }
-        else rt.messageRowIds.push(result.uuid);
+        const estimate = rt.tokenEstimate;
+        if (
+          !rt.state.preparing &&
+          estimate !== null &&
+          estimate >= rt.config.prepareThresholdTokens
+        ) {
+          if (rt.idleCheckpoint) {
+            rt.idleCheckpoint = false;
+            rt.state.rearm();
+          }
+          void runPreparation($, rt, false);
+        }
       }
     }
     return result;
@@ -808,6 +893,8 @@ export const register: Register = (on, options) => {
     const tokens = e.context.tokens;
     if (typeof tokens === "number" && Number.isFinite(tokens)) {
       rt.lastTokens = tokens;
+      // Exact figure replaces the append-grown estimate.
+      rt.tokenEstimate = tokens;
       if (rt.state.phase === "installed" && tokens < rt.config.prepareThresholdTokens) {
         rt.state.rearm();
       }
@@ -855,16 +942,32 @@ export const register: Register = (on, options) => {
     };
     if (rt.config.manualCompactMode === "native" && e.trigger === "manual") return native("manual-mode");
     let plan = planInstall(rt, e.messages);
+    // A transcript whose handles mostly resolve to nothing (e.g. the
+    // runtime restarted mid-session) cannot be checkpointed from the
+    // few archived rows: no just-in-time attempt, no wait.
+    const unknownCount = rt.messageRowIds.filter(id => id.startsWith("unknown-")).length;
+    if ("reason" in plan && rt.messageRowIds.length > 0 && unknownCount * 2 > rt.messageRowIds.length) {
+      plan = { reason: "history-unproven" };
+    }
     // Checkpoint-first: a checkpoint still preparing is not a failed one.
     // Hold this compaction for it (or for one just-in-time attempt when
     // none is running) instead of letting native win the race.
     if ("reason" in plan && plan.reason !== "history-unproven" && plan.reason !== "coverage-ambiguous" && rt.config.compactWaitSeconds > 0) {
       firstReason = plan.reason;
-      if (!rt.state.preparing) void runPreparation($, rt, false);
+      const wasPreparing = rt.state.preparing;
+      if (!wasPreparing) void runPreparation($, rt, false);
       if (rt.state.preparing) {
         const started = await $.clock.now();
-        await trace($, rt, "compact-wait-start", { trigger: e.trigger, reason: firstReason, seconds: rt.config.compactWaitSeconds });
-        const outcome = await waitForPreparation($, rt, next);
+        // An attempt this compaction itself started is waited out to
+        // its preparation deadline (bounded by prepareTimeoutSeconds):
+        // abandoning it at compactWaitSeconds would waste the hold.
+        // A background preparation that had its head start keeps the
+        // configured compactWaitSeconds bound.
+        const waitSeconds = wasPreparing || !rt.preparation
+          ? rt.config.compactWaitSeconds
+          : Math.max(rt.config.compactWaitSeconds, Math.ceil((rt.preparation.deadline - started) / 1000));
+        await trace($, rt, "compact-wait-start", { trigger: e.trigger, reason: firstReason, seconds: waitSeconds });
+        const outcome = await waitForPreparation($, rt, next, waitSeconds);
         waited = ` waited=${Math.round(((await $.clock.now()) - started) / 1000)}s:${outcome}`;
         await trace($, rt, "compact-wait-end", { outcome, waited });
         if (outcome === "interrupted") {
@@ -943,6 +1046,7 @@ export const register: Register = (on, options) => {
     rt.autoCompactWindow = null;
     rt.idleCompact = null;
     rt.lastTokens = null;
+    rt.tokenEstimate = null;
     rt.idleCheckpoint = false;
     rt.piStatus = usesPi(rt.config) ? "unchecked" : "off";
     rt.piStats = emptyPiStats();

@@ -988,16 +988,48 @@ describe("compaction install", () => {
 });
 
 describe("checkpoint-first compaction gate", () => {
-  test("a preparation remains useful when native keeps its coverage, without a summary append", async () => {
+  test("native compaction cancels in-flight preparation even when native keeps its coverage row", async () => {
     const h = await preparingHost(1000, { compactWaitSeconds: 0 });
     const kept = transcript(turns.slice(2));
     await h.compact(transcript(), "auto", [message("user", longText("native summary")), ...kept]);
-    expect(h.stoppedAgents.length).toBe(0);
+    // Coverage a2 survives in the kept tail, but the snapshot predates the
+    // native summary: publishing it would displace that summary later.
+    expect(h.stoppedAgents).toEqual(["agent-1"]);
     await h.deliverLate();
     await h.deliverLate();
-    expect(await h.status()).toContain("phase=ready");
+    expect(await h.status()).toContain("checkpoint=none");
     const again = await h.compact([message("user", longText("native summary"), { handle: "cloned-summary" }), ...kept]);
-    expect(again.coreCalls).toBe(0);
+    expect(again.coreCalls).toBe(1);
+  });
+
+  test("appends crossing the threshold start preparation mid-turn, without a measure", async () => {
+    const h = host({ prepareThresholdTokens: 500 }, undefined, { agentReply: covering("a2"), agentDelaySleeps: 1000 });
+    for (const [id, role, text] of turns) await h.append(id, role, text);
+    // No measure() call: the append stream itself crossed the estimate.
+    expect(h.spawns).toBe(1);
+    expect(await h.status()).toContain("phase=preparing");
+  });
+
+  test("a just-in-time attempt started by the compaction is waited out to its preparation deadline", async () => {
+    const h = host({ recentTurns: 1, compactWaitSeconds: 1 }, undefined, { agentReply: covering("a2"), agentDelaySleeps: 3 });
+    for (const [id, role, text] of turns) await h.append(id, role, text);
+    expect(h.spawns).toBe(0);
+    const { result, coreCalls } = await h.compact(transcript());
+    expect(coreCalls).toBe(0);
+    expect(result.messages?.[0]?.text).toContain("Covers the session through entry a2");
+    expect(h.sleeps).toBeGreaterThan(1);
+    expect(await h.status()).toContain(":done");
+  });
+
+  test("a mostly-unknown transcript gets no just-in-time preparation and no wait", async () => {
+    const h = host({ recentTurns: 1 }, undefined, { agentReply: covering("a2"), agentDelaySleeps: 2 });
+    for (const [id, role, text] of turns) await h.append(id, role, text);
+    const live = transcript().map((row, index) => ({ ...row, handle: `bogus-${index}` }));
+    const { coreCalls } = await h.compact(live);
+    expect(coreCalls).toBe(1);
+    expect(h.spawns).toBe(0);
+    expect(h.sleeps).toBe(0);
+    expect(await h.status()).toContain("native:history-unproven");
   });
   test("one preparation deadline stops agents and prevents later verifier or fallback calls", async () => {
     const h = await preparingHost(1_000, { prepareTimeoutSeconds: 2, compactWaitSeconds: 10 });
@@ -1052,7 +1084,7 @@ describe("checkpoint-first compaction gate", () => {
     await h.deliverLate();
     const status = await h.status();
     expect(status).toContain("checkpoint=none");
-    expect(status).toContain("stale:coverage a3 compacted away");
+    expect(status).toContain("stale:native compaction replaced history");
   });
 
   test("with nothing preparing, the compaction starts one just-in-time attempt", async () => {
@@ -1205,6 +1237,23 @@ describe("pi backend", () => {
     expect(status).toContain("pi=unchecked");
   });
 
+  test("a failed Pi verifier reuses the Pi builder draft with only the Claude verifier", async () => {
+    const verifierDown: PiWorker = (request) =>
+      request.role === "builder"
+        ? piCovering("a2")(request)
+        : { nonce: request.nonce, ok: false, error: "submit_verdict rejected 3 times: Checkpoint must be a JSON object", usage, durationMs: 5 };
+    const h = host({ ...PI_BOTH, recentTurns: 1 }, covering("a2"), { piWorker: verifierDown, agentReply: covering("a2") });
+    await fill(h);
+    // Two Pi runs (builder + failed verifier), then ONE Claude spawn: the verifier only.
+    expect(h.piRuns.map((run) => run.role)).toEqual(["builder", "verifier"]);
+    expect(h.spawns).toBe(1);
+    const status = await h.status();
+    expect(status).toContain("checkpoint=shadow-");
+    expect(status).toContain("pi:pi verifier");
+    const { coreCalls } = await h.compact(transcript());
+    expect(coreCalls).toBe(0);
+  });
+
   test("an unusable Pi verdict also falls back to Claude", async () => {
     const unusable: PiWorker = (request) =>
       request.role === "builder"
@@ -1286,7 +1335,7 @@ describe("engine integration", () => {
     expect(result.text).toContain("verifier=claude:haiku");
     expect(result.text).toContain("lastFallback=none");
     expect(result.text).toContain("lastCompact=unseen");
-    expect(result.text).toContain("v0.4.6");
+    expect(result.text).toContain("v0.4.7");
   });
 
   test("compact with no checkpoint defers without inventing messages", async ($, on) => {

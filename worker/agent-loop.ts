@@ -195,12 +195,12 @@ export const SUBMIT_CHECKPOINT_TOOL: Tool = {
 
 export const SUBMIT_VERDICT_TOOL: Tool = {
   name: "submit_verdict",
-  description: "Accept the draft, repair it with a complete corrected checkpoint, or reject it as unusable.",
+  description: "Accept the draft, repair it with a complete corrected checkpoint, or reject it as unusable. For repair, checkpoint must be the complete corrected checkpoint as an object (not a JSON string) and coverageEndEntryId must name its boundary; for accept or unusable, omit checkpoint.",
   parameters: params({
     type: "object",
     properties: {
       verdict: { type: "string", enum: ["accept", "repair", "unusable"] },
-      checkpoint: { ...CHECKPOINT_SCHEMA, description: "Complete corrected checkpoint (required for repair)" },
+      checkpoint: { ...CHECKPOINT_SCHEMA, description: "Complete corrected checkpoint as an object, not JSON text (required for repair; omit for accept/unusable)" },
       coverageEndEntryId: { type: "string", description: "Coverage boundary (required for repair)" },
       reason: { type: "string", description: "One sentence on what was wrong or confirmed" },
     },
@@ -433,19 +433,57 @@ function chars(message: Message): number {
 
 type Outcome = { done: true; answer: string } | { done: false; text: string; isError: boolean };
 
+/**
+ * Decodes a checkpoint argument some providers encode as JSON text —
+ * repeatedly, and unwrapping a lone `{checkpoint: …}` envelope. Anything
+ * else is returned as-is; the exact same strict validation follows.
+ */
+export function decodeCheckpointArg(value: unknown): unknown {
+  let current = value;
+  for (let depth = 0; depth < 3 && typeof current === "string"; depth += 1) {
+    try {
+      current = JSON.parse(current) as unknown;
+    } catch {
+      break;
+    }
+  }
+  if (current && typeof current === "object" && !Array.isArray(current)) {
+    const keys = Object.keys(current as Record<string, unknown>);
+    if (keys.length === 1 && keys[0] === "checkpoint") {
+      return decodeCheckpointArg((current as Record<string, unknown>).checkpoint);
+    }
+  }
+  return current;
+}
+
+/** Shape of a checkpoint argument for diagnostics: type only, never content. */
+export function describeCheckpointArg(value: unknown): string {
+  if (value === undefined) return "missing";
+  if (value === null) return "null";
+  if (Array.isArray(value)) return `array(len=${value.length})`;
+  if (typeof value === "string") return `string(len=${value.length})`;
+  if (typeof value === "object") return `object(keys=${Object.keys(value as Record<string, unknown>).length})`;
+  return typeof value;
+}
+
+function isCheckpointObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
 /** Checks one submit call; a rejection goes back to the agent to fix. */
 function submit(
   role: CheckpointRole,
   inspection: Inspection,
   args: Record<string, unknown>,
 ): Outcome {
-  // Some providers encode a nested object as JSON text. Decode that transport
-  // representation once; the exact same strict schema/citation checks follow.
-  if (typeof args.checkpoint === "string") {
-    args = { ...args, checkpoint: JSON.parse(args.checkpoint) as unknown };
+  if ("checkpoint" in args) {
+    args = { ...args, checkpoint: decodeCheckpointArg(args.checkpoint) };
   }
   const archive = inspection.archive;
   if (role === "builder") {
+    if (!isCheckpointObject(args.checkpoint)) {
+      throw new Error(`checkpoint must be an object (got ${describeCheckpointArg(args.checkpoint)}); pass the checkpoint as an object argument, not text`);
+    }
     inspection.requireCompletion();
     inspection.requireCoverage(args.coverageEndEntryId);
     const answer = JSON.stringify({ checkpoint: args.checkpoint, coverageEndEntryId: args.coverageEndEntryId });
@@ -461,6 +499,18 @@ function submit(
     return { done: true, answer: JSON.stringify({ verdict: args.verdict, reason }) };
   }
   if (args.verdict === "repair") {
+    if (!isCheckpointObject(args.checkpoint)) {
+      throw new Error(
+        `repair requires checkpoint as an object (got ${describeCheckpointArg(args.checkpoint)}); ` +
+        "pass the complete corrected checkpoint as an object argument, or use verdict accept if the draft is correct",
+      );
+    }
+    if (typeof args.coverageEndEntryId !== "string" || args.coverageEndEntryId === "") {
+      throw new Error(
+        `repair requires coverageEndEntryId as a string (got ${describeCheckpointArg(args.coverageEndEntryId)}); ` +
+        "name the last covered session row, or use verdict accept if the draft is correct",
+      );
+    }
     inspection.requireCoverage(args.coverageEndEntryId);
     const repaired = JSON.stringify({ checkpoint: args.checkpoint, coverageEndEntryId: args.coverageEndEntryId });
     parseSubmission(repaired, archive, inspection.servedRefs);

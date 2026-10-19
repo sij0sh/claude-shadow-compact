@@ -218,6 +218,10 @@ function parseVerdict(
   if (parsed.verdict === "accept") return { verdict: "accept", reason };
   if (parsed.verdict === "unusable") return { verdict: "unusable", reason };
   if (parsed.verdict === "repair") {
+    if (!parsed.checkpoint || typeof parsed.checkpoint !== "object" || Array.isArray(parsed.checkpoint)) {
+      const got = parsed.checkpoint === undefined ? "missing" : Array.isArray(parsed.checkpoint) ? "array" : typeof parsed.checkpoint;
+      throw new Error(`repair verdict requires a complete checkpoint object (got ${got}); omit checkpoint only for accept or unusable`);
+    }
     const repaired = parseSubmission(
       JSON.stringify({
         checkpoint: parsed.checkpoint,
@@ -265,27 +269,38 @@ export async function runVerifier(
   throw new Error(`Checkpoint verifier failed validation: ${lastError?.message ?? "no answer"}`);
 }
 
+/** A builder draft awaiting independent verification. */
+export interface CheckpointDraft {
+  checkpoint: Checkpoint;
+  coverageEndEntryId: string;
+}
+
+/** Verifies an existing draft and renders it; the builder is not re-run. */
+export async function verifyDraft(
+  ask: AskFn,
+  archive: EvidenceArchive,
+  evidenceAccess: EvidenceAccess,
+  verifierModel: string,
+  draft: CheckpointDraft,
+): Promise<PreparedCheckpoint> {
+  const verified = await runVerifier(ask, archive, draft, accessFor(evidenceAccess, "verifier"), verifierModel);
+  return {
+    structured: verified.checkpoint,
+    rendered: renderCheckpoint(verified.checkpoint, verified.coverageEndEntryId),
+    coverageEndEntryId: verified.coverageEndEntryId,
+  };
+}
+
 /** Full preparation: build, independently verify, render. */
 export async function prepareCheckpoint(
   ask: AskFn,
   archive: EvidenceArchive,
   evidenceAccess: EvidenceAccess,
   models: { builder: string; verifier: string },
-  onDraft?: (coverageEndEntryId: string) => void,
+  onDraft?: (draft: CheckpointDraft) => void,
 ): Promise<PreparedCheckpoint> {
   const draft = await runBuilder(ask, archive, accessFor(evidenceAccess, "builder"), models.builder);
-  onDraft?.(draft.coverageEndEntryId);
-  const verified = await runVerifier(
-    ask,
-    archive,
-    draft,
-    accessFor(evidenceAccess, "verifier"),
-    models.verifier,
-  );
-  return {
-    structured: verified.checkpoint,
-    rendered: renderCheckpoint(verified.checkpoint, verified.coverageEndEntryId),
-    coverageEndEntryId: verified.coverageEndEntryId,
-  };
+  onDraft?.(draft);
+  return verifyDraft(ask, archive, evidenceAccess, models.verifier, draft);
 }
 

@@ -221,6 +221,42 @@ describe("pi worker agent loop", () => {
     );
   });
 
+  test("a verifier repair with a double-encoded checkpoint string is decoded", async () => {
+    const repair = respond([["submit_verdict", {
+      verdict: "repair",
+      checkpoint: JSON.stringify(JSON.stringify(checkpoint("E0004"))),
+      coverageEndEntryId: "a3",
+      reason: "fixed",
+    }]]);
+    const { complete } = script(readAll, repair);
+    const result = await runCheckpointAgent({ role: "verifier", model: MODEL, system: "sys", prompt: "go", archive: archive(), complete, signal });
+    const answer = JSON.parse(result.answer);
+    assert.equal(answer.verdict, "repair");
+    assert.equal(typeof answer.checkpoint, "object");
+    assert.equal(answer.coverageEndEntryId, "a3");
+  });
+
+  test("a verifier repair without a checkpoint gets a shape-specific rejection, then can accept", async () => {
+    const badRepair = respond([["submit_verdict", { verdict: "repair", coverageEndEntryId: "a3", reason: "fixed" }]]);
+    const { complete, contexts } = script(
+      readAll,
+      badRepair,
+      respond([["submit_verdict", { verdict: "accept", reason: "draft is fine" }]]),
+    );
+    const result = await runCheckpointAgent({ role: "verifier", model: MODEL, system: "sys", prompt: "go", archive: archive(), complete, signal });
+    assert.match(lastToolText(contexts[2]!), /repair requires checkpoint as an object \(got missing\)/);
+    assert.deepEqual(JSON.parse(result.answer), { verdict: "accept", reason: "draft is fine" });
+  });
+
+  test("three checkpoint-less repairs fail naming the rejected argument shape", async () => {
+    const badRepair = respond([["submit_verdict", { verdict: "repair", coverageEndEntryId: "a3", reason: "fixed" }]]);
+    const { complete } = script(readAll, badRepair, badRepair, badRepair);
+    await assert.rejects(
+      runCheckpointAgent({ role: "verifier", model: MODEL, system: "sys", prompt: "go", archive: archive(), complete, signal }),
+      (error: unknown) => error instanceof AgentError && /rejected 3 times/.test(error.message) && /got missing/.test(error.message),
+    );
+  });
+
   test("the verifier must read before its verdict; unusable passes back to Shadow", async () => {
     const unusable = respond([["submit_verdict", { verdict: "unusable", reason: "no evidence" }]]);
     const { complete, contexts } = script(unusable, respond([["read_rows", { start: 0, count: 6 }]]), unusable);

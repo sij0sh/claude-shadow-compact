@@ -133,21 +133,30 @@ no/unproven checkpoint ──► next(e): Claude native compaction (fail closed)
   finishes after a compaction removed its covered row is discarded
   instead of published. `lastCompact` records the wait, e.g.
   `waited=48s:done`. Set `compactWaitSeconds` to `0` for the old
-  immediate native fallback.
+  immediate native fallback. A just-in-time attempt started by the
+  compaction itself is waited out to its preparation deadline instead;
+  a transcript whose handles mostly resolve to nothing (for example
+  after a mid-session runtime restart) gets no just-in-time attempt.
 - **Preparation deadline.** `prepareTimeoutSeconds` (360 by default,
   at most 600) is one deadline across both roles, retries, and every
-  backend fallback. Native compaction cancels preparation when its covered
-  row is removed: Pi aborts its provider request through a cancellation
-  marker; owned Claude agents receive `TaskStop`. An already-running
-  `model.complete` call has no explicit abort API, but its late answer is
-  ignored and no further calls start. The compaction hold remains separately
-  bounded by `compactWaitSeconds`.
+  backend fallback. Native compaction always cancels in-flight
+  preparation, even when the covered row survives in its kept tail:
+  the snapshot predates the native summary, so publishing it would
+  displace that summary at the next compaction. Pi aborts its provider
+  request through a cancellation marker; owned Claude agents receive
+  `TaskStop`. An already-running `model.complete` call has no explicit
+  abort API, but its late answer is ignored and no further calls start.
+  The compaction hold remains separately bounded by `compactWaitSeconds`
+  for preparations that were already running.
 - **Install confirmation.** Returning the checkpoint is an attempt, not
   an install. It counts once canonical history (`$.session.messages()`)
   opens with that checkpoint's coverage line; `/shadow-status` shows
   `phase=installing` until then and `lastCompact` records every decision.
 - **Thresholds.** Background checkpoint preparation starts at 150,000
-  context tokens (absolute, independent of the context window). On each
+  context tokens (absolute, independent of the context window). The
+  estimate is exact at each `session.measure` and grows with every
+  appended row in between, so one long turn can cross the threshold
+  mid-turn. On each
   model's first session Shadow sets Claude Code's auto-compact window to
   190,000 through `/autocompact` (it applies at once and is saved under
   `modelSettings` in your user settings). The observed Opus compaction
@@ -215,7 +224,7 @@ Set via the plugin's `userConfig` (Claude Code `/config` or
 | `configureIdleCompaction` | `true` | Lower Claude Code's idle-compaction floor and prepare at a completed turn above it |
 | `idleCompactMinTokens` | `100000` | Idle-compaction floor; values under 100,000 use 100,000 |
 | `recentTurns` | `10` | Minimum recent rounds kept verbatim (prompt + reply, or assistant response + its tool results) |
-| `compactWaitSeconds` | `120` | How long a compaction waits for a preparing checkpoint before native fallback; `0` never waits, at most `600` |
+| `compactWaitSeconds` | `120` | How long a compaction waits for an already-preparing checkpoint before native fallback; a just-in-time attempt started by that compaction is waited out to its preparation deadline; `0` never waits, at most `600` |
 | `prepareTimeoutSeconds` | `360` | Overall preparation deadline across roles, retries and backend fallbacks; positive integer, at most `600` |
 | `builderModel` / `verifierModel` | `haiku` | Checkpoint agent models; `inherit` uses the session model |
 | `manualCompactMode` | `shadow` | `shadow` or `native` for manual `/compact` |
@@ -262,8 +271,11 @@ How it runs:
   validates the answer exactly as it does a Claude agent's.
 - At session start Shadow runs a check that confirms each model exists and
   has credentials. This check makes no inference call.
-- **Fallback:** if Pi fails at any point, Shadow redoes the whole
-  preparation with the Claude models. Pi failures include a bad check, a worker crash, a provider error,
+- **Fallback:** if Pi fails after its builder produced a draft, Shadow
+  keeps that draft and redoes only the verifier with the Claude models.
+  A failure before any draft redoes the whole preparation with the
+  Claude models, and only while at least a quarter of the preparation
+  deadline remains. Pi failures include a bad check, a worker crash, a provider error,
   a rejected answer, or an `unusable` verdict. A worker that cannot run or
   start is not launched again that session.
 
@@ -286,7 +298,7 @@ claude plugin marketplace update claude-shadow-compact
 claude plugin update shadow-compact@claude-shadow-compact
 ```
 
-`/shadow-status` shows the running version (`v0.4.6`).
+`/shadow-status` shows the running version (`v0.4.7`).
 
 ## Deferred from the Pi version
 
