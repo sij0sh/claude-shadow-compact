@@ -1,6 +1,6 @@
 {
   "name": "claude-shadow-compact",
-  "version": "0.4.12",
+  "version": "0.4.13",
   "private": true,
   "type": "module",
   "description": "Verified Claude checkpoints with automatic compaction and exact recent-tail preservation.",

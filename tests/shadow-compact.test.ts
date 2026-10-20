@@ -7,7 +7,7 @@ import {
 } from "../hooks/checkpoint.js";
 import { decideAutoCompactWindow, decideIdleCompaction, isAtOrAbove, resolveConfig, ROLE_TIMEOUT_MS, RECENT_ROUNDS, type WindowFacts } from "../hooks/config.js";
 import { EvidenceArchive, isPersonPrompt, isCoverageRow, evidenceSignals } from "../hooks/evidence.js";
-import { evidencePacket, preparationSnapshot, curatorPacket, packetTokens } from "../hooks/evidence-packet.js";
+import { evidencePacket, packetTokens } from "../hooks/evidence-packet.js";
 import { redactSecretValue, sanitizeForContext } from "../hooks/normalize.js";
 import { BUILDER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT, prepareCheckpoint, parseSubmission, emptyPreparationMetrics, type AskFn } from "../hooks/prepare.js";
 import type { ClaudeRunRequest } from "../hooks/claude-protocol.js";
@@ -327,18 +327,32 @@ describe("checkpoint integrity", () => {
     expect(() => parseSubmission(submission(), archive)).toThrow("absent from the evidence snapshot");
   });
 
-  test("render size is checked before independent verification", async () => {
+  test("large valid checkpoints reach verification once without size rejection or regeneration", async () => {
     const metrics = emptyPreparationMetrics();
-    const oversized = { ...checkpointJson("E0001"), currentState: Array.from({ length: 10 }, () => ({ text: "context ".repeat(950), evidenceRefs: ["E0001"] })) };
-    await expect(prepareCheckpoint(async () => submission(oversized), lowArchive(), "haiku", undefined, { metrics })).rejects.toThrow(/output budget|Rendered checkpoint exceeds/);
-    expect(metrics.verifierCalls).toBe(0);
+    const refs = Array.from({ length: 40 }, (_, i) => `E${String(i + 1).padStart(4, "0")}`);
+    const archive = archiveWith(refs.map((_, i) => [`r${i + 1}`, "user", "Source evidence ".repeat(500)]));
+    const long = "Grounded continuation detail ".repeat(350);
+    const large = { ...checkpointJson("E0001"),
+      currentState: Array.from({ length: 101 }, () => ({ text: long, evidenceRefs: refs })),
+      verificationState: Array.from({ length: 101 }, () => ({ text: long, status: "unverified", evidenceRefs: refs })),
+      continuationState: { currentGoal: long, currentApproach: long, immediateNextStep: long } };
+    const prepared = await prepareCheckpoint(async request => {
+      if (request.role === "builder") return submission(large, "r40");
+      expect(request.prompt).toContain('"entryId":"r40"');
+      return " ".repeat(10_000) + '{"pass":true,"issues":[]}';
+    }, archive, "haiku", undefined, { metrics });
+    expect(prepared.rendered.length).toBeGreaterThan(64_000);
+    expect(metrics.builderCalls).toBe(1);
+    expect(metrics.verifierCalls).toBe(1);
+    expect(metrics.builderInputTokens).toBeGreaterThan(24_000);
+    expect(metrics.verifierInputTokens).toBeGreaterThan(12_000);
   });
 
   test("previous obligations and the whole new user instruction reach both source packets", () => {
     const archive = archiveWith([["r1", "user", "Keep the audit trail"], ["r2", "assistant", "Working on the compact hook"]]);
     archive.setPreviousCheckpoint("The audit trail must be retained", "r1");
     archive.add({ id: "r3", evidenceId: "", role: "user", door: "prompt", text: "Also preserve the latest explicit correction", toolNames: [], hasToolResult: false, isError: false });
-    const packet = evidencePacket(archive, 4000);
+    const packet = evidencePacket(archive);
     expect(packet.text).toContain("The audit trail must be retained");
     expect(packet.text).toContain("Also preserve the latest explicit correction");
     expect(packet.refs.has("E0000")).toBe(true);
@@ -609,8 +623,8 @@ async function readyHost(coverage = "a18", options = {}, fakes: HostFakes = {}) 
 }
 
 describe("three configuration preferences", () => {
-  test("defaults are 160k, haiku, high and both roles share the preferences", async () => {
-    expect(resolveConfig({})).toEqual({ prepareThresholdTokens: 160_000, checkpointModel: "haiku", checkpointEffort: "high" });
+  test("defaults are 160k, haiku, medium and both roles share the preferences", async () => {
+    expect(resolveConfig({})).toEqual({ prepareThresholdTokens: 160_000, checkpointModel: "haiku", checkpointEffort: "medium" });
     const h = await readyHost("a18", { checkpointModel: "sonnet", checkpointEffort: "max" });
     expect(h.claudeRuns.map(run => [run.role, run.model, run.effort])).toEqual([["builder", "sonnet", "max"], ["verifier", "sonnet", "max"]]);
   });
@@ -626,7 +640,7 @@ describe("three configuration preferences", () => {
       expect(resolveConfig({ prepareThresholdTokens: invalid }).prepareThresholdTokens).toBe(160_000);
     }
     expect(resolveConfig({ prepareThresholdTokens: "180000", checkpointEffort: "invalid", checkpointModel: " " }))
-      .toEqual({ prepareThresholdTokens: 180_000, checkpointModel: "haiku", checkpointEffort: "high" });
+      .toEqual({ prepareThresholdTokens: 180_000, checkpointModel: "haiku", checkpointEffort: "medium" });
     expect(isAtOrAbove({ tokens: 159_999, percent: 99 }, 160_000)).toBe(false);
     expect(isAtOrAbove({ tokens: 160_000 }, 160_000)).toBe(true);
     expect(isAtOrAbove({ percent: 100 }, 160_000)).toBe(false);
@@ -637,8 +651,8 @@ describe("three configuration preferences", () => {
     expect(h.commandNames).toEqual(["compact-native", "shadow-status"]);
     expect(h.commandHandlers).toEqual(["command.run:shadow-status", "command.run:compact-native"]);
     const status = await h.status();
-    expect(status).toContain("Shadow Compact v0.4.12 · idle");
-    expect(status).toContain("Model: haiku · effort: high · prepare: 160,000 tokens");
+    expect(status).toContain("Shadow Compact v0.4.13 · idle");
+    expect(status).toContain("Model: haiku · effort: medium · prepare: 160,000 tokens");
     expect(status.split("\n").length).toBe(6);
   });
 });
@@ -735,6 +749,28 @@ describe("checkpoint scheduling", () => {
 });
 
 describe("verified swap and recovery", () => {
+  test("a verified checkpoint that cannot save or fit context is not regenerated for size", async () => {
+    for (const [sourceRepeats, expectedReason] of [[80, "no-savings"], [3000, "replacement-budget-exceeded"]] as const) {
+      const rows: Array<[string, "user" | "assistant", string]> = turns.map(([id, role]) => [id, role, "source detail ".repeat(sourceRepeats)]);
+      const h = host({ prepareThresholdTokens: 1_000_000 }, undefined, { workerReply: request => {
+        if (request.system === VERIFIER_SYSTEM_PROMPT) return '{"pass":true,"issues":[]}';
+        return JSON.stringify({ checkpoint: { ...checkpointJson("E0001"),
+          currentState: [{ text: "checkpoint detail ".repeat(18_000), evidenceRefs: ["E0001"] }] }, coverageEndEntryId: "a20" });
+      } });
+      await fill(h, rows);
+      await h.measure(1_000_000);
+      // Large WebCrypto digests may finish on a later host event-loop turn.
+      for (let i = 0; i < 100 && !h.events().some(event => event.event === "prepare-verified"); i += 1) {
+        await new Promise(resolve => setTimeout(resolve, 5));
+        await h.settle();
+      }
+      expect(h.workerCalls).toBe(2);
+      expect(await h.status()).toContain("· ready");
+      expect((await h.compact(transcript(rows))).coreCalls).toBe(1);
+      expect(h.workerCalls).toBe(2);
+      expect(await h.status()).toContain(expectedReason);
+    }
+  });
   test("a ready checkpoint swaps immediately, keeps ten exact rounds, and makes no model call", async () => {
     const h = await readyHost();
     const live = transcript();
@@ -881,7 +917,7 @@ describe("Claude role transport", () => {
     expect(h.completeRequests.length).toBe(0);
     expect(await h.status()).toContain("checkpoint_rejected");
   });
-  test("large archives use bounded requests through the same transport", async () => {
+  test("large archives use complete requests through the same transport", async () => {
     const h = host({}, undefined, { workerReply: coveringManifest });
     await fill(h);
     for (let i = 0; i < 40; i++) await h.append(`large-${i}`, "assistant", "context ".repeat(700));
@@ -889,7 +925,7 @@ describe("Claude role transport", () => {
     expect(h.workerCalls).toBe(2);
     expect(h.completeRequests.length).toBe(0);
     expect(packetTokens(h.claudeRuns[0]!.prompt)).toBeGreaterThan(0);
-    expect(packetTokens(h.claudeRuns[0]!.prompt) <= 24_000).toBe(true);
+    expect(packetTokens(h.claudeRuns[0]!.prompt)).toBeGreaterThan(24_000);
     expect((await h.compact(h.messages())).coreCalls).toBe(0);
     expect(h.workerCalls).toBe(2);
   });
@@ -900,6 +936,17 @@ describe("Claude role transport", () => {
     expect((await h.compact(transcript())).coreCalls).toBe(1);
     expect(h.completeRequests.length).toBe(0);
     expect(await h.status()).toContain("worker_result_invalid");
+  });
+  test("a CLI token-limit error settles once without repeating the same generation", async () => {
+    const h = host({}, undefined, { workerReply: coveringManifest,
+      workerResult: request => ({ nonce: request.nonce, ok: false, code: "max_output_tokens",
+        error: "Claude CLI exited 1: max_output_tokens", retryable: false, durationMs: 1 }) });
+    await fill(h);
+    const result = await h.compact(transcript());
+    expect(result.coreCalls).toBe(1);
+    expect(h.workerCalls).toBe(1);
+    expect(h.events().filter(event => event.event === "role-retry").length).toBe(0);
+    expect(await h.status()).toContain("max_output_tokens");
   });
   test("role deadline expiry prevents a verifier from starting", async () => {
     const h = await readyHost("a18", {}, { workerRunTimeMs: 600_001 });
@@ -959,15 +1006,15 @@ describe("history reconciliation and fidelity", () => {
     expect(rows[0].text).toContain("task 1 detail");
     expect(rows[40].text).toContain("arrived during read");
   });
-  test("output projection preserves final errors with honest clipping metadata", () => {
+  test("source evidence retains full tool output and error provenance", () => {
     const archive = new EvidenceArchive("/repo");
     archive.addAppend("output", "tool-result", { type: "user", role: "user", content: [{ type: "tool_result", tool_use_id: "x", content: "Command: npm test\n" + "irrelevant log\n".repeat(800) + "\nFAIL tests/export.test.ts:42 expected 17 received 0", is_error: true }] });
     const row = archive.rows[0]!;
-    expect(row.text.length).toBe(4000);
+    expect(row.text.length).toBeGreaterThan(4000);
     expect(row.text).toContain("Command: npm test");
     expect(row.text).toContain("FAIL tests/export.test.ts:42 expected 17 received 0");
-    expect(row.text).toContain("characters omitted");
-    expect(row.textTruncated).toBe(true);
+    expect(row.text).not.toContain("characters omitted");
+    expect(row.textTruncated).toBe(false);
     expect(row.isError).toBe(true);
   });
   test("parallel tool calls and their results remain in the original exact tail", async () => {
@@ -1108,9 +1155,9 @@ describe("engine fixture integration", () => {
     on("session.start", (_$, e) => ({ cwd: e.cwd }));
     await $.session.start({ cwd: "/repo", surface: "terminal", isInteractive: true });
     const result = await $.command.run({ command: "shadow-status", args: "", origin: { kind: "composer" }, presentation: { isFullscreen: false, columns: 80 } });
-    expect(result.text).toContain("Shadow Compact v0.4.12");
+    expect(result.text).toContain("Shadow Compact v0.4.13");
     expect(result.text).toContain("prepare: 160,000 tokens");
-    expect(result.text).toContain("Model: haiku · effort: high");
+    expect(result.text).toContain("Model: haiku · effort: medium");
   });
   test("an unsafe tiny compaction cannot invent a checkpoint", async ($, on) => {
     on("session.compact", (_$, e) => ({ messages: e.messages }));
@@ -1268,58 +1315,66 @@ describe("0.4.12 failure regressions", () => {
   });
 });
 
-describe("bounded source curation", () => {
+describe("complete source curation", () => {
   test("full user corrections survive beyond the old 4000-character archive clip", () => {
     const archive = new EvidenceArchive("/repo");
     const prompt = "Opening request\n" + "context ".repeat(700) + "\nNever remove the audit trail.\n" + "context ".repeat(700);
     archive.addAppend("user", "prompt", { type: "user", role: "user", content: [{ type: "text", text: prompt }] }, "composer");
     expect(archive.rows[0]!.text).toBe(prompt);
     expect(archive.rows[0]!.textTruncated).toBe(false);
-    const packet = curatorPacket(preparationSnapshot(archive));
+    const packet = evidencePacket(archive);
     expect(packet.text).toContain("Never remove the audit trail.");
   });
-  test("oversized protected instructions reduce coverage and leave the suffix uncovered", () => {
+  test("long user instructions retain their complete evidence and coverage", () => {
     const archive = archiveWith([
       ["u1", "user", "Preserve the original acceptance criteria"], ["a1", "assistant", "Initial work remains unverified"],
       ["u2", "user", "critical ".repeat(10_000)], ["a2", "assistant", "More work pending"],
     ]);
-    const snapshot = preparationSnapshot(archive);
-    expect(snapshot.rows.at(-1)!.id).toBe("a1");
-    expect(archive.size).toBe(4);
-    expect(snapshot.size).toBe(2);
+    const packet = evidencePacket(archive);
+    expect(packet.text).toContain("critical ".repeat(10_000));
+    expect(packet.text).toContain('"entryId":"a2"');
+    expect(packet.selectedRows).toBe(4);
+    expect(packet.omittedRows).toBe(0);
   });
-  test("an indivisible first user request fails explicitly rather than truncating obligations", () => {
+  test("a large first user request is retained without a local token limit", () => {
     const archive = archiveWith([["u1", "user", "constraint ".repeat(20_000)]]);
-    expect(() => preparationSnapshot(archive)).toThrow("evidence_budget_exceeded");
+    expect(evidencePacket(archive).text).toContain("constraint ".repeat(20_000));
   });
-  test("the verifier packet contains uncited user constraints and rejects missing required audit sources", () => {
+  test("source packets contain all constraints and facts regardless of curator citations", () => {
     const archive = archiveWith([["u1", "user", "Never publish until I approve the exact final draft"], ["a1", "assistant", "The working branch is ready for review"]]);
-    const packet = evidencePacket(archive, 2000, new Set(["E0002"]));
+    const packet = evidencePacket(archive);
     expect(packet.text).toContain("Never publish until I approve");
-    expect(() => evidencePacket(archive, 2000, new Set(["E9999"]))).toThrow("missing cited source");
-    expect(() => evidencePacket(archive, 1, new Set(["E0001"]))).toThrow("evidence_budget_exceeded");
+    expect(packet.refs.has("E0001")).toBe(true);
+    expect(packet.refs.has("E0002")).toBe(true);
+    expect(packet.refs.has("E9999")).toBe(false);
   });
-  test("large ASCII and multibyte archives have bounded packets at both reported sizes", () => {
+  test("large ASCII and multibyte archives retain every source row", () => {
     for (const bytes of [138083, 228254]) {
       const archive = archiveWith([["u1", "user", "Continue implementing the required behavior"]]);
       for (let i = 0; i < 80; i++) archive.add({ id: `a${i}`, evidenceId: "", role: "assistant", door: "response",
         text: `${i} ` + "日志 context ".repeat(Math.ceil(bytes / 80 / 15)), toolNames: [], hasToolResult: false, isError: false });
-      const packet = curatorPacket(preparationSnapshot(archive));
-      expect(packetTokens(packet.text) <= 22_000).toBe(true);
-      expect(packet.omittedRows).toBeGreaterThan(0);
+      const packet = evidencePacket(archive);
+      expect(packetTokens(packet.text)).toBeGreaterThan(22_000);
+      expect(packet.omittedRows).toBe(0);
+      expect(packet.selectedRows).toBe(81);
+      expect(packet.text).toContain('"entryId":"a79"');
       expect(packet.refs.has("E0001")).toBe(true);
     }
   });
-  test("a curator cannot cite source evidence omitted from its packet", async () => {
+  test("repeated evidence keeps stable source IDs for both roles", async () => {
     const archive = archiveWith([["u1", "user", "Continue the task carefully"], ["a1", "assistant", "Duplicate log information"], ["a2", "assistant", "Duplicate log information"]]);
-    // Optional duplicate rows are deduplicated, while the newest is retained.
-    await expect(prepareCheckpoint(async () => JSON.stringify({ checkpoint: checkpointJson("E0002"), coverageEndEntryId: "a2" }), archive, "haiku"))
-      .rejects.toThrow("Unknown evidence reference");
+    const prepared = await prepareCheckpoint(async request => {
+      expect(request.prompt).toContain('"evidenceId":"E0002"');
+      expect(request.prompt).toContain('"evidenceId":"E0003"');
+      return request.role === "builder"
+        ? JSON.stringify({ checkpoint: checkpointJson("E0002"), coverageEndEntryId: "a2" }) : '{"pass":true,"issues":[]}';
+    }, archive, "haiku");
+    expect(prepared.coverageEndEntryId).toBe("a2");
   });
 });
 
 describe("audit and output fidelity", () => {
-  test("many cited large outputs remain auditable within a bounded source packet", () => {
+  test("many cited large outputs remain fully auditable without a source budget", () => {
     const archive = archiveWith([["u1", "user", "Keep the current continuation requirements"]]);
     const refs = new Set<string>();
     for (let i = 0; i < 20; i++) {
@@ -1327,9 +1382,9 @@ describe("audit and output fidelity", () => {
         isError: true, toolNames: [], text: `command-${i}\n${"log ".repeat(900)}\nERROR decisive failure ${i}` });
       refs.add(`E${String(i + 2).padStart(4, "0")}`);
     }
-    const packet = evidencePacket(archive, 10_000, refs);
+    const packet = evidencePacket(archive);
     expect([...refs].every(ref => packet.refs.has(ref))).toBe(true);
-    expect(packetTokens(packet.text) <= 10_000).toBe(true);
+    expect(packetTokens(packet.text)).toBeGreaterThan(10_000);
     expect(packet.text).toContain("ERROR decisive failure 19");
   });
   test("a decisive error in the middle of a large output survives source projection", () => {
@@ -1338,7 +1393,7 @@ describe("audit and output fidelity", () => {
     archive.addAppend("result", "tool-result", { type: "user", role: "user", content: [{ type: "tool_result", content: output, is_error: true }] }, "tool");
     expect(archive.rows[0]!.text).toContain("preserve middle evidence 192");
     expect(archive.rows[0]!.text.endsWith("End of output]")).toBe(true);
-    expect(archive.rows[0]!.text.length <= 4000).toBe(true);
+    expect(archive.rows[0]!.text).toBe(`[tool_result error ${output}]`);
   });
 });
 

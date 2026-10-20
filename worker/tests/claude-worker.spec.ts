@@ -9,19 +9,20 @@ import type { ClaudeRunRequest } from "../../hooks/claude-protocol.js";
 
 function request(directory: string, claudePath: string): ClaudeRunRequest {
   return {
-    nonce: "private-test", role: "builder", claudePath, model: "haiku", effort: "high",
+    nonce: "private-test", role: "builder", claudePath, model: "haiku", effort: "medium",
     system: "Read evidence only.", prompt: "private prompt", outputPath: join(directory, "result.json"),
     cancelPath: join(directory, "cancel"), deadlineMs: 5_000,
   };
 }
 
 test("Claude worker disables customizations and parent routing while preserving authentication", () => {
-  const env = workerEnvironment({ CLAUDECODE: "1", CLAUDE_CODE_PLUGIN_DIRS: "/parent", CLAUDE_CODE_SESSION_ID: "parent", ANTHROPIC_API_KEY: "test-key", CLAUDE_CODE_OAUTH_TOKEN: "test-oauth", PATH: "/bin", CLAUDE_CODE_EFFORT_LEVEL: "low", MAX_THINKING_TOKENS: "32000" });
+  const env = workerEnvironment({ CLAUDECODE: "1", CLAUDE_CODE_PLUGIN_DIRS: "/parent", CLAUDE_CODE_SESSION_ID: "parent", ANTHROPIC_API_KEY: "test-key", CLAUDE_CODE_OAUTH_TOKEN: "test-oauth", PATH: "/bin", CLAUDE_CODE_EFFORT_LEVEL: "low", MAX_THINKING_TOKENS: "32000", CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8192" });
   assert.equal(env.CLAUDECODE, undefined);
   assert.equal(env.CLAUDE_CODE_PLUGIN_DIRS, undefined);
   assert.equal(env.CLAUDE_CODE_SESSION_ID, undefined);
   assert.equal(env.CLAUDE_CODE_EFFORT_LEVEL, undefined);
   assert.equal(env.MAX_THINKING_TOKENS, undefined);
+  assert.equal(env.CLAUDE_CODE_MAX_OUTPUT_TOKENS, undefined);
   assert.equal(env.ANTHROPIC_API_KEY, "test-key");
   assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "test-oauth");
   const args = workerArguments(request("/tmp", "claude"));
@@ -30,7 +31,7 @@ test("Claude worker disables customizations and parent routing while preserving 
   assert.equal(args[args.indexOf("--tools") + 1], "");
   assert.equal(args[args.indexOf("--permission-mode") + 1], "dontAsk");
   assert.ok(!args.includes("--resume"));
-  assert.equal(args[args.indexOf("--max-turns") + 1], "1");
+  assert.ok(!args.includes("--max-turns"));
 });
 
 test("the shipped Claude worker writes only a nonce-tagged atomic result and short status", async () => {
@@ -40,6 +41,7 @@ test("the shipped Claude worker writes only a nonce-tagged atomic result and sho
     await writeFile(cli, `#!/usr/bin/env node
 let prompt = ''; for await (const chunk of process.stdin) prompt += chunk;
 if (prompt !== 'private prompt') process.exit(3);
+if (process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS) process.exit(4);
 process.stdout.write(JSON.stringify({ type: 'result', is_error: false, result: 'checkpoint ✓ 中文' }));
 `, { mode: 0o700 });
     const run = request(directory, cli);
@@ -52,6 +54,50 @@ process.stdout.write(JSON.stringify({ type: 'result', is_error: false, result: '
     assert.deepEqual(Object.keys(JSON.parse(child.stdout)).sort(), ["durationMs", "ok", "role"]);
     assert.ok(!child.stdout.includes("checkpoint"));
     assert.ok(!child.stdout.includes("private prompt"));
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("large CLI answers survive the former output transport cap", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "shadow-claude-large-"));
+  try {
+    const cli = join(directory, "large.mjs");
+    await writeFile(cli, `#!/usr/bin/env node
+for await (const chunk of process.stdin) {}
+process.stdout.write(JSON.stringify({ is_error: false, result: 'detail '.repeat(800000) + 'end of checkpoint' }));
+`, { mode: 0o700 });
+    const run = request(directory, cli);
+    const child = spawnSync(process.execPath, [resolve("dist/claude-checkpoint-worker.mjs")], { input: JSON.stringify(run), encoding: "utf8", timeout: 10_000 });
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(await readFile(run.outputPath, "utf8"));
+    assert.equal(result.ok, true);
+    assert.equal(result.answer.length, 7 * 800000 + 'end of checkpoint'.length);
+    assert.ok(result.answer.endsWith('end of checkpoint'));
+    assert.ok(child.stdout.length < 200);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("nonzero JSON errors preserve their cause and retry only transient API statuses", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "shadow-claude-errors-"));
+  try {
+    const cli = join(directory, "error.mjs");
+    for (const [code, status, retryable] of [
+      ["max_output_tokens", null, false], ["authentication_error", 401, false],
+      ["rate_limit_error", 429, true], ["overloaded_error", 529, true],
+    ] as const) {
+      await writeFile(cli, `#!/usr/bin/env node
+for await (const chunk of process.stdin) {}
+process.stderr.write('private prompt and credential');
+process.stdout.write(JSON.stringify(${JSON.stringify({ subtype: "success", is_error: true, api_error: code, api_error_status: status, result: "private prompt and credential" })}), () => process.exit(1));
+`, { mode: 0o700 });
+      const result = await runClaudeWorker(request(directory, cli));
+      assert.equal(result.ok, false);
+      if (!result.ok) {
+        assert.equal(result.code, code);
+        assert.equal(result.retryable, retryable);
+        assert.ok(!result.error.includes('private prompt'));
+        assert.ok(!result.error.includes('credential'));
+      }
+    }
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 

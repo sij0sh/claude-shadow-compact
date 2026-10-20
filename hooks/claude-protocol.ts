@@ -10,7 +10,6 @@ export interface ClaudeRunRequest {
   effort: string;
   system: string;
   prompt: string;
-  maxTokens?: number;
   outputPath: string;
   cancelPath: string;
   deadlineMs: number;

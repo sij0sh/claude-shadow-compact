@@ -8,6 +8,7 @@ export function workerEnvironment(source) {
     };
     delete env.CLAUDE_CODE_EFFORT_LEVEL;
     delete env.MAX_THINKING_TOKENS;
+    delete env.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
     for (const key of Object.keys(env)){
         if (key === "CLAUDECODE" || /^CLAUDE_(?:CODE_)?(?:SESSION|PARENT|AGENT|TEAM|REMOTE|SSE|PLUGIN)/.test(key)) delete env[key];
     }
@@ -23,8 +24,6 @@ export function workerArguments(request) {
         "--no-session-persistence",
         "--tools",
         "",
-        "--max-turns",
-        "1",
         "--permission-mode",
         "dontAsk",
         "--model",
@@ -41,12 +40,11 @@ export async function runClaudeWorker(request, parentSignal) {
     try {
         await cancellation.check();
         cancellation.signal.throwIfAborted();
-        const raw = await new Promise((resolve, reject)=>{
+        const exited = await new Promise((resolve, reject)=>{
             const child = spawn(request.claudePath, workerArguments(request), {
                 cwd: dirname(request.outputPath),
                 env: {
                     ...workerEnvironment(process.env),
-                    CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(request.maxTokens ?? (request.role === "builder" ? 8192 : 4096)),
                     CLAUDE_CODE_MAX_RETRIES: "0"
                 },
                 detached: process.platform !== "win32",
@@ -57,7 +55,6 @@ export async function runClaudeWorker(request, parentSignal) {
                 ]
             });
             let output = "";
-            let bytes = 0;
             let failure;
             let escalation;
             const kill = (signal)=>{
@@ -77,11 +74,7 @@ export async function runClaudeWorker(request, parentSignal) {
             if (cancellation.signal.aborted) stop();
             child.stdout.setEncoding("utf8");
             child.stdout.on("data", (chunk)=>{
-                bytes += Buffer.byteLength(chunk);
-                if (bytes > 4 * 1024 * 1024) {
-                    failure = new Error("Claude worker output exceeded 4 MiB");
-                    stop();
-                } else output += chunk;
+                output += chunk;
             });
             child.stderr.resume();
             child.stdin.on("error", ()=>undefined);
@@ -94,13 +87,39 @@ export async function runClaudeWorker(request, parentSignal) {
                 if (failure) {
                     kill("SIGKILL");
                     reject(failure);
-                } else if (code !== 0) reject(new Error(`Claude CLI exited ${code}`));
-                else resolve(output);
+                } else resolve({
+                    output,
+                    exitCode: code
+                });
             });
             child.stdin.end(request.prompt);
         });
-        const reply = JSON.parse(raw);
-        if (reply.is_error || typeof reply.result !== "string" || !reply.result.trim()) throw new Error("Claude CLI returned no successful result");
+        let reply;
+        try {
+            reply = JSON.parse(exited.output);
+        } catch  {}
+        const durationMs = Math.round(performance.now() - started);
+        if (!reply || typeof reply !== "object") return {
+            nonce: request.nonce,
+            ok: false,
+            error: `Claude CLI exited ${exited.exitCode} without a valid JSON result`,
+            code: "worker_result_invalid",
+            retryable: false,
+            durationMs
+        };
+        if (exited.exitCode !== 0 || reply.is_error) {
+            const code = typeof reply.api_error === "string" && /^[a-z_]+$/.test(reply.api_error) ? reply.api_error : "claude_request_failed";
+            const status = typeof reply.api_error_status === "number" && Number.isInteger(reply.api_error_status) && reply.api_error_status >= 400 && reply.api_error_status <= 599 ? reply.api_error_status : undefined;
+            return {
+                nonce: request.nonce,
+                ok: false,
+                code,
+                durationMs,
+                error: `Claude CLI exited ${exited.exitCode}: ${code}${status ? ` (HTTP ${status})` : ""}`,
+                retryable: status === 408 || status === 409 || status === 429 || status !== undefined && status >= 500
+            };
+        }
+        if (typeof reply.result !== "string" || !reply.result.trim()) throw new Error("Claude CLI returned no successful result");
         return {
             nonce: request.nonce,
             ok: true,
@@ -115,7 +134,7 @@ export async function runClaudeWorker(request, parentSignal) {
             ok: false,
             error: message,
             code,
-            retryable: code === "worker_failed",
+            retryable: false,
             durationMs: Math.round(performance.now() - started)
         };
     } finally{

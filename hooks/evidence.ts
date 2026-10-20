@@ -2,7 +2,7 @@
  * Durable evidence archive (spec §4.2). `session.append` hands every
  * transcript row to the mod before storage under a stable uuid; this
  * archive mirrors main-loop rows in append order, sanitizes their text,
- * and supplies frozen, bounded source packets for curation and audit.
+ * and supplies frozen, complete source packets for curation and audit.
  * Evidence ids (`E0001`, ...) are stable per archive position; `E0000`
  * names the previous checkpoint.
  */
@@ -58,19 +58,6 @@ export function isCoverageRow(row: EvidenceRow): boolean {
 
 const CORRECTION_SIGNALS =
   /\b(no\b|wrong|incorrect|instead|actually|not that|fix\b|should\b|must\b|never\b|always\b|don't\b|do not\b|require[sd]?|prefer|prohibit)/i;
-const MAX_ROW_TEXT_CHARS = 4_000;
-
-/** Keep output headers and final errors/results, with explicit clipping provenance. */
-function projectRowText(text: string): string {
-  if (text.length <= MAX_ROW_TEXT_CHARS) return text;
-  const decisive = [...text.matchAll(/[^\n]{0,120}\b(?:error|failed|failure|exception|fatal|passed)\b[^\n]{0,200}/gi)]
-    .slice(-4).map(match => match[0]).join("\n").slice(0, 900);
-  const marker = "\n[... source characters omitted; decisive excerpts follow ...]\n";
-  const head = text.slice(0, 1100);
-  const separator = decisive ? `\n${decisive}\n[... terminal output ...]\n` : "";
-  const tail = MAX_ROW_TEXT_CHARS - head.length - marker.length - separator.length;
-  return head + marker + separator + text.slice(-tail);
-}
 
 
 export type EvidenceSignal = "correction" | "error" | "verification";
@@ -134,18 +121,13 @@ export function rowFromAppend(
   const role = message.type === "assistant" ? "assistant"
     : message.role === "user" || message.role === "assistant" ? message.role : undefined;
   const sanitized = sanitizeForContext(parts.join("\n"), cwd);
-  // User instructions are protected evidence. Never discard a correction in
-  // the middle of a long prompt before packet budgeting can retain it.
-  const person = role === "user" && !hasToolResult && !message.isMeta &&
-    (originKind === undefined || PERSON_ORIGINS.has(originKind));
-  const projected = person ? sanitized : projectRowText(sanitized);
   return {
     id: uuid,
     evidenceId: evidenceIdForIndex(index),
     ...(role ? { role } : {}),
     door,
-    text: projected,
-    textTruncated: projected !== sanitized,
+    text: sanitized,
+    textTruncated: false,
     originalTextChars: sanitized.length,
     toolNames,
     hasToolResult,

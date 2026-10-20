@@ -43,7 +43,7 @@ const COMPACT_POLL_SECONDS = 1;
 /** A held compaction stops waiting while this much hook budget is left. */
 const COMPACT_BUDGET_RESERVE_MS = 2_000;
 /** Running plugin version shown in status; bump with the manifest. */
-const PLUGIN_VERSION = "0.4.12";
+const PLUGIN_VERSION = "0.4.13";
 
 interface Attempt {
   key: string;
@@ -364,7 +364,7 @@ function roleExecutor($: EngineInterface, rt: Runtime, control: PreparationContr
         const model = request.model === "inherit" ? await $.session.model() : request.model;
         const run = workerRequest(request, model, rt.config.checkpointEffort, control, ROLE_TIMEOUT_MS);
         await $.fs.write(`${control.directory}/${request.role}-request.json`, JSON.stringify(run));
-        await trace($, rt, "role-start", { generation: control.generation, role: request.role, attempt: attempt + 1, timeoutMs: ROLE_TIMEOUT_MS, maxTokens: request.maxTokens });
+        await trace($, rt, "role-start", { generation: control.generation, role: request.role, attempt: attempt + 1, timeoutMs: ROLE_TIMEOUT_MS });
         control.assertActive();
         const exited = await control.race($.process.run(["node", `${$.plugin.root}/${CLAUDE_WORKER_PATH}`], {
           stdin: JSON.stringify(run), timeoutMs: ROLE_TIMEOUT_MS,
@@ -845,6 +845,9 @@ export const register: Register = (on, options) => {
     let plan = await planInstall(rt, e.messages, instructions);
     if ("reason" in plan) {
       if (plan.reason === "coverage-ambiguous") return native("coverage_ambiguous");
+      // A verified answer is not regenerated just to make it smaller. Native
+      // recovery handles a replacement that cannot fit or save context.
+      if (plan.reason === "no-savings" || plan.reason === "replacement-budget-exceeded") return native(`checkpoint_ineligible:${plan.reason}`);
       const needsRepair = plan.reason === "prefix-mismatch" || rt.messageRowIds.some(id => id.startsWith("unknown-")) || !rt.historyStatus.startsWith("reconciled:");
       if (rt.preparation && rt.preparation.instructions !== instructions) {
         const old = rt.preparation;

@@ -7,7 +7,7 @@ import { PreparationError } from "./failure.js";
 export function workerRequest(request: AskRequest, model: string, effort: string, control: PreparationControl, timeoutMs: number): ClaudeRunRequest {
   const nonce = crypto.randomUUID();
   return { nonce, role: request.role, claudePath: "claude", model, effort, system: request.system,
-    prompt: request.prompt, maxTokens: request.maxTokens,
+    prompt: request.prompt,
     outputPath: `${control.directory}/claude-${request.role}-${nonce}-result.json`,
     cancelPath: `${control.directory}/cancel`, deadlineMs: Math.max(1, timeoutMs - 5_000) };
 }

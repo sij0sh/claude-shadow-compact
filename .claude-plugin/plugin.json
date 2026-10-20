@@ -1,8 +1,8 @@
 {
   "name": "shadow-compact",
   "displayName": "Shadow Compact",
-  "version": "0.4.12",
-  "description": "Automatic verified Claude checkpoints with bounded curation and exact recent-tail preservation.",
+  "version": "0.4.13",
+  "description": "Automatic verified Claude checkpoints with focused curation and exact recent-tail preservation.",
   "license": "MIT",
   "userConfig": {
     "checkpointModel": {
@@ -22,7 +22,7 @@
         "xhigh",
         "max"
       ],
-      "default": "high"
+      "default": "medium"
     },
     "prepareThresholdTokens": {
       "type": "number",

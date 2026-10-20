@@ -3,11 +3,10 @@
  * Ported from pi-shadow-compact `summary.ts` / `checkpoint.ts` with the
  * Pi model-resolution parts removed (Claude models are plugin options).
  * Every item must cite evidence ids the archive actually served; unknown
- * refs, unexpected keys, oversize items, and empty checkpoints throw.
+ * refs, unexpected keys, and empty checkpoints throw. Prompts govern length.
  */
 
 export const CHECKPOINT_SCHEMA_VERSION = 3;
-const MAX_ITEM_CHARS = 8_000;
 /** Shorter text cannot carry continuation state; it reads as a stub. */
 const MIN_ITEM_CHARS = 6;
 /** Stub answers a model submits to probe the schema, never real state. */
@@ -23,9 +22,6 @@ function requireSubstance(text: string, where: string): void {
     throw new Error(`${where} is placeholder text (${JSON.stringify(text)}); describe the real session state`);
   }
 }
-const MAX_ITEMS_PER_SECTION = 100;
-const MAX_REFS_PER_ITEM = 32;
-const MAX_RENDERED_CHARS = 64_000;
 
 export const SECTIONS = [
   "objective",
@@ -109,11 +105,6 @@ function parseVerificationSection(
   if (!Array.isArray(value)) {
     throw new Error(`Checkpoint section ${VERIFICATION_SECTION} must be an array`);
   }
-  if (value.length > MAX_ITEMS_PER_SECTION) {
-    throw new Error(
-      `Checkpoint section ${VERIFICATION_SECTION} exceeds ${MAX_ITEMS_PER_SECTION} items`,
-    );
-  }
   return value.map((item, index) => parseVerificationItem(item, index, knownRefs));
 }
 
@@ -133,9 +124,6 @@ function parseVerificationItem(
   }
   const text = typeof record.text === "string" ? record.text.trim() : "";
   if (!text) throw new Error(`Item ${index} in ${VERIFICATION_SECTION} has empty text`);
-  if (text.length > MAX_ITEM_CHARS) {
-    throw new Error(`Item ${index} in ${VERIFICATION_SECTION} exceeds text limit`);
-  }
   requireSubstance(text, `Item ${index} in ${VERIFICATION_SECTION}`);
   if (record.status !== "verified" && record.status !== "unverified") {
     throw new Error(
@@ -169,9 +157,6 @@ function parseContinuationState(source: Record<string, unknown>): ContinuationSt
     if (!text) {
       throw new Error(`Checkpoint section ${CONTINUATION_KEY}.${field} must be a non-empty string`);
     }
-    if (text.length > MAX_ITEM_CHARS) {
-      throw new Error(`Checkpoint section ${CONTINUATION_KEY}.${field} exceeds text limit`);
-    }
     requireSubstance(text, `Checkpoint section ${CONTINUATION_KEY}.${field}`);
     state[field] = text;
   }
@@ -203,9 +188,6 @@ function parseSection(
   }
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw new Error(`Checkpoint section ${section} must be an array`);
-  if (value.length > MAX_ITEMS_PER_SECTION) {
-    throw new Error(`Checkpoint section ${section} exceeds ${MAX_ITEMS_PER_SECTION} items`);
-  }
   return value.map((item, index) => parseItem(item, section, index, knownRefs));
 }
 
@@ -226,9 +208,6 @@ function parseItem(
   }
   const text = typeof record.text === "string" ? record.text.trim() : "";
   if (!text) throw new Error(`Item ${index} in ${section} has empty text`);
-  if (text.length > MAX_ITEM_CHARS) {
-    throw new Error(`Item ${index} in ${section} exceeds text limit`);
-  }
   requireSubstance(text, `Item ${index} in ${section}`);
   return { text, evidenceRefs: parseRefs(record.evidenceRefs, index, section, knownRefs) };
 }
@@ -241,9 +220,6 @@ function parseRefs(
 ): string[] {
   if (!Array.isArray(refs) || refs.length === 0) {
     throw new Error(`Item ${index} in ${section} needs at least one evidenceRef`);
-  }
-  if (refs.length > MAX_REFS_PER_ITEM) {
-    throw new Error(`Item ${index} in ${section} exceeds ${MAX_REFS_PER_ITEM} evidenceRefs`);
   }
   for (const ref of refs) {
     if (typeof ref !== "string" || !knownRefs.has(ref)) {
@@ -292,9 +268,6 @@ export function renderCheckpoint(checkpoint: Checkpoint, coverageEndEntryId: str
     );
   }
   const rendered = `${CHECKPOINT_HEADING}\n\n${coverageLine(coverageEndEntryId)}\n\n${sections.join("\n\n")}\n`;
-  if (rendered.length > MAX_RENDERED_CHARS) {
-    throw new Error("Rendered checkpoint exceeds size limit");
-  }
   return rendered;
 }
 

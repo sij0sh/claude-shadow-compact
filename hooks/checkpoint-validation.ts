@@ -1,5 +1,5 @@
 /** Deterministic integrity checks. Passing these does not establish semantic accuracy. */
-import { renderCheckpoint, requireContinuation, SECTIONS, validateCheckpointObject, type Checkpoint } from "./checkpoint.js";
+import { requireContinuation, SECTIONS, validateCheckpointObject, type Checkpoint } from "./checkpoint.js";
 import { isCoverageRow, PREVIOUS_CHECKPOINT_EVIDENCE_ID, type EvidenceArchive } from "./evidence.js";
 
 export interface ValidatedSubmission {
@@ -45,8 +45,6 @@ export function validateSubmission(
         }
       }
     }
-    // Enforce the final output limit before paying for another model call.
-    renderCheckpoint(checkpoint, coverage);
     return { checkpoint, coverageEndEntryId: coverage };
   } catch (error) {
     if (error instanceof CheckpointValidationError) throw error;

@@ -1,4 +1,4 @@
-# Shadow Compact 0.4.12
+# Shadow Compact 0.4.13
 
 A Claude Code mod that prepares an independently verified continuation checkpoint
 in the background, then installs it with the exact recent conversation at the
@@ -23,7 +23,7 @@ Host rollout and organization policy can affect availability.
 | Preference | Default | Behavior |
 | --- | --- | --- |
 | `checkpointModel` | `haiku` | Model for the curator and independent verifier; `inherit` uses the session model |
-| `checkpointEffort` | `high` | Same effort for both roles, subject to model support and host policy |
+| `checkpointEffort` | `medium` | Same effort for both roles, subject to model support and host policy |
 | `prepareThresholdTokens` | `160000` | Starts background preparation; capped to an internal safe estimate on smaller windows |
 
 There are no backend, verifier-mode, timeout, or compaction-hold settings.
@@ -43,7 +43,7 @@ There are no backend, verifier-mode, timeout, or compaction-hold settings.
 
 The result keeps the checkpoint, at least ten whole recent rounds, and **all
 uncovered messages**. Tool results cannot be separated from their retained calls.
-Prefix proof, message identity, coverage, size, and savings checks run before
+Prefix proof, message identity, coverage, host capacity, and savings checks run before
 installation. Only canonical confirmation counts an installation as successful.
 
 ### Curation and independent verification
@@ -53,9 +53,10 @@ current continuation state; the verifier returns a short pass/fail verdict.
 Neither agent pages through files, runs project tools, or regenerates the task.
 A rejected or malformed candidate is never published.
 
-One executor handles both roles. Retry a transient transport failure once after
-60 seconds, retaining a valid curator draft when only verification must retry.
-There is no worker-to-inline fallback or 120,000-character transport cliff.
+One executor handles both roles. Retry an identified transient API or transport
+failure once after 60 seconds, retaining a valid curator draft when only
+verification must retry. CLI token-limit and authentication errors settle with
+their structured cause instead of repeating the same request.
 
 Each role has a fresh request allowance of up to 600 seconds, including process
 overhead. The child aborts five seconds before the host process limit. There is
@@ -63,18 +64,21 @@ no combined 360-second pipeline deadline. History/setup I/O has a separate
 30-second guard. A renewable 240-second wait lease does not fail or restart a
 healthy preparation and does not authorize native summarization.
 
-The source packets target estimated input limits of 24k tokens for curation and
-12k for verification. Visible answers are limited to approximately 4k and 1k
-respectively. Request generation limits of 8k and 4k leave room for reasoning.
-These input/visible-answer sizes use a conservative sizing heuristic, not a
-provider tokenizer or actual usage measurement.
+Prompts govern scope: preserve the state needed to resume, remove repetition
+and obsolete history, and keep the independent verdict focused on material
+problems. A valid answer is never rejected or regenerated solely for its length,
+number of items, or number of citations. There are no extension-imposed input,
+generation-token, character, or response-byte limits. The worker clears inherited
+output/thinking caps and uses the CLI's model defaults; provider context and
+generation limits still apply.
 
-Full user instructions and prior checkpoint obligations are protected. If they
-cannot fit both requests, coverage moves earlier and the rest remains verbatim.
-If no safe boundary exists, preparation fails explicitly. Optional repeated logs
-are deduplicated; source excerpts retain decisive errors/results and exact
-identifiers. The independent audit includes user requirements even if the
-curator did not cite them. A source ID is not a guarantee of semantic accuracy.
+Both roles receive complete sanitized source evidence for their covered snapshot,
+including user instructions, tool output, and prior checkpoint obligations. The
+extension does not clip rows, omit sources to meet a token budget, or move
+coverage earlier because of input size. The independent audit includes user
+requirements even if the curator did not cite them. Schema, evidence references,
+coverage, independent verification, host capacity, and compaction savings remain
+required. A source ID is not a guarantee of semantic accuracy.
 
 ### Native compaction window
 
@@ -111,12 +115,13 @@ values are restored on normal session end only when still unchanged.
 
 ## Diagnostics and upgrading
 
-Private source snapshots, bounded role requests, nonce-tagged results, checkpoints,
+Private source snapshots, role requests, nonce-tagged results, checkpoints,
 outcomes, and events live in `.shadow-data/<session-id>/`. Events distinguish
 request deadlines, retry errors, wait leases, native recovery, and confirmed
 installation. The release archive excludes session diagnostics.
 
-Upgrading from 0.4.11 retains the three preference keys. The former saved 190k
+Upgrading from 0.4.12 retains the three preference keys and changes the default
+effort to medium. An explicit saved effort still takes precedence. The saved 190k
 window remains on disk; the active-session override takes precedence when the
 host supports it. There is no ownership-record prerequisite or settings-preserving
 early return. Existing per-session checkpoints are rebuilt after loading the mod.
@@ -136,9 +141,8 @@ npm ci
 npm run check:host
 ```
 
-The release environment has no Claude executable and dependency downloads were
-blocked. Live host waiting/window application, full TypeScript checks, and paid
-model quality/latency evaluations remain unverified. The portable suite exercises
-the reported failure paths using controlled host simulations and tests the built
-workers as actual processes. See [release notes](docs/release-0.4.12.md) for scope
-and the live verification checklist.
+The portable suite exercises the reported failure paths using controlled host
+simulations and tests the built workers as actual processes, including responses
+beyond the former size limits and JSON errors on nonzero CLI exits. See the
+[release notes](docs/release-0.4.13.md) for validation scope and the
+[0.4.12 investigation](docs/investigation-0.4.12.md) for the original evidence.
