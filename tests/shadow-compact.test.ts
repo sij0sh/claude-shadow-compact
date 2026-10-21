@@ -651,7 +651,7 @@ describe("three configuration preferences", () => {
     expect(h.commandNames).toEqual(["compact-native", "shadow-status"]);
     expect(h.commandHandlers).toEqual(["command.run:shadow-status", "command.run:compact-native"]);
     const status = await h.status();
-    expect(status).toContain("Shadow Compact v0.4.13 · idle");
+    expect(status).toContain("Shadow Compact v0.4.14 · idle");
     expect(status).toContain("Model: haiku · effort: medium · prepare: 160,000 tokens");
     expect(status.split("\n").length).toBe(6);
   });
@@ -1155,7 +1155,7 @@ describe("engine fixture integration", () => {
     on("session.start", (_$, e) => ({ cwd: e.cwd }));
     await $.session.start({ cwd: "/repo", surface: "terminal", isInteractive: true });
     const result = await $.command.run({ command: "shadow-status", args: "", origin: { kind: "composer" }, presentation: { isFullscreen: false, columns: 80 } });
-    expect(result.text).toContain("Shadow Compact v0.4.13");
+    expect(result.text).toContain("Shadow Compact v0.4.14");
     expect(result.text).toContain("prepare: 160,000 tokens");
     expect(result.text).toContain("Model: haiku · effort: medium");
   });

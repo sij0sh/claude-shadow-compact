@@ -1,4 +1,4 @@
-# Shadow Compact 0.4.13
+# Shadow Compact 0.4.14
 
 A Claude Code mod that prepares an independently verified continuation checkpoint
 in the background, then installs it with the exact recent conversation at the
@@ -146,5 +146,5 @@ npm run check:host
 The portable suite exercises the reported failure paths using controlled host
 simulations and tests the built workers as actual processes, including responses
 beyond the former size limits and JSON errors on nonzero CLI exits. See the
-[release notes](docs/release-0.4.13.md) for validation scope and the
+[release notes](docs/release-0.4.14.md) for validation scope and the
 [0.4.12 investigation](docs/investigation-0.4.12.md) for the original evidence.

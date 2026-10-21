@@ -1,7 +1,7 @@
 {
   "name": "shadow-compact",
   "displayName": "Shadow Compact",
-  "version": "0.4.13",
+  "version": "0.4.14",
   "description": "Automatic verified Claude checkpoints with focused curation and exact recent-tail preservation.",
   "license": "MIT",
   "userConfig": {

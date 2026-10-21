@@ -43,7 +43,7 @@ const COMPACT_POLL_SECONDS = 1;
 /** A held compaction stops waiting while this much hook budget is left. */
 const COMPACT_BUDGET_RESERVE_MS = 2_000;
 /** Running plugin version shown in status; bump with the manifest. */
-const PLUGIN_VERSION = "0.4.13";
+const PLUGIN_VERSION = "0.4.14";
 
 interface Attempt {
   key: string;
