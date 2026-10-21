@@ -13,9 +13,11 @@ claude --plugin-dir /absolute/path/to/shadow-compact
 ```
 
 The archive includes built JavaScript workers. Installation needs no npm install
-or build. Node.js 22.13+ and `claude` must be on PATH. Use Claude Code with
-function-hook mods, `--safe-mode`, replacement-message compaction, and the usage
-breakdown APIs. Native idle compaction requires Claude Code 2.1.290 or later.
+or build. Node.js 22.23.4+, 24.22.1+, or 26.12.1+ and `claude` must be on PATH.
+Earlier Node releases may trust the compromised eMudhra intermediates. Use Claude
+Code with function-hook mods, `--safe-mode`, replacement-message compaction,
+and the usage breakdown APIs. Native idle compaction requires Claude Code 2.1.290
+or later.
 Host rollout and organization policy can affect availability.
 
 ## Configuration
